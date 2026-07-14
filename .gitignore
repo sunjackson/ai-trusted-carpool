@@ -1,0 +1,17 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+*.log
+*.tsbuildinfo
+
+node_modules/
+dist/
+artifacts/
+.build/
+.omx/
+deploy/node_modules/
+src-tauri/target/
+
+vite.config.js
+vite.config.d.ts

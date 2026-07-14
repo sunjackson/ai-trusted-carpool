@@ -1,0 +1,717 @@
+import {
+  ArrowLeft,
+  CarFront,
+  Check,
+  CheckCircle2,
+  ChevronDown,
+  CircleHelp,
+  Clock3,
+  Code2,
+  Copy,
+  LogOut,
+  RefreshCw,
+  ShieldCheck,
+  Sparkles,
+  SquareTerminal,
+  Users,
+  Wifi,
+  X,
+} from 'lucide-react';
+import { useEffect, useMemo, useState } from 'react';
+import {
+  detectTools,
+  getActiveCar,
+  joinCar,
+  launchTool,
+  leaveCar,
+  previewInvite,
+  startCar,
+  stopCar,
+} from './api';
+import type { CarSession, JoinPreview, RideAccess, ToolDetection, ToolKind } from './types';
+import { trustedWebRtc } from './trustedWebRtc';
+
+type Screen = 'welcome' | 'host-setup' | 'host-live' | 'join' | 'ready' | 'ride';
+
+const TOOL_LABEL: Record<ToolKind, string> = { claude: 'Claude Code', codex: 'Codex' };
+const formatInviteCode = (code: string): string => code.match(/.{1,4}/g)?.join('-') ?? code;
+const toDateTimeInput = (timestamp: number): string => {
+  const date = new Date(timestamp);
+  const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
+  return local.toISOString().slice(0, 16);
+};
+const formatDateTime = (timestamp: number): string =>
+  new Intl.DateTimeFormat('zh-CN', {
+    month: 'numeric',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  }).format(timestamp);
+const formatTokens = (value: number): string =>
+  value >= 10_000 ? `${(value / 10_000).toFixed(1)}万` : value.toLocaleString('zh-CN');
+const formatOfficialCost = (microUsd: number): string =>
+  new Intl.NumberFormat('en-US', {
+    style: 'currency',
+    currency: 'USD',
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 6,
+  }).format(microUsd / 1_000_000);
+const initialScreen = (): Screen => {
+  if (!import.meta.env.DEV) return 'welcome';
+  const candidate = new URLSearchParams(window.location.search).get('screen');
+  return candidate === 'host-setup' || candidate === 'join' ? candidate : 'welcome';
+};
+
+function ToolMark({ kind }: { kind: ToolKind }) {
+  return (
+    <span className={`tool-mark tool-mark--${kind}`} aria-hidden="true">
+      {kind === 'claude' ? <Sparkles size={27} /> : <Code2 size={27} />}
+    </span>
+  );
+}
+
+function Brand() {
+  return (
+    <div className="brand" aria-label="可信拼车">
+      <span className="brand__mark">
+        <CarFront size={24} strokeWidth={2.4} />
+      </span>
+      <span className="brand__name">可信拼车</span>
+      <span className="brand__tagline">共享算力，不共享密钥</span>
+    </div>
+  );
+}
+
+function WindowShell({ children, onHome }: { children: React.ReactNode; onHome: () => void }) {
+  return (
+    <main className="app-shell">
+      <div className="ambient ambient--one" />
+      <div className="ambient ambient--two" />
+      <header className="titlebar" data-tauri-drag-region>
+        <button className="brand-button" onClick={onHome} aria-label="返回首页">
+          <Brand />
+        </button>
+        <div className="titlebar__right">
+          <span className="official-pill">
+            <ShieldCheck size={14} /> 只连官方地址
+          </span>
+        </div>
+      </header>
+      <div className="content-frame">{children}</div>
+    </main>
+  );
+}
+
+function BackButton({ onClick, label = '返回' }: { onClick: () => void; label?: string }) {
+  return (
+    <button className="back-button" onClick={onClick}>
+      <ArrowLeft size={18} /> {label}
+    </button>
+  );
+}
+
+function ErrorBanner({ message, onClose }: { message: string; onClose: () => void }) {
+  return (
+    <div className="error-banner" role="alert">
+      <CircleHelp size={18} />
+      <span>{message}</span>
+      <button onClick={onClose} aria-label="关闭提示">
+        <X size={16} />
+      </button>
+    </div>
+  );
+}
+
+function Welcome({ onHost, onJoin }: { onHost: () => void; onJoin: () => void }) {
+  return (
+    <section className="welcome page-enter">
+      <div className="welcome__hero">
+        <div className="hero-orbit">
+          <span className="hero-orbit__ring" />
+          <span className="hero-orbit__icon">
+            <CarFront size={44} />
+          </span>
+        </div>
+        <p className="eyebrow">TRUSTED CARPOOL</p>
+        <h1>一起用，密钥仍只在你的电脑里</h1>
+        <p className="welcome__lead">发车的人保持应用在线，上车的人点一次就能打开工具。</p>
+      </div>
+
+      <div className="role-grid">
+        <button className="role-card role-card--host" onClick={onHost}>
+          <span className="role-card__icon">
+            <CarFront size={34} />
+          </span>
+          <span className="role-card__copy">
+            <strong>我要发车</strong>
+            <small>选本机账号，分享四个上车码</small>
+          </span>
+          <span className="role-card__arrow">→</span>
+        </button>
+        <button className="role-card" onClick={onJoin}>
+          <span className="role-card__icon">
+            <Users size={34} />
+          </span>
+          <span className="role-card__copy">
+            <strong>我要上车</strong>
+            <small>输入上车码，立即打开工具</small>
+          </span>
+          <span className="role-card__arrow">→</span>
+        </button>
+      </div>
+
+      <div className="trust-row">
+        <span><ShieldCheck size={16} /> 本机数据</span>
+        <span><Wifi size={16} /> 自动连接</span>
+        <span><LogOut size={16} /> 随时退出</span>
+      </div>
+    </section>
+  );
+}
+
+function HostSetup({
+  tools,
+  loadingTools,
+  onRefresh,
+  onBack,
+  onStarted,
+  onError,
+}: {
+  tools: ToolDetection[];
+  loadingTools: boolean;
+  onRefresh: () => void;
+  onBack: () => void;
+  onStarted: (car: CarSession) => void;
+  onError: (message: string) => void;
+}) {
+  const [selected, setSelected] = useState<ToolKind[]>(() =>
+    tools.filter(tool => tool.installed && tool.authenticated).map(tool => tool.kind)
+  );
+  const [carName, setCarName] = useState('我的高效车队');
+  const [startsAt, setStartsAt] = useState(() => toDateTimeInput(Date.now()));
+  const [endsAt, setEndsAt] = useState(() => toDateTimeInput(Date.now() + 2 * 60 * 60 * 1000));
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    setSelected(current =>
+      current.length > 0
+        ? current
+        : tools.filter(tool => tool.installed && tool.authenticated).map(tool => tool.kind)
+    );
+  }, [tools]);
+
+  const toggleTool = (kind: ToolKind, enabled: boolean) => {
+    if (!enabled) return;
+    setSelected(current =>
+      current.includes(kind) ? current.filter(item => item !== kind) : [...current, kind]
+    );
+  };
+
+  const submit = async () => {
+    if (selected.length === 0) {
+      onError('至少选择一个已就绪的工具');
+      return;
+    }
+    const startTimestamp = new Date(startsAt).getTime();
+    const endTimestamp = new Date(endsAt).getTime();
+    if (!Number.isFinite(startTimestamp) || !Number.isFinite(endTimestamp) || endTimestamp <= startTimestamp) {
+      onError('请选择正确的开始和结束时间');
+      return;
+    }
+    setBusy(true);
+    try {
+      const nextCar = await startCar({
+        carName: carName.trim() || '我的车队',
+        enabledTools: selected,
+        startsAt: startTimestamp,
+        endsAt: endTimestamp,
+      });
+      try {
+        await trustedWebRtc.startHost();
+      } catch (error) {
+        await stopCar().catch(() => undefined);
+        throw error;
+      }
+      onStarted(nextCar);
+    } catch (error) {
+      onError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section className="flow-page page-enter">
+      <BackButton onClick={onBack} />
+      <div className="flow-heading">
+        <p className="eyebrow">一步发车</p>
+        <h1>选择要共享的工具</h1>
+        <p>只读取本机登录状态，不上传账号配置或密钥。</p>
+      </div>
+
+      <div className="stepper" aria-label="发车步骤">
+        <span className="stepper__item stepper__item--active"><b>1</b> 选择工具</span>
+        <i />
+        <span className="stepper__item"><b>2</b> 设置车队</span>
+        <i />
+        <span className="stepper__item"><b>3</b> 开始发车</span>
+      </div>
+
+      <div className="tool-detection-header">
+        <span>自动检测到以下可用工具</span>
+        <button onClick={onRefresh} disabled={loadingTools}>
+          <RefreshCw size={15} className={loadingTools ? 'spin' : ''} /> 重新检测
+        </button>
+      </div>
+      <div className="tool-grid">
+        {tools.map(tool => {
+          const enabled = tool.installed && tool.authenticated;
+          const checked = selected.includes(tool.kind);
+          return (
+            <button
+              className={`tool-card ${checked ? 'tool-card--selected' : ''}`}
+              key={tool.kind}
+              onClick={() => toggleTool(tool.kind, enabled)}
+              disabled={!enabled}
+            >
+              <ToolMark kind={tool.kind} />
+              <span className="tool-card__body">
+                <strong>{tool.name}</strong>
+                <small className={enabled ? 'status-ok' : 'status-off'}>
+                  <span /> {enabled ? '已就绪' : tool.detail}
+                </small>
+              </span>
+              <span className={`check-box ${checked ? 'check-box--on' : ''}`}>
+                {checked && <Check size={15} />}
+              </span>
+            </button>
+          );
+        })}
+      </div>
+
+      <div className="setup-grid">
+        <label>
+          <span>车队名称</span>
+          <input value={carName} onChange={event => setCarName(event.target.value)} maxLength={32} />
+        </label>
+        <label>
+          <span>开始时间</span>
+          <input
+            type="datetime-local"
+            value={startsAt}
+            onChange={event => {
+              setStartsAt(event.target.value);
+              const nextStart = new Date(event.target.value).getTime();
+              if (Number.isFinite(nextStart) && new Date(endsAt).getTime() <= nextStart) {
+                setEndsAt(toDateTimeInput(nextStart + 2 * 60 * 60 * 1000));
+              }
+            }}
+          />
+        </label>
+        <label>
+          <span>结束时间</span>
+          <input type="datetime-local" value={endsAt} onChange={event => setEndsAt(event.target.value)} />
+        </label>
+      </div>
+
+      <button className="primary-button" onClick={submit} disabled={busy || selected.length === 0}>
+        {busy ? <><RefreshCw className="spin" size={19} /> 正在准备...</> : <><CarFront size={20} /> 开始发车</>}
+      </button>
+      <p className="quiet-note"><ShieldCheck size={15} /> 最多 4 人同时使用，你的密钥不会离开电脑</p>
+    </section>
+  );
+}
+
+function HostLive({ car, onStopped, onError }: { car: CarSession; onStopped: () => void; onError: (message: string) => void }) {
+  const [liveCar, setLiveCar] = useState(car);
+  const [clock, setClock] = useState(Date.now());
+  const [copied, setCopied] = useState<string | null>(null);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setClock(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    const refresh = () => {
+      void getActiveCar()
+        .then(current => {
+          if (current?.carId === car.carId) setLiveCar(current);
+        })
+        .catch(error => onError(error instanceof Error ? error.message : String(error)));
+    };
+    refresh();
+    const timer = window.setInterval(refresh, 1000);
+    return () => window.clearInterval(timer);
+  }, [car.carId, onError]);
+
+  const scheduled = clock < liveCar.startedAt;
+  const seconds = Math.max(0, Math.floor(Math.abs(clock - liveCar.startedAt) / 1000));
+  const elapsed = `${String(Math.floor(seconds / 3600)).padStart(2, '0')}:${String(Math.floor((seconds % 3600) / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`;
+
+  const copy = async (value: string, label: string) => {
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopied(label);
+      window.setTimeout(() => setCopied(null), 1400);
+    } catch {
+      onError('复制失败，请手动记录上车码');
+    }
+  };
+
+  const stop = async () => {
+    try {
+      await trustedWebRtc.stop();
+      await stopCar();
+      onStopped();
+    } catch (error) {
+      onError(error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  return (
+    <section className="live-page page-enter">
+      <div className="live-header">
+        <div>
+          <div className="live-title"><span className="pulse-dot" /> {scheduled ? '等待发车' : '正在发车'}</div>
+          <p>{liveCar.carName} · {formatDateTime(liveCar.startedAt)}—{formatDateTime(liveCar.expiresAt)}</p>
+        </div>
+        <div className="live-header__actions">
+          <span className="timer"><Clock3 size={17} /> {scheduled ? `距开始 ${elapsed}` : elapsed}</span>
+          <button className="danger-button" onClick={stop}>停止发车</button>
+        </div>
+      </div>
+
+      <div className="seat-grid">
+        {liveCar.seats.map(seat => (
+          <article className={`seat-card seat-card--${seat.state}`} key={seat.seatNo}>
+            <span className="seat-number">{seat.seatNo}</span>
+            {seat.nickname ? (
+              <>
+                <div className="seat-person">
+                  <div className="avatar">{seat.nickname.slice(0, 1)}</div>
+                  <div>
+                    <strong>{seat.nickname}</strong>
+                    <span className="seat-state"><i /> {seat.state === 'using' ? '使用中' : '已连接'}</span>
+                  </div>
+                  <div className="seat-total">
+                    <strong>{seat.usage.requestCount} 次</strong>
+                    <small>
+                      {seat.usage.unpricedRequestCount === seat.usage.requestCount && seat.usage.requestCount > 0
+                        ? '暂无官价'
+                        : `官价估算 ${formatOfficialCost(seat.usage.officialCostMicrousd)}`}
+                    </small>
+                  </div>
+                </div>
+                <div className="usage-overview" aria-label={`${seat.nickname} 用量汇总`}>
+                  <span><small>输入</small><strong>{formatTokens(seat.usage.inputTokens)}</strong></span>
+                  <span><small>输出</small><strong>{formatTokens(seat.usage.outputTokens)}</strong></span>
+                  <span><small>缓存读</small><strong>{formatTokens(seat.usage.cacheReadTokens)}</strong></span>
+                  <span><small>缓存写</small><strong>{formatTokens(seat.usage.cacheWriteTokens)}</strong></span>
+                </div>
+                <div className="model-usage-list">
+                  {seat.usage.models.map(model => (
+                    <div className="model-usage" key={`${model.tool}:${model.model}`}>
+                      <div className="model-usage__title">
+                        <span>{TOOL_LABEL[model.tool]} · {model.requestCount} 次</span>
+                        <strong>{model.model}</strong>
+                        <em title={model.pricingSource ?? undefined}>
+                          {model.officialCostMicrousd === null
+                            ? '暂无官价'
+                            : `官价估算 ${formatOfficialCost(model.officialCostMicrousd)}`}
+                        </em>
+                      </div>
+                      <div className="model-usage__tokens">
+                        <span>输入 {formatTokens(model.inputTokens)}</span>
+                        <span>输出 {formatTokens(model.outputTokens)}</span>
+                        <span>缓存读 {formatTokens(model.cacheReadTokens)}</span>
+                        <span>缓存写 {formatTokens(model.cacheWriteTokens)}</span>
+                      </div>
+                      {model.tool === 'claude' && (
+                        <small>
+                          缓存写入：5 分钟 {formatTokens(model.cacheWrite5mTokens)} · 1 小时 {formatTokens(model.cacheWrite1hTokens)}
+                        </small>
+                      )}
+                      {model.unpricedRequestCount > 0 && (
+                        <small>{model.unpricedRequestCount} 次请求没有可用官方价，未计入估算</small>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="avatar avatar--empty"><Users size={25} /></div>
+                <strong>空座位</strong>
+                <span className="seat-state seat-state--waiting">等待上车</span>
+                <button className="invite-code" onClick={() => copy(seat.code, seat.code)}>
+                  {formatInviteCode(seat.code)} <Copy size={14} />
+                </button>
+              </>
+            )}
+          </article>
+        ))}
+      </div>
+
+      <button className="primary-button primary-button--compact" onClick={() => copy(liveCar.seats.map(seat => formatInviteCode(seat.code)).join('\n'), 'all')}>
+        {copied === 'all' ? <><Check size={19} /> 已复制全部上车码</> : <><Copy size={19} /> 复制全部上车码</>}
+      </button>
+      {copied && copied !== 'all' && <div className="toast-inline">上车码 {formatInviteCode(copied)} 已复制</div>}
+
+      <div className="live-notice">
+        <ShieldCheck size={18} />
+        <span><strong>熟人共享</strong> · 按人、按模型实时统计输入、输出与缓存，明细仅保存在车主本机；官价为官方 API 标准价估算，不是账单。</span>
+      </div>
+
+    </section>
+  );
+}
+
+function JoinPage({ onBack, onJoined, onError }: { onBack: () => void; onJoined: (access: RideAccess) => void; onError: (message: string) => void }) {
+  const [code, setCode] = useState('');
+  const [nickname, setNickname] = useState('');
+  const [preview, setPreview] = useState<JoinPreview | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [clock, setClock] = useState(Date.now());
+
+  const normalizedCode = code.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 12);
+
+  useEffect(() => {
+    if (normalizedCode.length !== 12) {
+      setPreview(null);
+      return;
+    }
+    let active = true;
+    previewInvite(normalizedCode)
+      .then(result => active && setPreview(result))
+      .catch(error => active && onError(error instanceof Error ? error.message : String(error)));
+    return () => { active = false; };
+  }, [normalizedCode, onError]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setClock(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  const waitingForStart = Boolean(preview && preview.startsAt > clock);
+
+  const submit = async () => {
+    if (!preview) return;
+    if (!nickname.trim()) {
+      onError('请输入一个昵称，车主才能识别你');
+      return;
+    }
+    setBusy(true);
+    try {
+      const nextAccess = await joinCar(normalizedCode, nickname.trim());
+      try {
+        await trustedWebRtc.startPassenger(nextAccess);
+      } catch (error) {
+        await leaveCar(nextAccess.accessId).catch(() => undefined);
+        throw error;
+      }
+      onJoined(nextAccess);
+    } catch (error) {
+      onError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section className="join-page flow-page page-enter">
+      <BackButton onClick={onBack} />
+      <div className="flow-heading flow-heading--center">
+        <p className="eyebrow">一键上车</p>
+        <h1>输入上车码</h1>
+        <p>向车主要一个 12 位上车码，粘贴后自动确认车队。</p>
+      </div>
+
+      <div className="code-input-wrap">
+        <div className="code-boxes" aria-label="上车码">
+          {Array.from({ length: 3 }, (_, index) => (
+            <span key={index}>{normalizedCode.slice(index * 4, index * 4 + 4)}</span>
+          ))}
+          <input value={normalizedCode} onChange={event => setCode(event.target.value)} autoFocus aria-label="输入上车码" />
+        </div>
+      </div>
+
+      {preview ? (
+        <div className="car-preview page-enter">
+          <div className="avatar">车</div>
+          <div className="car-preview__main">
+            <small>车主 {preview.ownerLabel}</small>
+            <strong>{preview.carName}</strong>
+            <span>{preview.enabledTools.map(kind => TOOL_LABEL[kind]).join(' · ')}</span>
+            <span>{formatDateTime(preview.startsAt)}—{formatDateTime(preview.expiresAt)}</span>
+          </div>
+          <div className="car-preview__seat"><small>你的座位</small><strong>{preview.seatNo} / 4</strong></div>
+        </div>
+      ) : (
+        <div className="preview-placeholder"><Wifi size={22} /><span>输入完整上车码后，这里会显示车队信息</span></div>
+      )}
+
+      <label className="nickname-field">
+        <span>你的昵称</span>
+        <input value={nickname} onChange={event => setNickname(event.target.value)} placeholder="例如：阿杰" maxLength={20} />
+      </label>
+
+      <div className="friends-note"><Users size={18} /> 仅加入你认识并信任的人发起的车队。</div>
+      <button className="primary-button" onClick={submit} disabled={!preview || busy || waitingForStart}>
+        {busy ? <><RefreshCw className="spin" size={19} /> 正在上车...</> : waitingForStart ? <><Clock3 size={20} /> 等待开放时间</> : <><Users size={20} /> 确认并上车</>}
+      </button>
+      <p className="quiet-note"><ShieldCheck size={15} /> 上车码只用于找到座位，授权仅绑定当前设备</p>
+    </section>
+  );
+}
+
+function ToolChooser({ access, onOpened, onError }: { access: RideAccess; onOpened: (kind: ToolKind) => void; onError: (message: string) => void }) {
+  const [selected, setSelected] = useState<ToolKind>(access.enabledTools[0] ?? 'claude');
+  const [workDir, setWorkDir] = useState('');
+  const [showDir, setShowDir] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  const open = async () => {
+    setBusy(true);
+    try {
+      await launchTool({ kind: selected, accessId: access.accessId, workDir: workDir.trim() || undefined });
+      onOpened(selected);
+    } catch (error) {
+      onError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section className="chooser-page flow-page page-enter">
+      <div className="success-banner"><CheckCircle2 size={35} /><span><strong>上车成功</strong><small>已加入 {access.carName}</small></span></div>
+      <div className="flow-heading flow-heading--center compact-heading">
+        <h1>选择要打开的工具</h1>
+        <p>两个工具都可以打开，之后也能随时切换。</p>
+      </div>
+      <div className="tool-grid chooser-grid">
+        {access.enabledTools.map(kind => (
+          <button className={`tool-card chooser-card ${selected === kind ? 'tool-card--selected' : ''}`} key={kind} onClick={() => setSelected(kind)}>
+            <ToolMark kind={kind} />
+            <span className="tool-card__body"><strong>{TOOL_LABEL[kind]}</strong><small>{kind === 'claude' ? '长文本与复杂任务' : '代码与工程任务'}</small></span>
+            <span className={`radio ${selected === kind ? 'radio--on' : ''}`} />
+          </button>
+        ))}
+      </div>
+      <button className="folder-toggle" onClick={() => setShowDir(value => !value)}>
+        <span>项目目录（可选）</span><ChevronDown size={17} className={showDir ? 'turn' : ''} />
+      </button>
+      {showDir && <input className="directory-input page-enter" value={workDir} onChange={event => setWorkDir(event.target.value)} placeholder="留空使用默认目录" />}
+      <button className="primary-button" onClick={open} disabled={busy}>
+        {busy ? <><RefreshCw className="spin" size={19} /> 正在打开...</> : <><SquareTerminal size={20} /> 打开 {TOOL_LABEL[selected]}</>}
+      </button>
+      <p className="quiet-note">两个工具可以同时打开</p>
+    </section>
+  );
+}
+
+function RidePage({ access, initiallyOpened, onLeave, onError }: { access: RideAccess; initiallyOpened: ToolKind; onLeave: () => void; onError: (message: string) => void }) {
+  const [opened, setOpened] = useState<ToolKind[]>([initiallyOpened]);
+  const [busy, setBusy] = useState<ToolKind | null>(null);
+  const [leaving, setLeaving] = useState(false);
+
+  const open = async (kind: ToolKind) => {
+    setBusy(kind);
+    try {
+      await launchTool({ kind, accessId: access.accessId });
+      setOpened(current => current.includes(kind) ? current : [...current, kind]);
+    } catch (error) {
+      onError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const leave = async () => {
+    setLeaving(true);
+    try {
+      await trustedWebRtc.stop();
+      await leaveCar(access.accessId);
+      onLeave();
+    } catch (error) {
+      onError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setLeaving(false);
+    }
+  };
+
+  return (
+    <section className="ride-page page-enter">
+      <div className="connection-bar">
+        <span><i /> 已连接</span><strong>{access.carName}</strong><span><ShieldCheck size={17} /> 当前设备已绑定</span>
+      </div>
+      <div className="ride-heading">
+        <p className="eyebrow">使用中</p>
+        <h1>需要哪个，点哪个</h1>
+      </div>
+      <div className="ride-tool-grid">
+        {access.enabledTools.map(kind => {
+          const isOpen = opened.includes(kind);
+          return (
+            <article className={`ride-tool ${isOpen ? 'ride-tool--open' : ''}`} key={kind}>
+              <ToolMark kind={kind} />
+              <div><strong>{TOOL_LABEL[kind]}</strong><small><i /> {isOpen ? '已打开' : '未打开'}</small></div>
+              <button onClick={() => open(kind)} disabled={busy === kind}>{busy === kind ? '打开中' : isOpen ? '打开新窗口' : '打开'}</button>
+            </article>
+          );
+        })}
+      </div>
+      <button className="leave-button" onClick={leave} disabled={leaving}><LogOut size={17} /> {leaving ? '正在离开...' : '离开车队'}</button>
+    </section>
+  );
+}
+
+export default function App() {
+  const [screen, setScreen] = useState<Screen>(initialScreen);
+  const [tools, setTools] = useState<ToolDetection[]>([]);
+  const [loadingTools, setLoadingTools] = useState(true);
+  const [car, setCar] = useState<CarSession | null>(null);
+  const [access, setAccess] = useState<RideAccess | null>(null);
+  const [openedTool, setOpenedTool] = useState<ToolKind>('claude');
+  const [error, setError] = useState<string | null>(null);
+
+  const loadTools = async () => {
+    setLoadingTools(true);
+    try {
+      setTools(await detectTools());
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setLoadingTools(false);
+    }
+  };
+
+  useEffect(() => { void loadTools(); }, []);
+  useEffect(() => {
+    void trustedWebRtc.initialize().catch(reason =>
+      setError(reason instanceof Error ? reason.message : String(reason))
+    );
+  }, []);
+
+  const goHome = () => {
+    setScreen('welcome');
+    setError(null);
+  };
+
+  const page = useMemo(() => {
+    if (screen === 'host-setup') return <HostSetup tools={tools} loadingTools={loadingTools} onRefresh={loadTools} onBack={goHome} onStarted={next => { setCar(next); setScreen('host-live'); }} onError={setError} />;
+    if (screen === 'host-live' && car) return <HostLive car={car} onStopped={() => { setCar(null); goHome(); }} onError={setError} />;
+    if (screen === 'join') return <JoinPage onBack={goHome} onJoined={next => { setAccess(next); setScreen('ready'); }} onError={setError} />;
+    if (screen === 'ready' && access) return <ToolChooser access={access} onOpened={kind => { setOpenedTool(kind); setScreen('ride'); }} onError={setError} />;
+    if (screen === 'ride' && access) return <RidePage access={access} initiallyOpened={openedTool} onLeave={() => { setAccess(null); goHome(); }} onError={setError} />;
+    return <Welcome onHost={() => setScreen('host-setup')} onJoin={() => setScreen('join')} />;
+  }, [screen, tools, loadingTools, car, access, openedTool]);
+
+  return (
+    <WindowShell onHome={goHome}>
+      {error && <ErrorBanner message={error} onClose={() => setError(null)} />}
+      {page}
+    </WindowShell>
+  );
+}

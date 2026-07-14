@@ -1,0 +1,52 @@
+# Trusted Carpool Architecture
+
+## Product Boundary
+
+The desktop app exposes only **host** and **join**. Claude Code and Codex are equal clients. A
+host can enable either or both, and each of four seats can run requests concurrently.
+
+## Trust Boundary
+
+- Official account credentials remain on the host device.
+- The coordinator stores only signed discovery metadata and expiring mailbox messages.
+- A twelve-character code (shown as 4-4-4) has about 60 bits of random entropy and resolves a
+  signed public invite; it is not an API credential. The coordinator limits invite resolution to
+  60 attempts per minute per client IP, and every code expires with the host's schedule.
+- A passenger creates a local P-256/X25519 identity. The host encrypts the seat access grant to
+  that identity after the passenger claims the invite.
+- Every accepted claim receives a separate 256-bit session secret bound to the passenger identity;
+  the short invite code is never used to authenticate proxied API traffic.
+- API request bodies use end-to-end encryption between passenger and host. TURN relays packets
+  but cannot decrypt application payloads.
+- Early trusted sharing has no deposit, points, billing, penalties, or user tiers. The host still
+  receives per-seat, per-model input, output, cache-read, cache-write, and request metrics in real
+  time.
+- Official price figures are USD API list-price estimates calculated per request at the price in
+  effect at that time. They are not invoices or Claude/Codex subscription usage. Unknown models
+  remain unpriced rather than inheriting a similar model's rate.
+- Each completed request appends a local `usage-history.jsonl` event under the app-data directory.
+  It stores the car, passenger, tool, model, token categories, and price estimate, but never the
+  prompt, response body, credential, session secret, or invite code.
+- Official response headers and body chunks are forwarded continuously over the ordered WebRTC
+  data channel instead of being buffered. The passenger verifies the final SHA-256 digest before
+  accepting a clean stream end; provider-reported usage is applied after the final usage event.
+
+## One-click Flow
+
+1. Host detects local Claude Code/Codex installations and login files without exposing secrets.
+   Detection includes GUI-safe npm, Homebrew, NVM, FNM, Volta, pnpm, and Windows npm locations,
+   so launching the desktop app outside a shell does not depend on an inherited `PATH`.
+2. Host sets a start/end window, creates four signed public invites, and registers them with the
+   coordinator.
+3. Passenger enters one short code, verifies the host signature, and sends a signed claim.
+4. Host automatically binds the first valid claimant to that seat and returns an encrypted grant.
+5. WebRTC is attempted first; TURN is used automatically when direct connectivity fails.
+6. The passenger's local HTTP proxy streams Claude Code/Codex requests and responses through the
+   encrypted data channel without waiting for a complete model response.
+7. The host validates the official endpoint, calls the provider locally, extracts provider usage,
+   and updates that seat's model-specific counters and official list-price estimate.
+
+## Cross-platform Delivery
+
+Tauri 2 and Rust provide one codebase for macOS, Windows, and Linux. Platform-specific code is
+limited to executable discovery, detached process launch, secure file permissions, and packaging.
