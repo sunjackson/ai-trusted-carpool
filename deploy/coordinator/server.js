@@ -51,6 +51,40 @@ function error(res, status, message, headers = {}) {
   res.end(body);
 }
 
+function html(res, status, body) {
+  res.writeHead(status, {
+    'content-type': 'text/html; charset=utf-8',
+    'cache-control': 'no-store',
+    'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+    'referrer-policy': 'no-referrer',
+    'x-content-type-options': 'nosniff',
+    'x-frame-options': 'DENY',
+  });
+  res.end(body);
+}
+
+function joinPage(code) {
+  const deepLink = `trusted-carpool://join/${code}`;
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta http-equiv="refresh" content="0;url=${deepLink}">
+  <title>正在上车 · 可信拼车</title>
+  <style>
+    :root{color-scheme:dark;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#111315;color:#f7f7f4}
+    *{box-sizing:border-box}body{min-height:100vh;margin:0;display:grid;place-items:center;padding:24px;background:radial-gradient(circle at 50% 12%,#2f291d 0,#171819 36%,#101112 72%)}
+    main{width:min(440px,100%);padding:40px 32px;border:1px solid #35383b;border-radius:24px;background:#1b1d1f;box-shadow:0 24px 80px #0008;text-align:center}
+    .mark{width:62px;height:62px;margin:0 auto 20px;display:grid;place-items:center;border-radius:20px;background:#d8ad58;color:#15120d;font-size:30px;font-weight:800}
+    h1{margin:0 0 10px;font-size:27px}p{margin:0 0 22px;color:#aeb1b4;line-height:1.7}.code{display:block;margin:0 0 22px;color:#e7c67e;font:700 15px ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:2px}
+    a{display:block;padding:14px 18px;border-radius:12px;background:#d8ad58;color:#17130c;text-decoration:none;font-weight:800}small{display:block;margin-top:18px;color:#777d82;line-height:1.6}
+  </style>
+</head>
+<body><main><div class="mark">车</div><h1>正在唤起可信拼车</h1><p>客户端会自动确认这辆车，无需再输入上车码。</p><span class="code">${code}</span><a href="${deepLink}">打开可信拼车并上车</a><small>如果没有自动打开，请点击上面的按钮。只加入你认识并信任的人发起的车队。</small></main></body>
+</html>`;
+}
+
 function readJson(req) {
   return new Promise((resolve, reject) => {
     let size = 0;
@@ -216,6 +250,15 @@ function createCoordinator(options = {}) {
       return json(res, 200, { ok: true, invites: invites.size, messages: [...mailboxes.values()].reduce((sum, list) => sum + list.length, 0), now_ms: clock() });
     }
 
+    const joinMatch = url.pathname.match(/^(?:\/join|\/api\/v1\/carpool\/join)\/([A-HJ-NP-Z2-9]{12})$/);
+    if (req.method === 'GET' && joinMatch) {
+      if (!allowRate(`join:${clientIp(req)}`, resolveRateLimit)) {
+        return error(res, 429, 'too many join link lookups', { 'retry-after': '60' });
+      }
+      if (!invites.has(joinMatch[1])) return error(res, 404, 'invite not found or expired');
+      return html(res, 200, joinPage(joinMatch[1]));
+    }
+
     if (req.method === 'POST' && url.pathname === '/api/v1/carpool/invites') {
       let input;
       try { input = await readJson(req); } catch (cause) { return error(res, cause.statusCode || 400, cause.message); }
@@ -304,6 +347,7 @@ module.exports = {
   canonicalMessage,
   canonicalPoll,
   createCoordinator,
+  joinPage,
   peerIdFromPublicKey,
   validCode,
   validPeerId,

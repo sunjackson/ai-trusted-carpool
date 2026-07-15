@@ -20,17 +20,20 @@ import {
   Wifi,
   X,
 } from 'lucide-react';
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   detectTools,
   getActiveCar,
   joinCar,
   launchTool,
   leaveCar,
+  listenForJoinLinks,
   previewInvite,
   refreshAccountQuotas,
+  serverJoinUrl,
   startCar,
   stopCar,
+  takePendingJoinCode,
   updateMemberTokenLimits,
 } from './api';
 import type {
@@ -49,6 +52,7 @@ import type {
 import { trustedWebRtc } from './trustedWebRtc';
 
 type Screen = 'welcome' | 'host-setup' | 'host-live' | 'join' | 'ready' | 'ride';
+type PendingServerJoin = { code: string; requestId: number };
 
 const TOOL_LABEL: Record<ToolKind, string> = { claude: 'Claude', codex: 'Codex' };
 type LaunchTarget = { kind: ToolKind; mode: LaunchMode };
@@ -829,7 +833,11 @@ function HostLive({ car, onStopped, onError }: { car: CarSession; onStopped: () 
                 <div className="avatar avatar--empty"><Users size={25} /></div>
                 <strong>空座位</strong>
                 <span className="seat-state seat-state--waiting">等待上车</span>
-                <button className="invite-code" onClick={() => copy(seat.code, seat.code)}>
+                <button
+                  className="invite-code"
+                  onClick={() => copy(serverJoinUrl(seat.code), seat.code)}
+                  title="复制服务器一键上车链接"
+                >
                   {formatInviteCode(seat.code)} <Copy size={14} />
                 </button>
               </>
@@ -838,10 +846,11 @@ function HostLive({ car, onStopped, onError }: { car: CarSession; onStopped: () 
         ))}
       </div>
 
-      <button className="primary-button primary-button--compact" onClick={() => copy(liveCar.seats.map(seat => formatInviteCode(seat.code)).join('\n'), 'all')}>
-        {copied === 'all' ? <><Check size={19} /> 已复制全部上车码</> : <><Copy size={19} /> 复制全部上车码</>}
+      <p className="share-link-hint"><Wifi size={15} /> 分享链接给好友，点击即可唤起客户端并自动带入座位。</p>
+      <button className="primary-button primary-button--compact" onClick={() => copy(liveCar.seats.map(seat => serverJoinUrl(seat.code)).join('\n'), 'all')}>
+        {copied === 'all' ? <><Check size={19} /> 已复制全部上车链接</> : <><Copy size={19} /> 复制全部上车链接</>}
       </button>
-      {copied && copied !== 'all' && <div className="toast-inline">上车码 {formatInviteCode(copied)} 已复制</div>}
+      {copied && copied !== 'all' && <div className="toast-inline">座位 {formatInviteCode(copied)} 的上车链接已复制</div>}
 
       <div className="live-notice">
         <ShieldCheck size={18} />
@@ -861,14 +870,43 @@ function HostLive({ car, onStopped, onError }: { car: CarSession; onStopped: () 
   );
 }
 
-function JoinPage({ onBack, onJoined, onError }: { onBack: () => void; onJoined: (access: RideAccess) => void; onError: (message: string) => void }) {
-  const [code, setCode] = useState('');
-  const [nickname, setNickname] = useState('');
+const SAVED_NICKNAME_KEY = 'trusted-carpool:nickname';
+
+function savedNickname(): string {
+  try {
+    return window.localStorage.getItem(SAVED_NICKNAME_KEY)?.slice(0, 20) ?? '';
+  } catch {
+    return '';
+  }
+}
+
+function JoinPage({
+  initialCode,
+  fromServerLink = false,
+  onBack,
+  onJoined,
+  onError,
+}: {
+  initialCode?: string;
+  fromServerLink?: boolean;
+  onBack: () => void;
+  onJoined: (access: RideAccess) => void;
+  onError: (message: string) => void;
+}) {
+  const [code, setCode] = useState(initialCode ?? '');
+  const [nickname, setNickname] = useState(savedNickname);
   const [preview, setPreview] = useState<JoinPreview | null>(null);
   const [busy, setBusy] = useState(false);
   const [clock, setClock] = useState(Date.now());
+  const automaticAttempted = useRef(false);
 
   const normalizedCode = code.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 12);
+
+  useEffect(() => {
+    if (!initialCode) return;
+    setCode(initialCode);
+    automaticAttempted.current = false;
+  }, [initialCode]);
 
   useEffect(() => {
     if (normalizedCode.length !== 12) {
@@ -889,7 +927,7 @@ function JoinPage({ onBack, onJoined, onError }: { onBack: () => void; onJoined:
 
   const waitingForStart = Boolean(preview && preview.startsAt > clock);
 
-  const submit = async () => {
+  const submit = useCallback(async () => {
     if (!preview) return;
     if (!nickname.trim()) {
       onError('请输入一个昵称，车主才能识别你');
@@ -904,21 +942,48 @@ function JoinPage({ onBack, onJoined, onError }: { onBack: () => void; onJoined:
         await leaveCar(nextAccess.accessId).catch(() => undefined);
         throw error;
       }
+      try {
+        window.localStorage.setItem(SAVED_NICKNAME_KEY, nickname.trim());
+      } catch {
+        // A blocked storage API must not block the current ride.
+      }
       onJoined(nextAccess);
     } catch (error) {
       onError(error instanceof Error ? error.message : String(error));
     } finally {
       setBusy(false);
     }
-  };
+  }, [nickname, normalizedCode, onError, onJoined, preview]);
+
+  useEffect(() => {
+    if (
+      !fromServerLink ||
+      !preview ||
+      !nickname.trim() ||
+      waitingForStart ||
+      busy ||
+      automaticAttempted.current
+    ) {
+      return;
+    }
+    automaticAttempted.current = true;
+    void submit();
+  }, [busy, fromServerLink, nickname, preview, submit, waitingForStart]);
 
   return (
     <section className="join-page flow-page page-enter">
       <BackButton onClick={onBack} />
       <div className="flow-heading flow-heading--center">
         <p className="eyebrow">一键上车</p>
-        <h1>输入上车码</h1>
-        <p>向车主要一个 12 位上车码，粘贴后自动确认车队。</p>
+        <h1>{fromServerLink ? '已收到车主邀请' : '输入上车码'}</h1>
+        <p>
+          {fromServerLink
+            ? '官方协调服务已带入上车码，确认昵称后即可上车。'
+            : '向车主要一个 12 位上车码，粘贴后自动确认车队。'}
+        </p>
+        {fromServerLink && (
+          <span className="server-link-badge"><ShieldCheck size={14} /> 来自 p2p.cnaigc.ai</span>
+        )}
       </div>
 
       <div className="code-input-wrap">
@@ -926,7 +991,7 @@ function JoinPage({ onBack, onJoined, onError }: { onBack: () => void; onJoined:
           {Array.from({ length: 3 }, (_, index) => (
             <span key={index}>{normalizedCode.slice(index * 4, index * 4 + 4)}</span>
           ))}
-          <input value={normalizedCode} onChange={event => setCode(event.target.value)} autoFocus aria-label="输入上车码" />
+          <input value={normalizedCode} onChange={event => setCode(event.target.value)} autoFocus={!fromServerLink} aria-label="输入上车码" />
         </div>
       </div>
 
@@ -952,7 +1017,7 @@ function JoinPage({ onBack, onJoined, onError }: { onBack: () => void; onJoined:
 
       <div className="friends-note"><Users size={18} /> 仅加入你认识并信任的人发起的车队。</div>
       <button className="primary-button" onClick={submit} disabled={!preview || busy || waitingForStart}>
-        {busy ? <><RefreshCw className="spin" size={19} /> 正在上车...</> : waitingForStart ? <><Clock3 size={20} /> 等待开放时间</> : <><Users size={20} /> 确认并上车</>}
+        {busy ? <><RefreshCw className="spin" size={19} /> 正在上车...</> : waitingForStart ? <><Clock3 size={20} /> 等待开放时间</> : fromServerLink ? <><Users size={20} /> 一键上车</> : <><Users size={20} /> 确认并上车</>}
       </button>
       <p className="quiet-note"><ShieldCheck size={15} /> 上车码只用于找到座位，授权仅绑定当前设备</p>
     </section>
@@ -1136,8 +1201,10 @@ export default function App() {
   const [loadingTools, setLoadingTools] = useState(true);
   const [car, setCar] = useState<CarSession | null>(null);
   const [access, setAccess] = useState<RideAccess | null>(null);
+  const [pendingServerJoin, setPendingServerJoin] = useState<PendingServerJoin | null>(null);
   const [openedTarget, setOpenedTarget] = useState<LaunchTarget>({ kind: 'claude', mode: 'terminal' });
   const [error, setError] = useState<string | null>(null);
+  const joinRequestId = useRef(0);
 
   const loadTools = async () => {
     setLoadingTools(true);
@@ -1156,8 +1223,38 @@ export default function App() {
       setError(reason instanceof Error ? reason.message : String(reason))
     );
   }, []);
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    let lastCode = '';
+    let lastOpenedAt = 0;
+    const openServerJoin = (code: string) => {
+      if (disposed) return;
+      const now = Date.now();
+      if (code === lastCode && now - lastOpenedAt < 1000) return;
+      lastCode = code;
+      lastOpenedAt = now;
+      joinRequestId.current += 1;
+      setPendingServerJoin({ code, requestId: joinRequestId.current });
+      setScreen('join');
+      setError(null);
+    };
+    void (async () => {
+      unlisten = await listenForJoinLinks(code => {
+        openServerJoin(code);
+        void takePendingJoinCode().catch(() => undefined);
+      });
+      const initialCode = await takePendingJoinCode();
+      if (initialCode) openServerJoin(initialCode);
+    })().catch(reason => setError(reason instanceof Error ? reason.message : String(reason)));
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
 
   const goHome = () => {
+    setPendingServerJoin(null);
     setScreen('welcome');
     setError(null);
   };
@@ -1165,11 +1262,11 @@ export default function App() {
   const page = useMemo(() => {
     if (screen === 'host-setup') return <HostSetup tools={tools} loadingTools={loadingTools} onRefresh={loadTools} onBack={goHome} onStarted={next => { setCar(next); setScreen('host-live'); }} onError={setError} />;
     if (screen === 'host-live' && car) return <HostLive car={car} onStopped={() => { setCar(null); goHome(); }} onError={setError} />;
-    if (screen === 'join') return <JoinPage onBack={goHome} onJoined={next => { setAccess(next); setScreen('ready'); }} onError={setError} />;
+    if (screen === 'join') return <JoinPage key={pendingServerJoin?.requestId ?? 'manual'} initialCode={pendingServerJoin?.code} fromServerLink={pendingServerJoin !== null} onBack={goHome} onJoined={next => { setPendingServerJoin(null); setAccess(next); setScreen('ready'); }} onError={setError} />;
     if (screen === 'ready' && access) return <ToolChooser access={access} tools={tools} onOpened={target => { setOpenedTarget(target); setScreen('ride'); }} onError={setError} />;
     if (screen === 'ride' && access) return <RidePage access={access} tools={tools} initiallyOpened={openedTarget} onLeave={() => { setAccess(null); goHome(); }} onError={setError} />;
-    return <Welcome onHost={() => setScreen('host-setup')} onJoin={() => setScreen('join')} />;
-  }, [screen, tools, loadingTools, car, access, openedTarget]);
+    return <Welcome onHost={() => setScreen('host-setup')} onJoin={() => { setPendingServerJoin(null); setScreen('join'); }} />;
+  }, [screen, tools, loadingTools, car, access, pendingServerJoin, openedTarget]);
 
   return (
     <WindowShell onHome={goHome}>

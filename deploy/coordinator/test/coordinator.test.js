@@ -41,10 +41,19 @@ async function withServer(run, options) {
 async function request(url, method = 'GET', body) {
   return new Promise((resolve, reject) => {
     const target = new URL(url);
-    const req = http.request({ hostname: target.hostname, port: target.port, path: target.pathname, method, headers: body ? { 'content-type': 'application/json' } : {} }, res => {
+    const req = http.request({ hostname: target.hostname, port: target.port, path: `${target.pathname}${target.search}`, method, headers: body ? { 'content-type': 'application/json' } : {} }, res => {
       const chunks = [];
       res.on('data', chunk => chunks.push(chunk));
-      res.on('end', () => resolve({ status: res.statusCode, body: JSON.parse(Buffer.concat(chunks).toString('utf8')) }));
+      res.on('end', () => {
+        const text = Buffer.concat(chunks).toString('utf8');
+        const contentType = String(res.headers['content-type'] || '');
+        resolve({
+          status: res.statusCode,
+          headers: res.headers,
+          text,
+          body: contentType.includes('application/json') ? JSON.parse(text) : text,
+        });
+      });
     });
     req.on('error', reject);
     if (body) req.write(JSON.stringify(body));
@@ -73,6 +82,19 @@ test('registers and resolves an owner-signed public invite', async () => {
     const resolved = await request(`${base}/api/v1/carpool/invites/${invite.code}`);
     assert.equal(resolved.status, 200);
     assert.equal(resolved.body.invite.owner_peer_id, owner.peerId);
+    const join = await request(`${base}/api/v1/carpool/join/${invite.code}`);
+    assert.equal(join.status, 200);
+    assert.match(join.headers['content-type'], /^text\/html/);
+    assert.match(join.headers['content-security-policy'], /default-src 'none'/);
+    assert.match(join.text, new RegExp(`trusted-carpool://join/${invite.code}`));
+    assert.doesNotMatch(join.text, /owner_public_key|payload_base64|signature/);
+  });
+});
+
+test('does not create launch pages for unknown or malformed invite codes', async () => {
+  await withServer(async base => {
+    assert.equal((await request(`${base}/api/v1/carpool/join/7G2K5LQ8M4TZ`)).status, 404);
+    assert.equal((await request(`${base}/api/v1/carpool/join/%3Cscript%3E`)).status, 404);
   });
 });
 

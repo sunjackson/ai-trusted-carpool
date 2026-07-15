@@ -274,6 +274,8 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .my-usage-card > span { color: #d6bb64; font-size: 10px; }
 .invite-code { display: flex; align-items: center; gap: 6px; margin-top: 14px; padding: 7px 8px; color: #d7dbe1; font: 700 9px 'Sora',sans-serif; letter-spacing: .35px; border: 1px solid #383f48; border-radius: 8px; background: #20242a; cursor: pointer; }
 .invite-code:hover { border-color: var(--gold); color: var(--gold); }
+.share-link-hint { display: flex; align-items: center; justify-content: center; gap: 7px; margin: 17px 0 0; color: #9ba3ad; font-size: 10px; }
+.share-link-hint + .primary-button--compact { margin-top: 9px; }
 .toast-inline { width: max-content; margin: 8px auto -6px; color: #8ce7a9; font-size: 11px; }
 .live-notice { display: flex; align-items: center; gap: 10px; margin-top: 18px; padding: 12px 14px; color: #d8b9b2; border: 1px solid #683c35; border-radius: 12px; background: #2b1c1a; font-size: 11px; }
 .live-notice svg { color: var(--danger); }
@@ -285,6 +287,7 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .green { color: #47de7a; }
 
 .join-page { max-width: 720px; }
+.server-link-badge { width: max-content; display: inline-flex; align-items: center; gap: 6px; margin-top: 12px; padding: 6px 10px; color: #8ce7aa; border: 1px solid #28583a; border-radius: 999px; background: #153421; font-size: 10px; }
 .code-input-wrap { display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: stretch; margin: 26px auto 20px; }
 .code-boxes { position: relative; display: grid; grid-template-columns: repeat(3,1fr); gap: 10px; }
 .code-boxes span { height: 64px; display: grid; place-items: center; color: #f7f8fa; font: 700 20px 'Sora',sans-serif; letter-spacing: 4px; border: 1px solid #3b424c; border-radius: 13px; background: #171a1f; }

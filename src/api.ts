@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
+import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
   CarSession,
   JoinPreview,
@@ -13,6 +14,27 @@ import type {
 } from './types';
 
 const inTauri = (): boolean => '__TAURI_INTERNALS__' in window;
+const JOIN_LINK_EVENT = 'trusted-carpool:join-link';
+const JOIN_CODE_PATTERN = /^[A-HJ-NP-Z2-9]{12}$/;
+
+export function serverJoinUrl(code: string): string {
+  const normalized = code.trim().toUpperCase();
+  if (!JOIN_CODE_PATTERN.test(normalized)) throw new Error('上车码格式不正确');
+  return `https://p2p.cnaigc.ai/api/v1/carpool/join/${normalized}`;
+}
+
+export async function takePendingJoinCode(): Promise<string | null> {
+  return inTauri() ? invoke<string | null>('take_pending_join_code') : null;
+}
+
+export async function listenForJoinLinks(
+  onCode: (code: string) => void
+): Promise<UnlistenFn> {
+  if (!inTauri()) return () => undefined;
+  return listen<string>(JOIN_LINK_EVENT, event => {
+    if (JOIN_CODE_PATTERN.test(event.payload)) onCode(event.payload);
+  });
+}
 
 const demoTools: ToolDetection[] = [
   {

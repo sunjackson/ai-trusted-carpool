@@ -19,6 +19,7 @@ pub struct AppRuntime {
     pub pending_signals: Vec<CoordinatorMessage>,
     pub relay_request_seen_at: HashMap<String, i64>,
     pub usage_history_path: Option<PathBuf>,
+    pub pending_join_code: Option<String>,
 }
 
 #[derive(Debug, Clone)]

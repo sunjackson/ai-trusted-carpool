@@ -4,6 +4,7 @@ mod commands;
 mod coordinator;
 mod crypto;
 mod identity;
+mod join_link;
 mod local_proxy;
 mod models;
 mod pricing;
@@ -11,6 +12,7 @@ mod protocol;
 mod quota;
 mod relay;
 mod runtime;
+mod status_tray;
 mod terminal_launcher;
 mod usage;
 mod usage_history;
@@ -24,12 +26,23 @@ use commands::{
 use relay::RelayBridge;
 use runtime::RuntimeState;
 use tauri::Manager;
+use tauri_plugin_deep_link::DeepLinkExt;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let state = RuntimeState::default();
     let setup_state = state.clone();
-    tauri::Builder::default()
+    let single_instance_state = state.clone();
+    let builder = tauri::Builder::default();
+    #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(
+        move |app, arguments, _working_directory| {
+            join_link::accept_urls(app, &single_instance_state, arguments.iter());
+            join_link::show_main_window(app);
+        },
+    ));
+    builder
+        .plugin(tauri_plugin_deep_link::init())
         .manage(state)
         .setup(move |app| {
             client_launcher::recover_stale(app.handle()).map_err(std::io::Error::other)?;
@@ -48,6 +61,38 @@ pub fn run() {
                 RelayBridge::global().set_app_handle(app.handle().clone()),
             );
             local_proxy::start(setup_state.clone()).map_err(std::io::Error::other)?;
+            match status_tray::setup(app) {
+                Ok(()) => {
+                    status_tray::spawn_refresh_loop(app.handle().clone(), setup_state.clone())
+                }
+                Err(error) => eprintln!("system status tray is unavailable: {error}"),
+            }
+
+            #[cfg(any(windows, target_os = "linux"))]
+            if let Err(error) = app.deep_link().register_all() {
+                eprintln!("runtime deep-link registration is unavailable: {error}");
+            }
+
+            if let Some(urls) = app
+                .deep_link()
+                .get_current()
+                .map_err(std::io::Error::other)?
+            {
+                join_link::accept_urls(
+                    app.handle(),
+                    &setup_state,
+                    urls.iter().map(ToString::to_string),
+                );
+            }
+            let open_state = setup_state.clone();
+            let open_app = app.handle().clone();
+            app.deep_link().on_open_url(move |event| {
+                join_link::accept_urls(
+                    &open_app,
+                    &open_state,
+                    event.urls().iter().map(ToString::to_string),
+                );
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -68,11 +113,25 @@ pub fn run() {
             execute_relay_request,
             start_relay_request,
             submit_relay_response,
-            submit_relay_stream_event
+            submit_relay_stream_event,
+            join_link::take_pending_join_code
         ])
         .build(tauri::generate_context!())
         .expect("failed to build trusted carpool desktop")
         .run(|app, event| {
+            if let tauri::RunEvent::WindowEvent {
+                label,
+                event: tauri::WindowEvent::CloseRequested { api, .. },
+                ..
+            } = &event
+            {
+                if label == "main" && status_tray::should_hide_on_close(app) {
+                    api.prevent_close();
+                    if let Some(window) = app.get_webview_window(label) {
+                        let _ = window.hide();
+                    }
+                }
+            }
             if matches!(event, tauri::RunEvent::Exit) {
                 if let Err(error) = client_launcher::recover_stale(app) {
                     eprintln!("failed to restore desktop client configuration on exit: {error}");

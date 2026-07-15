@@ -41,12 +41,16 @@ host can enable either or both, and each of four seats can run requests concurre
    so launching the desktop app outside a shell does not depend on an inherited `PATH`.
 2. Host sets a start/end window, creates four signed public invites, and registers them with the
    coordinator.
-3. Passenger enters one short code, verifies the host signature, and sends a signed claim.
-4. Host automatically binds the first valid claimant to that seat and returns an encrypted grant.
-5. WebRTC is attempted first; TURN is used automatically when direct connectivity fails.
-6. The passenger's local HTTP proxy streams Claude Code/Codex requests and responses through the
+3. The coordinator exposes a fixed-origin `/api/v1/carpool/join/<code>` launch page. It contains only the short
+   code and redirects to the statically registered `trusted-carpool://join/<code>` scheme. The
+   desktop app rejects every non-official HTTPS origin, custom-scheme host, port, and malformed code.
+4. Passenger opens the official link (or enters one short code), verifies the host signature, and
+   sends a signed claim. A locally saved nickname makes repeated friend-to-friend joins one click.
+5. Host automatically binds the first valid claimant to that seat and returns an encrypted grant.
+6. WebRTC is attempted first; TURN is used automatically when direct connectivity fails.
+7. The passenger's local HTTP proxy streams Claude Code/Codex requests and responses through the
    encrypted data channel without waiting for a complete model response.
-7. The host validates the official endpoint, calls the provider locally, extracts provider usage,
+8. The host validates the official endpoint, calls the provider locally, extracts provider usage,
    and updates that seat's model-specific counters and official list-price estimate.
 
 ## Quota Visibility
@@ -67,3 +71,7 @@ host can enable either or both, and each of four seats can run requests concurre
 
 Tauri 2 and Rust provide one codebase for macOS, Windows, and Linux. Platform-specific code is
 limited to executable discovery, detached process launch, secure file permissions, and packaging.
+The deep-link and single-instance plugins route cold and warm launch URLs to the same validated
+join handler. A native tray/menu-bar item mirrors idle, hosting occupancy, riding, or combined
+state once per second. Closing the main window hides it instead of stopping an active car or ride;
+the tray menu remains the explicit reopen/quit surface.

@@ -1,6 +1,6 @@
 import '@testing-library/jest-dom/vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import App from './App';
 
 describe('Trusted Carpool simple flow', () => {
@@ -82,6 +82,29 @@ describe('Trusted Carpool simple flow', () => {
     expect(saveButton).toBeEnabled();
     expect(screen.getByText(/明细仅保存在车主本机/)).toBeInTheDocument();
     expect(screen.getByText(/官方 API 标准价估算，不是账单/)).toBeInTheDocument();
+  });
+
+  it('copies official server links instead of making friends retype seat codes', async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText },
+    });
+    render(<App />);
+    fireEvent.click(screen.getByRole('button', { name: /我要发车/ }));
+    const startButton = await screen.findByRole('button', { name: /开始发车/ });
+    await waitFor(() => expect(startButton).toBeEnabled());
+    fireEvent.click(startButton);
+
+    const seatLink = await screen.findByRole('button', { name: 'CR8W-4N2H-J7KM' });
+    expect(seatLink).toHaveAttribute('title', '复制服务器一键上车链接');
+    fireEvent.click(seatLink);
+    await waitFor(() =>
+      expect(writeText).toHaveBeenCalledWith(
+        'https://p2p.cnaigc.ai/api/v1/carpool/join/CR8W4N2HJ7KM'
+      )
+    );
+    expect(screen.getByRole('button', { name: '复制全部上车链接' })).toBeInTheDocument();
   });
 
   it('opens the twelve-character join flow', () => {
