@@ -26,6 +26,17 @@ pub struct ToolDetection {
     pub executable_path: Option<String>,
     pub config_path: Option<String>,
     pub detail: String,
+    pub desktop_supported: bool,
+    pub desktop_installed: bool,
+    pub desktop_path: Option<String>,
+    pub desktop_detail: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum LaunchMode {
+    Terminal,
+    Desktop,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -241,6 +252,7 @@ pub enum ConnectionState {
 #[serde(rename_all = "camelCase")]
 pub struct LaunchToolInput {
     pub kind: ToolKind,
+    pub mode: LaunchMode,
     pub access_id: String,
     pub work_dir: Option<String>,
 }

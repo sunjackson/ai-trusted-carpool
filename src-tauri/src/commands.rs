@@ -260,6 +260,7 @@ fn detect_tool(kind: ToolKind) -> ToolDetection {
         (true, false, true) => "已登录，但缺少官方 API Key",
         (true, false, false) => "缺少官方 API Key",
     };
+    let desktop = crate::client_launcher::detect(kind);
     ToolDetection {
         kind,
         name: name.to_string(),
@@ -270,6 +271,10 @@ fn detect_tool(kind: ToolKind) -> ToolDetection {
             .map(|value| value.source)
             .or_else(|| local_config.map(|path| path.to_string_lossy().into_owned())),
         detail: detail.to_string(),
+        desktop_supported: desktop.supported,
+        desktop_installed: desktop.installed,
+        desktop_path: desktop.path,
+        desktop_detail: desktop.detail,
     }
 }
 
@@ -971,16 +976,23 @@ pub async fn leave_car(
         passenger_peer_id: identity.peer_id.clone(),
         timestamp_ms: now_ms(),
     };
-    let coordinator = CoordinatorClient::from_environment()?;
-    let send_result = coordinator
-        .send_message(
-            &identity,
-            &context.owner_peer_id,
-            "hangup",
-            serde_json::to_string(&notice).map_err(|error| format!("无法编码离开通知: {error}"))?,
-            now_ms(),
-        )
-        .await;
+    crate::client_launcher::restore_access(&app, &access_id, true)?;
+    let notice_json =
+        serde_json::to_string(&notice).map_err(|error| format!("无法编码离开通知: {error}"))?;
+    let send_result = match CoordinatorClient::from_environment() {
+        Ok(coordinator) => {
+            coordinator
+                .send_message(
+                    &identity,
+                    &context.owner_peer_id,
+                    "hangup",
+                    notice_json,
+                    now_ms(),
+                )
+                .await
+        }
+        Err(error) => Err(error),
+    };
     {
         let mut runtime = state
             .inner
@@ -1071,9 +1083,14 @@ fn spawn_tool(
 #[tauri::command]
 pub async fn launch_tool(
     input: LaunchToolInput,
+    app: AppHandle,
     state: State<'_, RuntimeState>,
 ) -> Result<(), String> {
-    let work_dir = validate_work_dir(input.work_dir.as_deref())?;
+    let work_dir = if input.mode == LaunchMode::Terminal {
+        validate_work_dir(input.work_dir.as_deref())?
+    } else {
+        None
+    };
     let (access, session_secret) = {
         let runtime = state
             .inner
@@ -1092,7 +1109,14 @@ pub async fn launch_tool(
             .ok_or_else(|| "加密会话密钥已失效，请重新上车".to_string())?;
         (access.clone(), secret.clone())
     };
-    spawn_tool(input.kind, &access, &session_secret, work_dir.as_deref())
+    match input.mode {
+        LaunchMode::Terminal => {
+            spawn_tool(input.kind, &access, &session_secret, work_dir.as_deref())
+        }
+        LaunchMode::Desktop => {
+            crate::client_launcher::launch(&app, input.kind, &access, &session_secret)
+        }
+    }
 }
 
 fn allowed_signal_kind(kind: &str) -> bool {

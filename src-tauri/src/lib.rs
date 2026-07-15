@@ -1,4 +1,5 @@
 mod account_quota;
+mod client_launcher;
 mod commands;
 mod coordinator;
 mod crypto;
@@ -31,6 +32,7 @@ pub fn run() {
     tauri::Builder::default()
         .manage(state)
         .setup(move |app| {
+            client_launcher::recover_stale(app.handle()).map_err(std::io::Error::other)?;
             let history_path = app
                 .path()
                 .app_data_dir()
@@ -68,6 +70,13 @@ pub fn run() {
             submit_relay_response,
             submit_relay_stream_event
         ])
-        .run(tauri::generate_context!())
-        .expect("failed to run trusted carpool desktop");
+        .build(tauri::generate_context!())
+        .expect("failed to build trusted carpool desktop")
+        .run(|app, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                if let Err(error) = client_launcher::recover_stale(app) {
+                    eprintln!("failed to restore desktop client configuration on exit: {error}");
+                }
+            }
+        });
 }

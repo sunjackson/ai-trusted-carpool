@@ -92,4 +92,32 @@ describe('Trusted Carpool simple flow', () => {
     expect(screen.getByRole('button', { name: /确认并上车/ })).toBeDisabled();
     expect(screen.queryByText(/押金|积分|结算/)).not.toBeInTheDocument();
   });
+
+  it('lets passengers choose desktop clients or terminals after joining', async () => {
+    render(<App />);
+    fireEvent.click(screen.getByRole('button', { name: /我要上车/ }));
+    fireEvent.change(screen.getByLabelText('输入上车码'), {
+      target: { value: '7G2K5LQ8M4TZ' },
+    });
+    await screen.findByText('我的高效车队');
+    fireEvent.change(screen.getByPlaceholderText('例如：阿杰'), {
+      target: { value: '小雨' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /确认并上车/ }));
+
+    expect(await screen.findByRole('heading', { name: '选择要打开的工具' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^客户端/ })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByRole('button', { name: /打开 Claude 客户端/ })).toBeEnabled();
+    expect(screen.queryByText('项目目录（可选）')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: /^终端/ }));
+    expect(screen.getByText('项目目录（可选）')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /打开 Claude 终端/ })).toBeEnabled();
+
+    fireEvent.click(screen.getByRole('button', { name: /^客户端/ }));
+    fireEvent.click(screen.getByRole('button', { name: /打开 Claude 客户端/ }));
+    expect(await screen.findByRole('heading', { name: '需要哪个，点哪个' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /新客户端/ })).toBeInTheDocument();
+    expect(screen.getAllByRole('button', { name: /终端/ })).toHaveLength(2);
+  });
 });

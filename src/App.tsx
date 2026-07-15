@@ -10,6 +10,7 @@ import {
   Copy,
   Gauge,
   LogOut,
+  MonitorUp,
   RefreshCw,
   ShieldCheck,
   SlidersHorizontal,
@@ -43,12 +44,14 @@ import type {
   SharedCarStatus,
   ToolDetection,
   ToolKind,
+  LaunchMode,
 } from './types';
 import { trustedWebRtc } from './trustedWebRtc';
 
 type Screen = 'welcome' | 'host-setup' | 'host-live' | 'join' | 'ready' | 'ride';
 
-const TOOL_LABEL: Record<ToolKind, string> = { claude: 'Claude Code', codex: 'Codex' };
+const TOOL_LABEL: Record<ToolKind, string> = { claude: 'Claude', codex: 'Codex' };
+type LaunchTarget = { kind: ToolKind; mode: LaunchMode };
 const formatInviteCode = (code: string): string => code.match(/.{1,4}/g)?.join('-') ?? code;
 const toDateTimeInput = (timestamp: number): string => {
   const date = new Date(timestamp);
@@ -956,17 +959,34 @@ function JoinPage({ onBack, onJoined, onError }: { onBack: () => void; onJoined:
   );
 }
 
-function ToolChooser({ access, onOpened, onError }: { access: RideAccess; onOpened: (kind: ToolKind) => void; onError: (message: string) => void }) {
+function ToolChooser({ access, tools, onOpened, onError }: { access: RideAccess; tools: ToolDetection[]; onOpened: (target: LaunchTarget) => void; onError: (message: string) => void }) {
   const [selected, setSelected] = useState<ToolKind>(access.enabledTools[0] ?? 'claude');
+  const initialDetection = tools.find(tool => tool.kind === (access.enabledTools[0] ?? 'claude'));
+  const [mode, setMode] = useState<LaunchMode>(initialDetection?.desktopInstalled ? 'desktop' : 'terminal');
   const [workDir, setWorkDir] = useState('');
   const [showDir, setShowDir] = useState(false);
   const [busy, setBusy] = useState(false);
+  const detection = tools.find(tool => tool.kind === selected);
+  const terminalAvailable = detection?.installed ?? false;
+  const desktopAvailable = detection?.desktopSupported === true && detection.desktopInstalled;
+  const selectedAvailable = mode === 'desktop' ? desktopAvailable : terminalAvailable;
+
+  const selectTool = (kind: ToolKind) => {
+    setSelected(kind);
+    const next = tools.find(tool => tool.kind === kind);
+    setMode(next?.desktopInstalled ? 'desktop' : 'terminal');
+  };
 
   const open = async () => {
     setBusy(true);
     try {
-      await launchTool({ kind: selected, accessId: access.accessId, workDir: workDir.trim() || undefined });
-      onOpened(selected);
+      await launchTool({
+        kind: selected,
+        mode,
+        accessId: access.accessId,
+        workDir: mode === 'terminal' ? workDir.trim() || undefined : undefined,
+      });
+      onOpened({ kind: selected, mode });
     } catch (error) {
       onError(error instanceof Error ? error.message : String(error));
     } finally {
@@ -983,39 +1003,52 @@ function ToolChooser({ access, onOpened, onError }: { access: RideAccess; onOpen
       </div>
       <div className="tool-grid chooser-grid">
         {access.enabledTools.map(kind => (
-          <button className={`tool-card chooser-card ${selected === kind ? 'tool-card--selected' : ''}`} key={kind} onClick={() => setSelected(kind)}>
+          <button className={`tool-card chooser-card ${selected === kind ? 'tool-card--selected' : ''}`} key={kind} onClick={() => selectTool(kind)}>
             <ToolMark kind={kind} />
-            <span className="tool-card__body"><strong>{TOOL_LABEL[kind]}</strong><small>{kind === 'claude' ? '长文本与复杂任务' : '代码与工程任务'}</small></span>
+            <span className="tool-card__body"><strong>{TOOL_LABEL[kind]}</strong><small>终端与客户端都能使用</small></span>
             <span className={`radio ${selected === kind ? 'radio--on' : ''}`} />
           </button>
         ))}
       </div>
-      <button className="folder-toggle" onClick={() => setShowDir(value => !value)}>
-        <span>项目目录（可选）</span><ChevronDown size={17} className={showDir ? 'turn' : ''} />
+      <div className="launch-mode-picker" aria-label="启动方式">
+        <button className={mode === 'desktop' ? 'launch-mode--selected' : ''} onClick={() => setMode('desktop')} disabled={!desktopAvailable} aria-pressed={mode === 'desktop'}>
+          <MonitorUp size={19} /><span><strong>客户端</strong><small>{detection?.desktopDetail ?? '正在检测'}</small></span>
+        </button>
+        <button className={mode === 'terminal' ? 'launch-mode--selected' : ''} onClick={() => setMode('terminal')} disabled={!terminalAvailable} aria-pressed={mode === 'terminal'}>
+          <SquareTerminal size={19} /><span><strong>终端</strong><small>{terminalAvailable ? '已安装，可直接打开' : '未找到命令行工具'}</small></span>
+        </button>
+      </div>
+      {mode === 'terminal' && <>
+        <button className="folder-toggle" onClick={() => setShowDir(value => !value)}>
+          <span>项目目录（可选）</span><ChevronDown size={17} className={showDir ? 'turn' : ''} />
+        </button>
+        {showDir && <input className="directory-input page-enter" value={workDir} onChange={event => setWorkDir(event.target.value)} placeholder="留空使用默认目录" />}
+      </>}
+      <button className="primary-button" onClick={open} disabled={busy || !selectedAvailable}>
+        {busy ? <><RefreshCw className="spin" size={19} /> 正在打开...</> : mode === 'desktop' ? <><MonitorUp size={20} /> 打开 {TOOL_LABEL[selected]} 客户端</> : <><SquareTerminal size={20} /> 打开 {TOOL_LABEL[selected]} 终端</>}
       </button>
-      {showDir && <input className="directory-input page-enter" value={workDir} onChange={event => setWorkDir(event.target.value)} placeholder="留空使用默认目录" />}
-      <button className="primary-button" onClick={open} disabled={busy}>
-        {busy ? <><RefreshCw className="spin" size={19} /> 正在打开...</> : <><SquareTerminal size={20} /> 打开 {TOOL_LABEL[selected]}</>}
-      </button>
-      <p className="quiet-note">两个工具可以同时打开</p>
+      <p className="quiet-note">客户端会临时使用本车路由，离车后自动恢复原配置</p>
     </section>
   );
 }
 
-function RidePage({ access, initiallyOpened, onLeave, onError }: { access: RideAccess; initiallyOpened: ToolKind; onLeave: () => void; onError: (message: string) => void }) {
-  const [opened, setOpened] = useState<ToolKind[]>([initiallyOpened]);
-  const [busy, setBusy] = useState<ToolKind | null>(null);
+function RidePage({ access, tools, initiallyOpened, onLeave, onError }: { access: RideAccess; tools: ToolDetection[]; initiallyOpened: LaunchTarget; onLeave: () => void; onError: (message: string) => void }) {
+  const [opened, setOpened] = useState<LaunchTarget[]>([initiallyOpened]);
+  const [busy, setBusy] = useState<string | null>(null);
   const [leaving, setLeaving] = useState(false);
   const [sharedStatus, setSharedStatus] = useState<SharedCarStatus | null>(null);
   const [showMemberDetails, setShowMemberDetails] = useState(false);
 
   useEffect(() => trustedWebRtc.subscribeCarStatus(setSharedStatus), []);
 
-  const open = async (kind: ToolKind) => {
-    setBusy(kind);
+  const open = async (kind: ToolKind, mode: LaunchMode) => {
+    const key = `${kind}-${mode}`;
+    setBusy(key);
     try {
-      await launchTool({ kind, accessId: access.accessId });
-      setOpened(current => current.includes(kind) ? current : [...current, kind]);
+      await launchTool({ kind, mode, accessId: access.accessId });
+      setOpened(current => current.some(target => target.kind === kind && target.mode === mode)
+        ? current
+        : [...current, { kind, mode }]);
     } catch (error) {
       onError(error instanceof Error ? error.message : String(error));
     } finally {
@@ -1065,12 +1098,22 @@ function RidePage({ access, initiallyOpened, onLeave, onError }: { access: RideA
       )}
       <div className="ride-tool-grid">
         {access.enabledTools.map(kind => {
-          const isOpen = opened.includes(kind);
+          const detection = tools.find(tool => tool.kind === kind);
+          const terminalOpen = opened.some(target => target.kind === kind && target.mode === 'terminal');
+          const desktopOpen = opened.some(target => target.kind === kind && target.mode === 'desktop');
+          const isOpen = terminalOpen || desktopOpen;
           return (
             <article className={`ride-tool ${isOpen ? 'ride-tool--open' : ''}`} key={kind}>
               <ToolMark kind={kind} />
-              <div><strong>{TOOL_LABEL[kind]}</strong><small><i /> {isOpen ? '已打开' : '未打开'}</small></div>
-              <button onClick={() => open(kind)} disabled={busy === kind}>{busy === kind ? '打开中' : isOpen ? '打开新窗口' : '打开'}</button>
+              <div className="ride-tool__meta"><strong>{TOOL_LABEL[kind]}</strong><small><i /> {isOpen ? `${desktopOpen ? '客户端' : ''}${desktopOpen && terminalOpen ? '、' : ''}${terminalOpen ? '终端' : ''}已打开` : '未打开'}</small></div>
+              <div className="ride-tool__actions">
+                <button onClick={() => open(kind, 'desktop')} disabled={busy === `${kind}-desktop` || !detection?.desktopInstalled} title={detection?.desktopDetail}>
+                  <MonitorUp size={15} /> {busy === `${kind}-desktop` ? '打开中' : desktopOpen ? '新客户端' : '客户端'}
+                </button>
+                <button onClick={() => open(kind, 'terminal')} disabled={busy === `${kind}-terminal` || !detection?.installed}>
+                  <SquareTerminal size={15} /> {busy === `${kind}-terminal` ? '打开中' : terminalOpen ? '新终端' : '终端'}
+                </button>
+              </div>
             </article>
           );
         })}
@@ -1093,7 +1136,7 @@ export default function App() {
   const [loadingTools, setLoadingTools] = useState(true);
   const [car, setCar] = useState<CarSession | null>(null);
   const [access, setAccess] = useState<RideAccess | null>(null);
-  const [openedTool, setOpenedTool] = useState<ToolKind>('claude');
+  const [openedTarget, setOpenedTarget] = useState<LaunchTarget>({ kind: 'claude', mode: 'terminal' });
   const [error, setError] = useState<string | null>(null);
 
   const loadTools = async () => {
@@ -1123,10 +1166,10 @@ export default function App() {
     if (screen === 'host-setup') return <HostSetup tools={tools} loadingTools={loadingTools} onRefresh={loadTools} onBack={goHome} onStarted={next => { setCar(next); setScreen('host-live'); }} onError={setError} />;
     if (screen === 'host-live' && car) return <HostLive car={car} onStopped={() => { setCar(null); goHome(); }} onError={setError} />;
     if (screen === 'join') return <JoinPage onBack={goHome} onJoined={next => { setAccess(next); setScreen('ready'); }} onError={setError} />;
-    if (screen === 'ready' && access) return <ToolChooser access={access} onOpened={kind => { setOpenedTool(kind); setScreen('ride'); }} onError={setError} />;
-    if (screen === 'ride' && access) return <RidePage access={access} initiallyOpened={openedTool} onLeave={() => { setAccess(null); goHome(); }} onError={setError} />;
+    if (screen === 'ready' && access) return <ToolChooser access={access} tools={tools} onOpened={target => { setOpenedTarget(target); setScreen('ride'); }} onError={setError} />;
+    if (screen === 'ride' && access) return <RidePage access={access} tools={tools} initiallyOpened={openedTarget} onLeave={() => { setAccess(null); goHome(); }} onError={setError} />;
     return <Welcome onHost={() => setScreen('host-setup')} onJoin={() => setScreen('join')} />;
-  }, [screen, tools, loadingTools, car, access, openedTool]);
+  }, [screen, tools, loadingTools, car, access, openedTarget]);
 
   return (
     <WindowShell onHome={goHome}>

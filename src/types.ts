@@ -1,4 +1,5 @@
 export type ToolKind = 'claude' | 'codex';
+export type LaunchMode = 'terminal' | 'desktop';
 
 export type ToolDetection = {
   kind: ToolKind;
@@ -8,6 +9,10 @@ export type ToolDetection = {
   executablePath: string | null;
   configPath: string | null;
   detail: string;
+  desktopSupported: boolean;
+  desktopInstalled: boolean;
+  desktopPath: string | null;
+  desktopDetail: string;
 };
 
 export type ModelUsageSummary = {

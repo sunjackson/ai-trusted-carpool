@@ -9,6 +9,7 @@ import type {
   SeatUsageSummary,
   ToolDetection,
   ToolKind,
+  LaunchMode,
 } from './types';
 
 const inTauri = (): boolean => '__TAURI_INTERNALS__' in window;
@@ -22,6 +23,10 @@ const demoTools: ToolDetection[] = [
     executablePath: '/usr/local/bin/claude',
     configPath: '~/.claude',
     detail: '已就绪',
+    desktopSupported: true,
+    desktopInstalled: true,
+    desktopPath: '/Applications/Claude.app',
+    desktopDetail: '已安装，可一键配置并启动',
   },
   {
     kind: 'codex',
@@ -31,6 +36,10 @@ const demoTools: ToolDetection[] = [
     executablePath: '/usr/local/bin/codex',
     configPath: '~/.codex/auth.json',
     detail: '已就绪',
+    desktopSupported: true,
+    desktopInstalled: true,
+    desktopPath: '/Applications/Codex.app',
+    desktopDetail: '已安装，可一键配置并启动',
   },
 ];
 
@@ -288,6 +297,7 @@ export async function joinCar(code: string, nickname: string): Promise<RideAcces
 
 export async function launchTool(input: {
   kind: ToolKind;
+  mode: LaunchMode;
   accessId: string;
   workDir?: string;
 }): Promise<void> {
