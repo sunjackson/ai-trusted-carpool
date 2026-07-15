@@ -62,6 +62,10 @@ const formatDateTime = (timestamp: number): string =>
     hour: '2-digit',
     minute: '2-digit',
   }).format(timestamp);
+const roundUpToHalfHour = (timestamp: number): number =>
+  Math.ceil(timestamp / (30 * 60_000)) * 30 * 60_000;
+const durationOptions = [1, 2, 4, 8] as const;
+type DurationHours = (typeof durationOptions)[number];
 const formatTokens = (value: number): string =>
   value >= 10_000 ? `${(value / 10_000).toFixed(1)}万` : value.toLocaleString('zh-CN');
 const formatOfficialCost = (microUsd: number): string =>
@@ -203,8 +207,14 @@ function HostSetup({
     tools.filter(tool => tool.installed && tool.authenticated).map(tool => tool.kind)
   );
   const [carName, setCarName] = useState('我的高效车队');
-  const [startsAt, setStartsAt] = useState(() => toDateTimeInput(Date.now()));
-  const [endsAt, setEndsAt] = useState(() => toDateTimeInput(Date.now() + 2 * 60 * 60 * 1000));
+  const [startMode, setStartMode] = useState<'now' | 'scheduled'>('now');
+  const [scheduledAt, setScheduledAt] = useState(() =>
+    toDateTimeInput(roundUpToHalfHour(Date.now() + 15 * 60_000))
+  );
+  const [durationHours, setDurationHours] = useState<DurationHours | 'custom'>(2);
+  const [customEndsAt, setCustomEndsAt] = useState(() =>
+    toDateTimeInput(roundUpToHalfHour(Date.now() + 15 * 60_000) + 2 * 60 * 60_000)
+  );
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
@@ -222,13 +232,45 @@ function HostSetup({
     );
   };
 
+  const previewStart =
+    startMode === 'now' ? Date.now() : new Date(scheduledAt).getTime();
+  const previewEnd =
+    durationHours === 'custom'
+      ? new Date(customEndsAt).getTime()
+      : previewStart + durationHours * 60 * 60_000;
+  const hasValidPreview =
+    Number.isFinite(previewStart) && Number.isFinite(previewEnd) && previewEnd > previewStart;
+
+  const chooseDuration = (duration: DurationHours | 'custom') => {
+    setDurationHours(duration);
+    if (duration !== 'custom') return;
+    const currentEnd = new Date(customEndsAt).getTime();
+    if (!Number.isFinite(currentEnd) || currentEnd <= previewStart + 15 * 60_000) {
+      setCustomEndsAt(toDateTimeInput(previewStart + 2 * 60 * 60_000));
+    }
+  };
+
+  const updateScheduledAt = (value: string) => {
+    setScheduledAt(value);
+    if (durationHours !== 'custom') return;
+    const nextStart = new Date(value).getTime();
+    const currentEnd = new Date(customEndsAt).getTime();
+    if (Number.isFinite(nextStart) && currentEnd <= nextStart + 15 * 60_000) {
+      setCustomEndsAt(toDateTimeInput(nextStart + 2 * 60 * 60_000));
+    }
+  };
+
   const submit = async () => {
     if (selected.length === 0) {
       onError('至少选择一个已就绪的工具');
       return;
     }
-    const startTimestamp = new Date(startsAt).getTime();
-    const endTimestamp = new Date(endsAt).getTime();
+    const startTimestamp =
+      startMode === 'now' ? Date.now() : new Date(scheduledAt).getTime();
+    const endTimestamp =
+      durationHours === 'custom'
+        ? new Date(customEndsAt).getTime()
+        : startTimestamp + durationHours * 60 * 60_000;
     if (!Number.isFinite(startTimestamp) || !Number.isFinite(endTimestamp) || endTimestamp <= startTimestamp) {
       onError('请选择正确的开始和结束时间');
       return;
@@ -304,29 +346,110 @@ function HostSetup({
         })}
       </div>
 
-      <div className="setup-grid">
-        <label>
+      <div className="setup-stack">
+        <label className="setup-field">
           <span>车队名称</span>
           <input value={carName} onChange={event => setCarName(event.target.value)} maxLength={32} />
         </label>
-        <label>
-          <span>开始时间</span>
-          <input
-            type="datetime-local"
-            value={startsAt}
-            onChange={event => {
-              setStartsAt(event.target.value);
-              const nextStart = new Date(event.target.value).getTime();
-              if (Number.isFinite(nextStart) && new Date(endsAt).getTime() <= nextStart) {
-                setEndsAt(toDateTimeInput(nextStart + 2 * 60 * 60 * 1000));
-              }
-            }}
-          />
-        </label>
-        <label>
-          <span>结束时间</span>
-          <input type="datetime-local" value={endsAt} onChange={event => setEndsAt(event.target.value)} />
-        </label>
+        <div className="schedule-card">
+          <div className="schedule-card__heading">
+            <span className="schedule-card__icon"><Clock3 size={18} /></span>
+            <div>
+              <strong>发车时间</strong>
+              <small>先选什么时候开始，再选共享多久</small>
+            </div>
+          </div>
+
+          <div className="schedule-row">
+            <span className="schedule-row__label">什么时候开始</span>
+            <div className="segmented-control" role="group" aria-label="什么时候开始">
+              <button
+                type="button"
+                className={startMode === 'now' ? 'is-active' : ''}
+                aria-pressed={startMode === 'now'}
+                onClick={() => setStartMode('now')}
+              >
+                立即开始
+              </button>
+              <button
+                type="button"
+                className={startMode === 'scheduled' ? 'is-active' : ''}
+                aria-pressed={startMode === 'scheduled'}
+                onClick={() => setStartMode('scheduled')}
+              >
+                预约开始
+              </button>
+            </div>
+          </div>
+
+          {startMode === 'scheduled' && (
+            <label className="schedule-datetime schedule-datetime--start">
+              <span>预约开始时间</span>
+              <input
+                aria-label="预约开始时间"
+                type="datetime-local"
+                min={toDateTimeInput(Date.now())}
+                max={toDateTimeInput(Date.now() + 30 * 24 * 60 * 60_000)}
+                value={scheduledAt}
+                onChange={event => updateScheduledAt(event.target.value)}
+              />
+            </label>
+          )}
+
+          <div className="schedule-row schedule-row--duration">
+            <span className="schedule-row__label">共享多久</span>
+            <div className="duration-options" role="group" aria-label="共享时长">
+              {durationOptions.map(duration => (
+                <button
+                  type="button"
+                  key={duration}
+                  className={durationHours === duration ? 'is-active' : ''}
+                  aria-pressed={durationHours === duration}
+                  onClick={() => chooseDuration(duration)}
+                >
+                  {duration} 小时
+                  {duration === 2 && <small>推荐</small>}
+                </button>
+              ))}
+              <button
+                type="button"
+                className={durationHours === 'custom' ? 'is-active' : ''}
+                aria-pressed={durationHours === 'custom'}
+                onClick={() => chooseDuration('custom')}
+              >
+                自定义
+              </button>
+            </div>
+          </div>
+
+          {durationHours === 'custom' && (
+            <label className="schedule-datetime schedule-datetime--end">
+              <span>自定义结束时间</span>
+              <input
+                aria-label="自定义结束时间"
+                type="datetime-local"
+                min={toDateTimeInput(previewStart + 15 * 60_000)}
+                max={toDateTimeInput(previewStart + 24 * 60 * 60_000)}
+                value={customEndsAt}
+                onChange={event => setCustomEndsAt(event.target.value)}
+              />
+            </label>
+          )}
+
+          <div className={`schedule-summary ${hasValidPreview ? '' : 'schedule-summary--invalid'}`}>
+            <CheckCircle2 size={17} />
+            <div>
+              <strong>
+                {startMode === 'now' ? '发车后立即可上车' : `${formatDateTime(previewStart)} 开放上车`}
+              </strong>
+              <small>
+                {hasValidPreview
+                  ? `${formatDateTime(previewEnd)} 自动结束${durationHours === 'custom' ? '' : ` · 共 ${durationHours} 小时`}`
+                  : '请补充正确的时间范围'}
+              </small>
+            </div>
+          </div>
+        </div>
       </div>
 
       <button className="primary-button" onClick={submit} disabled={busy || selected.length === 0}>

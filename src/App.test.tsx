@@ -18,10 +18,31 @@ describe('Trusted Carpool simple flow', () => {
     fireEvent.click(screen.getByRole('button', { name: /我要发车/ }));
     expect(await screen.findByRole('heading', { name: '选择要共享的工具' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /开始发车/ })).toBeInTheDocument();
-    expect(screen.getByText('开始时间')).toBeInTheDocument();
-    expect(screen.getByText('结束时间')).toBeInTheDocument();
+    expect(screen.getByText('什么时候开始')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '立即开始' })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByText('共享多久')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /2 小时/ })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.queryByLabelText('预约开始时间')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('自定义结束时间')).not.toBeInTheDocument();
     expect(screen.queryByText(/押金|积分|结算/)).not.toBeInTheDocument();
     expect(screen.queryByText(/信令|中继|密钥输入/)).not.toBeInTheDocument();
+  });
+
+  it('keeps common schedules one click away and reveals exact times only when requested', async () => {
+    render(<App />);
+    fireEvent.click(screen.getByRole('button', { name: /我要发车/ }));
+    await screen.findByRole('heading', { name: '选择要共享的工具' });
+
+    fireEvent.click(screen.getByRole('button', { name: '4 小时' }));
+    expect(screen.getByRole('button', { name: '4 小时' })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByText(/共 4 小时/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '预约开始' }));
+    expect(screen.getByLabelText('预约开始时间')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '自定义' }));
+    expect(screen.getByLabelText('自定义结束时间')).toBeInTheDocument();
+    expect(screen.queryByText(/共 4 小时/)).not.toBeInTheDocument();
   });
 
   it('keeps the member list concise and opens detailed usage on demand', async () => {
