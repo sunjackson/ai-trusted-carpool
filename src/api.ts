@@ -38,8 +38,8 @@ const demoTools: ToolDetection[] = [
     detail: '已就绪',
     desktopSupported: true,
     desktopInstalled: true,
-    desktopPath: '/Applications/Codex.app',
-    desktopDetail: '已安装，可一键配置并启动',
+    desktopPath: '/Applications/ChatGPT.app',
+    desktopDetail: '已找到 ChatGPT.app（Codex 客户端），可一键配置并启动',
   },
 ];
 

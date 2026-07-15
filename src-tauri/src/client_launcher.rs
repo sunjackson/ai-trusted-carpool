@@ -618,31 +618,56 @@ fn restore_unix_mode(_path: &Path, _mode: Option<u32>) -> Result<(), String> {
 #[cfg(target_os = "macos")]
 fn detect_client(kind: ToolKind) -> DetectedClient {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    let (name, executable) = match kind {
-        ToolKind::Claude => ("Claude", "Contents/MacOS/Claude"),
-        ToolKind::Codex => ("Codex", "Contents/MacOS/Codex"),
-    };
-    let candidates = [
-        PathBuf::from(format!("/Applications/{name}.app")),
-        home.join(format!("Applications/{name}.app")),
-    ];
-    let bundle = candidates
-        .into_iter()
-        .find(|candidate| candidate.is_dir() && candidate.join(executable).is_file());
+    let bundle = find_macos_client(kind, Path::new("/Applications"), &home.join("Applications"));
     match bundle {
         Some(path) => DetectedClient {
             supported: true,
             launcher: Some(DesktopLauncher::MacBundle(path.clone())),
             display_path: Some(path.to_string_lossy().into_owned()),
-            detail: "已安装，可一键配置并启动".to_string(),
+            detail: if matches!(kind, ToolKind::Codex)
+                && path.file_name().and_then(|value| value.to_str()) == Some("ChatGPT.app")
+            {
+                "已找到 ChatGPT.app（Codex 客户端），可一键配置并启动".to_string()
+            } else {
+                "已安装，可一键配置并启动".to_string()
+            },
         },
         None => DetectedClient {
             supported: true,
             launcher: None,
             display_path: None,
-            detail: format!("未找到官方 {name} 客户端"),
+            detail: match kind {
+                ToolKind::Claude => "未找到官方 Claude 客户端".to_string(),
+                ToolKind::Codex => "未找到官方 ChatGPT/Codex 客户端".to_string(),
+            },
         },
     }
+}
+
+#[cfg(target_os = "macos")]
+fn find_macos_client(
+    kind: ToolKind,
+    system_applications: &Path,
+    user_applications: &Path,
+) -> Option<PathBuf> {
+    let specs: &[(&str, &str)] = match kind {
+        ToolKind::Claude => &[("Claude.app", "Contents/MacOS/Claude")],
+        ToolKind::Codex => &[
+            ("ChatGPT.app", "Contents/MacOS/ChatGPT"),
+            ("Codex.app", "Contents/MacOS/Codex"),
+        ],
+    };
+    [system_applications, user_applications]
+        .into_iter()
+        .flat_map(|root| {
+            specs
+                .iter()
+                .map(move |(bundle, executable)| (root, bundle, executable))
+        })
+        .find_map(|(root, bundle, executable)| {
+            let path = root.join(bundle);
+            (path.is_dir() && path.join(executable).is_file()).then_some(path)
+        })
 }
 
 #[cfg(target_os = "windows")]
@@ -668,7 +693,9 @@ fn detect_client(kind: ToolKind) -> DetectedClient {
             paths
         }
         ToolKind::Codex => vec![
+            local.join("Programs/ChatGPT/ChatGPT.exe"),
             local.join("Programs/Codex/Codex.exe"),
+            local.join("Microsoft/WindowsApps/ChatGPT.exe"),
             local.join("Microsoft/WindowsApps/Codex.exe"),
         ],
     };
@@ -890,14 +917,16 @@ fn close_client(kind: ToolKind) {
 
 #[cfg(target_os = "windows")]
 fn close_client(kind: ToolKind) {
-    let image = if matches!(kind, ToolKind::Claude) {
-        "Claude.exe"
+    let images: &[&str] = if matches!(kind, ToolKind::Claude) {
+        &["Claude.exe"]
     } else {
-        "Codex.exe"
+        &["ChatGPT.exe", "Codex.exe"]
     };
-    let _ = Command::new("taskkill")
-        .args(["/IM", image, "/F", "/T"])
-        .status();
+    for image in images {
+        let _ = Command::new("taskkill")
+            .args(["/IM", image, "/F", "/T"])
+            .status();
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -999,5 +1028,21 @@ mod tests {
         assert!(config.contains("requires_openai_auth = false"));
         assert!(config.contains("experimental_bearer_token = \"secret\\\"token\""));
         assert!(!config.contains("auth.json"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn codex_desktop_detection_accepts_the_chatgpt_app_name() {
+        let temp = TempDir::new().expect("temp dir");
+        let system = temp.path().join("Applications");
+        let user = temp.path().join("UserApplications");
+        let executable = system.join("ChatGPT.app/Contents/MacOS/ChatGPT");
+        fs::create_dir_all(executable.parent().unwrap()).expect("create fake app");
+        fs::write(&executable, b"fake executable").expect("write fake app");
+
+        assert_eq!(
+            find_macos_client(ToolKind::Codex, &system, &user),
+            Some(system.join("ChatGPT.app"))
+        );
     }
 }
