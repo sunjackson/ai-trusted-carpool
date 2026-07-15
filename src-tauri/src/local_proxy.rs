@@ -685,7 +685,11 @@ mod tests {
                     state: SeatState::Connected,
                     tool: None,
                     usage: SeatUsageSummary::default(),
+                    token_limits: crate::models::MemberTokenLimits::default(),
+                    token_limit_status: crate::models::MemberTokenLimitStatus::default(),
+                    token_usage_events: Vec::new(),
                 }],
+                account_quotas: Vec::new(),
             });
             host.host_bindings.insert(
                 code.clone(),

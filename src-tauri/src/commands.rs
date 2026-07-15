@@ -41,6 +41,85 @@ fn now_ms() -> i64 {
         .unwrap_or_default()
 }
 
+async fn query_account_quotas(tools: &[ToolKind]) -> Vec<AccountQuotaSnapshot> {
+    let has_claude = tools.contains(&ToolKind::Claude);
+    let has_codex = tools.contains(&ToolKind::Codex);
+    match (has_claude, has_codex) {
+        (true, true) => {
+            let (claude, codex) = tokio::join!(
+                crate::account_quota::query(ToolKind::Claude),
+                crate::account_quota::query(ToolKind::Codex)
+            );
+            tools
+                .iter()
+                .map(|tool| match tool {
+                    ToolKind::Claude => claude.clone(),
+                    ToolKind::Codex => codex.clone(),
+                })
+                .collect()
+        }
+        (true, false) => vec![crate::account_quota::query(ToolKind::Claude).await],
+        (false, true) => vec![crate::account_quota::query(ToolKind::Codex).await],
+        (false, false) => Vec::new(),
+    }
+}
+
+fn merge_account_quotas(
+    previous: &[AccountQuotaSnapshot],
+    next: Vec<AccountQuotaSnapshot>,
+) -> Vec<AccountQuotaSnapshot> {
+    next.into_iter()
+        .map(|mut snapshot| {
+            let Some(existing) = previous.iter().find(|item| item.tool == snapshot.tool) else {
+                return snapshot;
+            };
+            if snapshot.state == AccountQuotaState::Error && !existing.windows.is_empty() {
+                snapshot.plan_name = existing.plan_name.clone();
+                snapshot.fetched_at = existing.fetched_at;
+                snapshot.windows = existing.windows.clone();
+                snapshot.message = Some(format!(
+                    "刷新失败，当前显示上次官方结果：{}",
+                    snapshot.message.unwrap_or_else(|| "未知错误".to_string())
+                ));
+            }
+            snapshot
+        })
+        .collect()
+}
+
+fn spawn_account_quota_loop(state: RuntimeState, car_id: String) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            let tools = {
+                let Ok(runtime) = state.inner.lock() else {
+                    break;
+                };
+                let Some(car) = runtime.active_car.as_ref() else {
+                    break;
+                };
+                if car.car_id != car_id {
+                    break;
+                }
+                car.enabled_tools.clone()
+            };
+            let snapshots = query_account_quotas(&tools).await;
+            {
+                let Ok(mut runtime) = state.inner.lock() else {
+                    break;
+                };
+                let Some(car) = runtime.active_car.as_mut() else {
+                    break;
+                };
+                if car.car_id != car_id {
+                    break;
+                }
+                car.account_quotas = merge_account_quotas(&car.account_quotas, snapshots);
+            }
+            sleep(Duration::from_secs(60)).await;
+        }
+    });
+}
+
 fn path_candidates(command: &str) -> Vec<String> {
     #[cfg(target_os = "windows")]
     {
@@ -549,8 +628,12 @@ pub async fn start_car(
             state: SeatState::Waiting,
             tool: None,
             usage: SeatUsageSummary::default(),
+            token_limits: MemberTokenLimits::default(),
+            token_limit_status: MemberTokenLimitStatus::default(),
+            token_usage_events: Vec::new(),
         });
     }
+    let account_quotas = crate::account_quota::pending_for(&input.enabled_tools);
     let car = CarSession {
         owner_peer_id: identity.peer_id.clone(),
         car_id: car_id.clone(),
@@ -559,6 +642,7 @@ pub async fn start_car(
         expires_at,
         enabled_tools: input.enabled_tools,
         seats,
+        account_quotas,
     };
 
     for seat in &car.seats {
@@ -590,6 +674,7 @@ pub async fn start_car(
         runtime.relay_request_seen_at.clear();
     }
     spawn_host_claim_loop(state.inner().clone(), coordinator, identity, car_id);
+    spawn_account_quota_loop(state.inner().clone(), car.car_id.clone());
     Ok(car)
 }
 
@@ -608,11 +693,116 @@ pub async fn stop_car(state: State<'_, RuntimeState>) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn get_active_car(state: State<'_, RuntimeState>) -> Result<Option<CarSession>, String> {
-    let runtime = state
+    let mut runtime = state
         .inner
         .lock()
         .map_err(|_| "运行状态暂时不可用".to_string())?;
+    if let Some(car) = runtime.active_car.as_mut() {
+        crate::quota::refresh_car(car, now_ms());
+    }
     Ok(runtime.active_car.clone())
+}
+
+#[tauri::command]
+pub async fn refresh_account_quotas(
+    state: State<'_, RuntimeState>,
+) -> Result<Vec<AccountQuotaSnapshot>, String> {
+    let (car_id, tools) = {
+        let runtime = state
+            .inner
+            .lock()
+            .map_err(|_| "运行状态暂时不可用".to_string())?;
+        let car = runtime
+            .active_car
+            .as_ref()
+            .ok_or_else(|| "当前没有正在发车的车队".to_string())?;
+        (car.car_id.clone(), car.enabled_tools.clone())
+    };
+    let snapshots = query_account_quotas(&tools).await;
+    let mut runtime = state
+        .inner
+        .lock()
+        .map_err(|_| "运行状态暂时不可用".to_string())?;
+    let car = runtime
+        .active_car
+        .as_mut()
+        .filter(|car| car.car_id == car_id)
+        .ok_or_else(|| "发车状态已经变化".to_string())?;
+    car.account_quotas = merge_account_quotas(&car.account_quotas, snapshots);
+    Ok(car.account_quotas.clone())
+}
+
+#[tauri::command]
+pub fn update_member_token_limits(
+    input: UpdateMemberTokenLimitsInput,
+    state: State<'_, RuntimeState>,
+) -> Result<Seat, String> {
+    let limits = MemberTokenLimits {
+        five_hour_tokens: input.five_hour_tokens,
+        daily_tokens: input.daily_tokens,
+        weekly_tokens: input.weekly_tokens,
+    };
+    crate::quota::validate_limits(&limits)?;
+    let mut runtime = state
+        .inner
+        .lock()
+        .map_err(|_| "运行状态暂时不可用".to_string())?;
+    let car = runtime
+        .active_car
+        .as_mut()
+        .ok_or_else(|| "当前没有正在发车的车队".to_string())?;
+    let seat = car
+        .seats
+        .iter_mut()
+        .find(|seat| seat.seat_no == input.seat_no)
+        .ok_or_else(|| "成员座位不存在".to_string())?;
+    seat.token_limits = limits;
+    crate::quota::refresh_seat(seat, now_ms());
+    Ok(seat.clone())
+}
+
+#[tauri::command]
+pub fn get_shared_car_status(
+    passenger_peer_id: String,
+    state: State<'_, RuntimeState>,
+) -> Result<SharedCarStatus, String> {
+    let mut runtime = state
+        .inner
+        .lock()
+        .map_err(|_| "运行状态暂时不可用".to_string())?;
+    let code = runtime
+        .host_bindings
+        .values()
+        .find(|binding| binding.passenger_peer_id == passenger_peer_id)
+        .map(|binding| binding.code.clone())
+        .ok_or_else(|| "成员不属于当前有效车队".to_string())?;
+    let car = runtime
+        .active_car
+        .as_mut()
+        .ok_or_else(|| "车主已经停止发车".to_string())?;
+    crate::quota::refresh_car(car, now_ms());
+    let seat = car
+        .seats
+        .iter()
+        .find(|seat| seat.code == code)
+        .ok_or_else(|| "成员座位不存在".to_string())?;
+    Ok(SharedCarStatus {
+        car_id: car.car_id.clone(),
+        car_name: car.car_name.clone(),
+        started_at: car.started_at,
+        expires_at: car.expires_at,
+        enabled_tools: car.enabled_tools.clone(),
+        account_quotas: car.account_quotas.clone(),
+        member: SharedMemberStatus {
+            seat_no: seat.seat_no,
+            nickname: seat.nickname.clone().unwrap_or_else(|| "成员".to_string()),
+            state: seat.state.clone(),
+            tool: seat.tool,
+            usage: seat.usage.clone(),
+            token_limits: seat.token_limits.clone(),
+            token_limit_status: seat.token_limit_status.clone(),
+        },
+    })
 }
 
 #[tauri::command]
@@ -1131,7 +1321,11 @@ mod tests {
                 state: SeatState::Waiting,
                 tool: None,
                 usage: SeatUsageSummary::default(),
+                token_limits: MemberTokenLimits::default(),
+                token_limit_status: MemberTokenLimitStatus::default(),
+                token_usage_events: Vec::new(),
             }],
+            account_quotas: Vec::new(),
         });
         let claim = |identity: &DeviceIdentity| CarpoolClaim {
             version: PROTOCOL_VERSION,

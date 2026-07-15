@@ -7,6 +7,7 @@ import type {
   RelayRequest,
   RelayStreamEvent,
   RideAccess,
+  SharedCarStatus,
 } from './types';
 import {
   acceptChunkFrame,
@@ -50,10 +51,19 @@ class TrustedWebRtcRuntime {
   private connections = new Map<string, Connection>();
   private iceServers: RTCIceServer[] = [];
   private pollTimer: number | null = null;
+  private statusTimer: number | null = null;
   private pollBusy = false;
   private unlisten: UnlistenFn[] = [];
   private pendingBridge = new Map<string, RelayBridgeRequestEvent>();
   private hostRequests = new Map<string, Connection>();
+  private statusListeners = new Set<(status: SharedCarStatus) => void>();
+  private lastStatus: SharedCarStatus | null = null;
+
+  subscribeCarStatus(listener: (status: SharedCarStatus) => void): () => void {
+    this.statusListeners.add(listener);
+    if (this.lastStatus) listener(this.lastStatus);
+    return () => this.statusListeners.delete(listener);
+  }
 
   async initialize(): Promise<void> {
     if (!inTauri() || this.unlisten.length > 0) return;
@@ -77,6 +87,7 @@ class TrustedWebRtcRuntime {
     this.ownerPeerId = null;
     await this.loadIceServers();
     this.startPolling();
+    this.startStatusBroadcast();
   }
 
   async startPassenger(access: RideAccess): Promise<void> {
@@ -89,6 +100,7 @@ class TrustedWebRtcRuntime {
     this.role = 'passenger';
     this.accessId = access.accessId;
     this.ownerPeerId = access.ownerPeerId;
+    this.lastStatus = null;
     await this.loadIceServers();
     this.startPolling();
     const connection = this.createConnection(access.ownerPeerId);
@@ -125,7 +137,9 @@ class TrustedWebRtcRuntime {
 
   private closeConnections(): void {
     if (this.pollTimer !== null) window.clearInterval(this.pollTimer);
+    if (this.statusTimer !== null) window.clearInterval(this.statusTimer);
     this.pollTimer = null;
+    this.statusTimer = null;
     for (const connection of this.connections.values()) {
       connection.channel?.close();
       connection.pc.close();
@@ -133,6 +147,7 @@ class TrustedWebRtcRuntime {
     this.connections.clear();
     this.pendingBridge.clear();
     this.hostRequests.clear();
+    this.lastStatus = null;
   }
 
   private createConnection(peerId: string): Connection {
@@ -184,6 +199,15 @@ class TrustedWebRtcRuntime {
             payloadJson: event.payloadJson,
           }).catch(error => void this.failBridge(event.requestId, errorMessage(error)));
         }
+      }
+      if (this.role === 'host') {
+        void this.sendCarStatus(connection).catch(() => undefined);
+      } else if (this.role === 'passenger') {
+        void this.queueWire(connection, {
+          type: 'car_status_request',
+          bridgeRequestId: crypto.randomUUID(),
+          payloadJson: '{}',
+        }).catch(() => undefined);
       }
     };
     channel.onmessage = event => {
@@ -281,6 +305,19 @@ class TrustedWebRtcRuntime {
       }
       return;
     }
+    if (message.type === 'car_status_request' && this.role === 'host') {
+      await this.sendCarStatus(connection, message.bridgeRequestId);
+      return;
+    }
+    if (message.type === 'car_status_snapshot' && this.role === 'passenger') {
+      const status = JSON.parse(message.payloadJson) as SharedCarStatus;
+      if (!status.carId || !status.member || !Array.isArray(status.accountQuotas)) {
+        throw new Error('车队状态格式无效');
+      }
+      this.lastStatus = status;
+      for (const listener of this.statusListeners) listener(status);
+      return;
+    }
     if (message.type === 'relay_stream_event' && this.role === 'passenger') {
       const event = JSON.parse(message.payloadJson) as RelayStreamEvent;
       if (event.requestId !== message.bridgeRequestId) {
@@ -312,6 +349,32 @@ class TrustedWebRtcRuntime {
         this.hostRequests.delete(event.requestId);
       }
     }
+  }
+
+  private async sendCarStatus(
+    connection: Connection,
+    requestId: string = crypto.randomUUID()
+  ): Promise<void> {
+    if (this.role !== 'host' || connection.channel?.readyState !== 'open') return;
+    const status = await invoke<SharedCarStatus>('get_shared_car_status', {
+      passengerPeerId: connection.peerId,
+    });
+    await this.queueWire(connection, {
+      type: 'car_status_snapshot',
+      bridgeRequestId: requestId,
+      payloadJson: JSON.stringify(status),
+    });
+  }
+
+  private startStatusBroadcast(): void {
+    if (this.statusTimer !== null) window.clearInterval(this.statusTimer);
+    if (this.role !== 'host') return;
+    const broadcast = () => {
+      for (const connection of this.connections.values()) {
+        void this.sendCarStatus(connection).catch(() => undefined);
+      }
+    };
+    this.statusTimer = window.setInterval(broadcast, 2_000);
   }
 
   private async sendSignal(

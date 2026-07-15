@@ -2,8 +2,10 @@ import { invoke } from '@tauri-apps/api/core';
 import type {
   CarSession,
   JoinPreview,
+  MemberTokenLimits,
   ModelUsageSummary,
   RideAccess,
+  Seat,
   SeatUsageSummary,
   ToolDetection,
   ToolKind,
@@ -122,6 +124,36 @@ const demoUsage = (seatIndex: number): SeatUsageSummary => {
   };
 };
 
+const unlimitedWindow = () => ({
+  limitTokens: null,
+  usedTokens: 0,
+  remainingTokens: null,
+  resetsAt: null,
+  exhausted: false,
+});
+
+const demoTokenLimits = (seatIndex: number): MemberTokenLimits =>
+  seatIndex === 0
+    ? { fiveHourTokens: 60_000, dailyTokens: 180_000, weeklyTokens: 800_000 }
+    : { fiveHourTokens: null, dailyTokens: null, weeklyTokens: null };
+
+const demoTokenLimitStatus = (seatIndex: number) => {
+  const usage = demoUsage(seatIndex).totalTokens;
+  const limits = demoTokenLimits(seatIndex);
+  const status = (limitTokens: number | null, ratio: number) => ({
+    limitTokens,
+    usedTokens: Math.round(usage * ratio),
+    remainingTokens: limitTokens === null ? null : Math.max(0, limitTokens - Math.round(usage * ratio)),
+    resetsAt: limitTokens === null ? null : Date.now() + 2 * 60 * 60 * 1000,
+    exhausted: limitTokens !== null && Math.round(usage * ratio) >= limitTokens,
+  });
+  return {
+    fiveHour: limits.fiveHourTokens === null ? unlimitedWindow() : status(limits.fiveHourTokens, 0.55),
+    daily: limits.dailyTokens === null ? unlimitedWindow() : status(limits.dailyTokens, 0.8),
+    weekly: limits.weeklyTokens === null ? unlimitedWindow() : status(limits.weeklyTokens, 1),
+  };
+};
+
 const demoCar = (
   enabledTools: ToolKind[],
   carName: string,
@@ -141,6 +173,29 @@ const demoCar = (
     state: index < 2 ? 'using' : 'waiting',
     tool: index === 0 ? 'claude' : index === 1 ? 'codex' : null,
     usage: demoUsage(index),
+    tokenLimits: demoTokenLimits(index),
+    tokenLimitStatus: demoTokenLimitStatus(index),
+  })),
+  accountQuotas: enabledTools.map(kind => ({
+    tool: kind,
+    state: 'available' as const,
+    planName: kind === 'claude' ? 'Max' : 'Plus',
+    fetchedAt: Date.now(),
+    source:
+      kind === 'claude'
+        ? 'https://api.anthropic.com/api/oauth/usage'
+        : 'https://chatgpt.com/backend-api/wham/usage',
+    message: null,
+    windows:
+      kind === 'claude'
+        ? [
+            { label: '5 小时', usedPercent: 36, remainingPercent: 64, resetsAt: Date.now() + 90 * 60 * 1000 },
+            { label: '7 天', usedPercent: 22, remainingPercent: 78, resetsAt: Date.now() + 4 * 24 * 60 * 60 * 1000 },
+          ]
+        : [
+            { label: '5 小时', usedPercent: 42, remainingPercent: 58, resetsAt: Date.now() + 2 * 60 * 60 * 1000 },
+            { label: '7 天', usedPercent: 18, remainingPercent: 82, resetsAt: Date.now() + 5 * 24 * 60 * 60 * 1000 },
+          ],
   })),
 });
 
@@ -168,6 +223,42 @@ export async function stopCar(): Promise<void> {
 
 export async function getActiveCar(): Promise<CarSession | null> {
   return inTauri() ? invoke<CarSession | null>('get_active_car') : demoActiveCar;
+}
+
+export async function refreshAccountQuotas(): Promise<CarSession['accountQuotas']> {
+  if (inTauri()) return invoke<CarSession['accountQuotas']>('refresh_account_quotas');
+  return demoActiveCar?.accountQuotas ?? [];
+}
+
+export async function updateMemberTokenLimits(input: {
+  seatNo: number;
+  fiveHourTokens: number | null;
+  dailyTokens: number | null;
+  weeklyTokens: number | null;
+}): Promise<Seat> {
+  if (inTauri()) return invoke<Seat>('update_member_token_limits', { input });
+  if (!demoActiveCar) throw new Error('当前没有正在发车的车队');
+  const seat = demoActiveCar.seats.find(item => item.seatNo === input.seatNo);
+  if (!seat) throw new Error('成员座位不存在');
+  seat.tokenLimits = {
+    fiveHourTokens: input.fiveHourTokens,
+    dailyTokens: input.dailyTokens,
+    weeklyTokens: input.weeklyTokens,
+  };
+  const updateWindow = (key: keyof MemberTokenLimits, windowKey: 'fiveHour' | 'daily' | 'weekly') => {
+    const limitTokens = seat.tokenLimits[key];
+    const usedTokens = seat.tokenLimitStatus[windowKey].usedTokens;
+    seat.tokenLimitStatus[windowKey] = {
+      ...seat.tokenLimitStatus[windowKey],
+      limitTokens,
+      remainingTokens: limitTokens === null ? null : Math.max(0, limitTokens - usedTokens),
+      exhausted: limitTokens !== null && usedTokens >= limitTokens,
+    };
+  };
+  updateWindow('fiveHourTokens', 'fiveHour');
+  updateWindow('dailyTokens', 'daily');
+  updateWindow('weeklyTokens', 'weekly');
+  return structuredClone(seat);
 }
 
 export async function previewInvite(code: string): Promise<JoinPreview> {

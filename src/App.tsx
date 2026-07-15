@@ -8,9 +8,11 @@ import {
   Clock3,
   Code2,
   Copy,
+  Gauge,
   LogOut,
   RefreshCw,
   ShieldCheck,
+  SlidersHorizontal,
   Sparkles,
   SquareTerminal,
   Users,
@@ -25,10 +27,23 @@ import {
   launchTool,
   leaveCar,
   previewInvite,
+  refreshAccountQuotas,
   startCar,
   stopCar,
+  updateMemberTokenLimits,
 } from './api';
-import type { CarSession, JoinPreview, RideAccess, ToolDetection, ToolKind } from './types';
+import type {
+  AccountQuotaSnapshot,
+  CarSession,
+  JoinPreview,
+  MemberTokenLimitStatus,
+  RideAccess,
+  Seat,
+  SeatUsageSummary,
+  SharedCarStatus,
+  ToolDetection,
+  ToolKind,
+} from './types';
 import { trustedWebRtc } from './trustedWebRtc';
 
 type Screen = 'welcome' | 'host-setup' | 'host-live' | 'join' | 'ready' | 'ride';
@@ -322,10 +337,242 @@ function HostSetup({
   );
 }
 
+const windowLabel: Record<keyof MemberTokenLimitStatus, string> = {
+  fiveHour: '5 小时',
+  daily: '24 小时',
+  weekly: '7 天',
+};
+
+const MAX_MEMBER_TOKEN_LIMIT = 1_000_000_000_000;
+
+function AccountQuotaPanel({
+  quotas,
+  onRefresh,
+  refreshing = false,
+}: {
+  quotas: AccountQuotaSnapshot[];
+  onRefresh?: () => void;
+  refreshing?: boolean;
+}) {
+  return (
+    <section className="account-quota-panel" aria-label="车队账号额度">
+      <div className="account-quota-panel__header">
+        <div>
+          <span><Gauge size={17} /> 车队账号额度</span>
+          <small>来自车主本机官方账号，车主和所有成员看到相同结果</small>
+        </div>
+        {onRefresh && (
+          <button onClick={onRefresh} disabled={refreshing}>
+            <RefreshCw size={14} className={refreshing ? 'spin' : ''} /> 刷新
+          </button>
+        )}
+      </div>
+      <div className="account-quota-grid">
+        {quotas.map(quota => (
+          <article className="account-quota-card" key={quota.tool}>
+            <div className="account-quota-card__title">
+              <strong>{TOOL_LABEL[quota.tool]}</strong>
+              <span>{quota.planName || (quota.state === 'available' ? '官方额度' : '额度状态')}</span>
+            </div>
+            {quota.windows.length > 0 ? (
+              <>
+                <div className="quota-window-list">
+                  {quota.windows.map(item => (
+                    <div className="quota-window" key={item.label}>
+                      <div><span>{item.label}</span><strong>剩余 {item.remainingPercent.toFixed(0)}%</strong></div>
+                      <div className="quota-progress" aria-label={`${TOOL_LABEL[quota.tool]} ${item.label} 剩余 ${item.remainingPercent.toFixed(0)}%`}>
+                        <i style={{ width: `${item.remainingPercent}%` }} />
+                      </div>
+                      <small>{item.resetsAt ? `${formatDateTime(item.resetsAt)} 重置` : '重置时间以官方为准'}</small>
+                    </div>
+                  ))}
+                </div>
+                {quota.message && <p className="quota-stale-message">{quota.message}</p>}
+              </>
+            ) : (
+              <p className={`quota-message quota-message--${quota.state}`}>
+                {quota.message || '暂时没有可用的官方额度数据'}
+              </p>
+            )}
+          </article>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function MemberLimitBars({ status }: { status: MemberTokenLimitStatus }) {
+  return (
+    <div className="member-limit-bars">
+      {(Object.keys(windowLabel) as (keyof MemberTokenLimitStatus)[]).map(key => {
+        const item = status[key];
+        const usedPercent = item.limitTokens
+          ? Math.min(100, (item.usedTokens / item.limitTokens) * 100)
+          : 0;
+        return (
+          <div className="member-limit-row" key={key}>
+            <span>{windowLabel[key]}</span>
+            <div className="member-limit-track">
+              <i className={item.exhausted ? 'is-exhausted' : ''} style={{ width: item.limitTokens ? `${usedPercent}%` : '0%' }} />
+            </div>
+            <strong>
+              {item.limitTokens === null
+                ? '不限额'
+                : `${formatTokens(item.remainingTokens ?? 0)} 剩余`}
+            </strong>
+            <small>{item.resetsAt ? `${formatDateTime(item.resetsAt)} 重置` : '—'}</small>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function MemberUsageDetails({ usage }: { usage: SeatUsageSummary }) {
+  return (
+    <>
+      <div className="usage-overview" aria-label="成员用量汇总">
+        <span><small>输入</small><strong>{formatTokens(usage.inputTokens)}</strong></span>
+        <span><small>输出</small><strong>{formatTokens(usage.outputTokens)}</strong></span>
+        <span><small>缓存读</small><strong>{formatTokens(usage.cacheReadTokens)}</strong></span>
+        <span><small>缓存写</small><strong>{formatTokens(usage.cacheWriteTokens)}</strong></span>
+      </div>
+      <div className="model-usage-list">
+        {usage.models.length === 0 && <div className="empty-usage">还没有模型调用记录</div>}
+        {usage.models.map(model => (
+          <div className="model-usage" key={`${model.tool}:${model.model}`}>
+            <div className="model-usage__title">
+              <span>{TOOL_LABEL[model.tool]} · {model.requestCount} 次</span>
+              <strong>{model.model}</strong>
+              <em title={model.pricingSource ?? undefined}>
+                {model.officialCostMicrousd === null
+                  ? '暂无官价'
+                  : `官价估算 ${formatOfficialCost(model.officialCostMicrousd)}`}
+              </em>
+            </div>
+            <div className="model-usage__tokens">
+              <span>输入 {formatTokens(model.inputTokens)}</span>
+              <span>输出 {formatTokens(model.outputTokens)}</span>
+              <span>缓存读 {formatTokens(model.cacheReadTokens)}</span>
+              <span>缓存写 {formatTokens(model.cacheWriteTokens)}</span>
+            </div>
+            {model.tool === 'claude' && (
+              <small>
+                缓存写入：5 分钟 {formatTokens(model.cacheWrite5mTokens)} · 1 小时 {formatTokens(model.cacheWrite1hTokens)}
+              </small>
+            )}
+            {model.unpricedRequestCount > 0 && (
+              <small>{model.unpricedRequestCount} 次请求没有可用官方价，未计入估算</small>
+            )}
+          </div>
+        ))}
+      </div>
+    </>
+  );
+}
+
+function MemberDetailDialog({
+  seat,
+  onClose,
+  onSave,
+  saving,
+  editable = true,
+}: {
+  seat: Seat;
+  onClose: () => void;
+  onSave?: (limits: { fiveHourTokens: number | null; dailyTokens: number | null; weeklyTokens: number | null }) => void;
+  saving?: boolean;
+  editable?: boolean;
+}) {
+  const [fiveHour, setFiveHour] = useState(seat.tokenLimits.fiveHourTokens?.toString() ?? '');
+  const [daily, setDaily] = useState(seat.tokenLimits.dailyTokens?.toString() ?? '');
+  const [weekly, setWeekly] = useState(seat.tokenLimits.weeklyTokens?.toString() ?? '');
+
+  useEffect(() => {
+    setFiveHour(seat.tokenLimits.fiveHourTokens?.toString() ?? '');
+    setDaily(seat.tokenLimits.dailyTokens?.toString() ?? '');
+    setWeekly(seat.tokenLimits.weeklyTokens?.toString() ?? '');
+  }, [
+    seat.seatNo,
+    seat.tokenLimits.fiveHourTokens,
+    seat.tokenLimits.dailyTokens,
+    seat.tokenLimits.weeklyTokens,
+  ]);
+
+  const parse = (value: string): number | null | undefined => {
+    if (!value.trim()) return null;
+    const parsed = Number(value);
+    return Number.isSafeInteger(parsed) && parsed > 0 && parsed <= MAX_MEMBER_TOKEN_LIMIT
+      ? parsed
+      : undefined;
+  };
+
+  const parsedLimits = {
+    fiveHourTokens: parse(fiveHour),
+    dailyTokens: parse(daily),
+    weeklyTokens: parse(weekly),
+  };
+  const hasInvalidLimit = Object.values(parsedLimits).some(value => value === undefined);
+
+  return (
+    <div className="dialog-backdrop" role="presentation" onMouseDown={event => event.target === event.currentTarget && onClose()}>
+      <section className="member-dialog" role="dialog" aria-modal="true" aria-label={`${seat.nickname ?? '成员'}使用详情`}>
+        <header className="member-dialog__header">
+          <div className="avatar">{seat.nickname?.slice(0, 1) ?? seat.seatNo}</div>
+          <div>
+            <small>成员 {seat.seatNo}</small>
+            <h2>{seat.nickname ?? '未命名成员'}</h2>
+            <span>{seat.tool ? TOOL_LABEL[seat.tool] : '尚未选择工具'} · {seat.usage.requestCount} 次请求 · {formatTokens(seat.usage.totalTokens)} Token</span>
+          </div>
+          <button className="dialog-close" onClick={onClose} aria-label="关闭成员详情"><X size={18} /></button>
+        </header>
+
+        <div className="dialog-section">
+          <div className="dialog-section__title"><strong>实时使用明细</strong><span>按工具和模型统计</span></div>
+          <MemberUsageDetails usage={seat.usage} />
+        </div>
+
+        <div className="dialog-section">
+          <div className="dialog-section__title"><strong>成员 Token 限额</strong><span>达到任一窗口限额后停止新请求</span></div>
+          <MemberLimitBars status={seat.tokenLimitStatus} />
+          {editable && (
+            <div className="limit-editor">
+              <label><span>5 小时</span><input aria-label="5 小时 Token 限额" type="number" min="1" max={MAX_MEMBER_TOKEN_LIMIT} value={fiveHour} onChange={event => setFiveHour(event.target.value)} placeholder="不限额" /><small>Token</small></label>
+              <label><span>24 小时</span><input aria-label="24 小时 Token 限额" type="number" min="1" max={MAX_MEMBER_TOKEN_LIMIT} value={daily} onChange={event => setDaily(event.target.value)} placeholder="不限额" /><small>Token</small></label>
+              <label><span>7 天</span><input aria-label="7 天 Token 限额" type="number" min="1" max={MAX_MEMBER_TOKEN_LIMIT} value={weekly} onChange={event => setWeekly(event.target.value)} placeholder="不限额" /><small>Token</small></label>
+              {hasInvalidLimit && (
+                <p className="limit-editor__error" role="alert">
+                  限额必须是 1—1万亿之间的整数，留空表示不限额
+                </p>
+              )}
+              <button
+                onClick={() => {
+                  if (hasInvalidLimit) return;
+                  onSave?.(parsedLimits as {
+                    fiveHourTokens: number | null;
+                    dailyTokens: number | null;
+                    weeklyTokens: number | null;
+                  });
+                }}
+                disabled={saving || hasInvalidLimit}
+              >
+                {saving ? '保存中...' : '保存成员限额'}
+              </button>
+            </div>
+          )}
+        </div>
+      </section>
+    </div>
+  );
+}
+
 function HostLive({ car, onStopped, onError }: { car: CarSession; onStopped: () => void; onError: (message: string) => void }) {
   const [liveCar, setLiveCar] = useState(car);
   const [clock, setClock] = useState(Date.now());
   const [copied, setCopied] = useState<string | null>(null);
+  const [selectedSeatNo, setSelectedSeatNo] = useState<number | null>(null);
+  const [quotaRefreshing, setQuotaRefreshing] = useState(false);
+  const [limitSaving, setLimitSaving] = useState(false);
 
   useEffect(() => {
     const timer = window.setInterval(() => setClock(Date.now()), 1000);
@@ -369,6 +616,38 @@ function HostLive({ car, onStopped, onError }: { car: CarSession; onStopped: () 
     }
   };
 
+  const refreshQuotas = async () => {
+    setQuotaRefreshing(true);
+    try {
+      const accountQuotas = await refreshAccountQuotas();
+      setLiveCar(current => ({ ...current, accountQuotas }));
+    } catch (error) {
+      onError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setQuotaRefreshing(false);
+    }
+  };
+
+  const saveLimits = async (limits: { fiveHourTokens: number | null; dailyTokens: number | null; weeklyTokens: number | null }) => {
+    if (selectedSeatNo === null) return;
+    setLimitSaving(true);
+    try {
+      const updated = await updateMemberTokenLimits({ seatNo: selectedSeatNo, ...limits });
+      setLiveCar(current => ({
+        ...current,
+        seats: current.seats.map(seat => seat.seatNo === updated.seatNo ? updated : seat),
+      }));
+    } catch (error) {
+      onError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setLimitSaving(false);
+    }
+  };
+
+  const selectedSeat = selectedSeatNo === null
+    ? null
+    : liveCar.seats.find(seat => seat.seatNo === selectedSeatNo) ?? null;
+
   return (
     <section className="live-page page-enter">
       <div className="live-header">
@@ -382,63 +661,43 @@ function HostLive({ car, onStopped, onError }: { car: CarSession; onStopped: () 
         </div>
       </div>
 
+      <AccountQuotaPanel quotas={liveCar.accountQuotas} onRefresh={refreshQuotas} refreshing={quotaRefreshing} />
+
       <div className="seat-grid">
         {liveCar.seats.map(seat => (
           <article className={`seat-card seat-card--${seat.state}`} key={seat.seatNo}>
             <span className="seat-number">{seat.seatNo}</span>
             {seat.nickname ? (
-              <>
+              <button
+                className="member-summary"
+                onClick={() => setSelectedSeatNo(seat.seatNo)}
+                aria-label={`查看${seat.nickname}详情`}
+              >
                 <div className="seat-person">
                   <div className="avatar">{seat.nickname.slice(0, 1)}</div>
                   <div>
                     <strong>{seat.nickname}</strong>
-                    <span className="seat-state"><i /> {seat.state === 'using' ? '使用中' : '已连接'}</span>
+                    <span className="seat-state"><i /> {seat.state === 'using' ? '使用中' : '已连接'}{seat.tool ? ` · ${TOOL_LABEL[seat.tool]}` : ''}</span>
                   </div>
                   <div className="seat-total">
-                    <strong>{seat.usage.requestCount} 次</strong>
-                    <small>
-                      {seat.usage.unpricedRequestCount === seat.usage.requestCount && seat.usage.requestCount > 0
-                        ? '暂无官价'
-                        : `官价估算 ${formatOfficialCost(seat.usage.officialCostMicrousd)}`}
-                    </small>
+                    <strong>{formatTokens(seat.usage.totalTokens)} Token</strong>
+                    <small>{seat.usage.requestCount} 次请求</small>
                   </div>
                 </div>
-                <div className="usage-overview" aria-label={`${seat.nickname} 用量汇总`}>
-                  <span><small>输入</small><strong>{formatTokens(seat.usage.inputTokens)}</strong></span>
-                  <span><small>输出</small><strong>{formatTokens(seat.usage.outputTokens)}</strong></span>
-                  <span><small>缓存读</small><strong>{formatTokens(seat.usage.cacheReadTokens)}</strong></span>
-                  <span><small>缓存写</small><strong>{formatTokens(seat.usage.cacheWriteTokens)}</strong></span>
+                <div className="member-summary__bottom">
+                  <span>
+                    {seat.usage.unpricedRequestCount === seat.usage.requestCount && seat.usage.requestCount > 0
+                      ? '暂无官价'
+                      : `官价估算 ${formatOfficialCost(seat.usage.officialCostMicrousd)}`}
+                  </span>
+                  <span className={seat.tokenLimitStatus.fiveHour.exhausted ? 'limit-exhausted' : ''}>
+                    {seat.tokenLimitStatus.fiveHour.limitTokens === null
+                      ? '5 小时不限额'
+                      : `5 小时剩余 ${formatTokens(seat.tokenLimitStatus.fiveHour.remainingTokens ?? 0)}`}
+                  </span>
+                  <strong><SlidersHorizontal size={13} /> 查看详情与限额</strong>
                 </div>
-                <div className="model-usage-list">
-                  {seat.usage.models.map(model => (
-                    <div className="model-usage" key={`${model.tool}:${model.model}`}>
-                      <div className="model-usage__title">
-                        <span>{TOOL_LABEL[model.tool]} · {model.requestCount} 次</span>
-                        <strong>{model.model}</strong>
-                        <em title={model.pricingSource ?? undefined}>
-                          {model.officialCostMicrousd === null
-                            ? '暂无官价'
-                            : `官价估算 ${formatOfficialCost(model.officialCostMicrousd)}`}
-                        </em>
-                      </div>
-                      <div className="model-usage__tokens">
-                        <span>输入 {formatTokens(model.inputTokens)}</span>
-                        <span>输出 {formatTokens(model.outputTokens)}</span>
-                        <span>缓存读 {formatTokens(model.cacheReadTokens)}</span>
-                        <span>缓存写 {formatTokens(model.cacheWriteTokens)}</span>
-                      </div>
-                      {model.tool === 'claude' && (
-                        <small>
-                          缓存写入：5 分钟 {formatTokens(model.cacheWrite5mTokens)} · 1 小时 {formatTokens(model.cacheWrite1hTokens)}
-                        </small>
-                      )}
-                      {model.unpricedRequestCount > 0 && (
-                        <small>{model.unpricedRequestCount} 次请求没有可用官方价，未计入估算</small>
-                      )}
-                    </div>
-                  ))}
-                </div>
-              </>
+              </button>
             ) : (
               <>
                 <div className="avatar avatar--empty"><Users size={25} /></div>
@@ -462,6 +721,15 @@ function HostLive({ car, onStopped, onError }: { car: CarSession; onStopped: () 
         <ShieldCheck size={18} />
         <span><strong>熟人共享</strong> · 按人、按模型实时统计输入、输出与缓存，明细仅保存在车主本机；官价为官方 API 标准价估算，不是账单。</span>
       </div>
+
+      {selectedSeat && (
+        <MemberDetailDialog
+          seat={selectedSeat}
+          onClose={() => setSelectedSeatNo(null)}
+          onSave={saveLimits}
+          saving={limitSaving}
+        />
+      )}
 
     </section>
   );
@@ -615,6 +883,10 @@ function RidePage({ access, initiallyOpened, onLeave, onError }: { access: RideA
   const [opened, setOpened] = useState<ToolKind[]>([initiallyOpened]);
   const [busy, setBusy] = useState<ToolKind | null>(null);
   const [leaving, setLeaving] = useState(false);
+  const [sharedStatus, setSharedStatus] = useState<SharedCarStatus | null>(null);
+  const [showMemberDetails, setShowMemberDetails] = useState(false);
+
+  useEffect(() => trustedWebRtc.subscribeCarStatus(setSharedStatus), []);
 
   const open = async (kind: ToolKind) => {
     setBusy(kind);
@@ -646,10 +918,28 @@ function RidePage({ access, initiallyOpened, onLeave, onError }: { access: RideA
       <div className="connection-bar">
         <span><i /> 已连接</span><strong>{access.carName}</strong><span><ShieldCheck size={17} /> 当前设备已绑定</span>
       </div>
+      {sharedStatus && <AccountQuotaPanel quotas={sharedStatus.accountQuotas} />}
       <div className="ride-heading">
         <p className="eyebrow">使用中</p>
         <h1>需要哪个，点哪个</h1>
       </div>
+      {sharedStatus && (
+        <button className="my-usage-card" onClick={() => setShowMemberDetails(true)} aria-label="查看我的使用详情">
+          <div>
+            <small>我的使用</small>
+            <strong>{formatTokens(sharedStatus.member.usage.totalTokens)} Token</strong>
+          </div>
+          <div>
+            <small>5 小时限额</small>
+            <strong>
+              {sharedStatus.member.tokenLimitStatus.fiveHour.limitTokens === null
+                ? '不限额'
+                : `剩余 ${formatTokens(sharedStatus.member.tokenLimitStatus.fiveHour.remainingTokens ?? 0)}`}
+            </strong>
+          </div>
+          <span>查看明细 →</span>
+        </button>
+      )}
       <div className="ride-tool-grid">
         {access.enabledTools.map(kind => {
           const isOpen = opened.includes(kind);
@@ -663,6 +953,13 @@ function RidePage({ access, initiallyOpened, onLeave, onError }: { access: RideA
         })}
       </div>
       <button className="leave-button" onClick={leave} disabled={leaving}><LogOut size={17} /> {leaving ? '正在离开...' : '离开车队'}</button>
+      {sharedStatus && showMemberDetails && (
+        <MemberDetailDialog
+          seat={{ ...sharedStatus.member, code: '' }}
+          onClose={() => setShowMemberDetails(false)}
+          editable={false}
+        />
+      )}
     </section>
   );
 }

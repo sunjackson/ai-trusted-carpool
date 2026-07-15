@@ -618,7 +618,7 @@ fn binding_for_request(
     verify_request(request, &binding.session_secret)?;
     let car = runtime
         .active_car
-        .as_ref()
+        .as_mut()
         .ok_or_else(|| "车主已经停止发车".to_string())?;
     if car.started_at > current_ms || car.expires_at <= current_ms {
         return Err("当前不在发车开放时间内".to_string());
@@ -626,6 +626,7 @@ fn binding_for_request(
     if !car.enabled_tools.contains(&request.tool) {
         return Err("车主没有开放这个工具".to_string());
     }
+    crate::quota::ensure_available(car, &binding.code, current_ms)?;
     if !matches!(request.method.as_str(), "GET" | "POST")
         || !allowed_path(request.tool, &request.path)
     {
@@ -1039,7 +1040,11 @@ mod tests {
                 state: SeatState::Connected,
                 tool: None,
                 usage: SeatUsageSummary::default(),
+                token_limits: crate::models::MemberTokenLimits::default(),
+                token_limit_status: crate::models::MemberTokenLimitStatus::default(),
+                token_usage_events: Vec::new(),
             }],
+            account_quotas: Vec::new(),
         });
         runtime.host_bindings.insert(
             code.clone(),
@@ -1081,6 +1086,33 @@ mod tests {
         ));
         assert!(!allowed_path(ToolKind::Claude, "/v1/../admin"));
         assert!(!allowed_path(ToolKind::Claude, "/internal/account"));
+    }
+
+    #[tokio::test]
+    async fn exhausted_member_token_window_is_rejected_before_any_upstream_call() {
+        let secret = crate::protocol::new_session_secret().expect("secret");
+        let request = request(&secret);
+        let state = state_for(&request, &secret);
+        {
+            let mut runtime = state.inner.lock().expect("runtime");
+            let seat = &mut runtime.active_car.as_mut().expect("car").seats[0];
+            seat.token_limits.five_hour_tokens = Some(1);
+            seat.token_usage_events
+                .push(crate::models::TokenUsageEvent {
+                    occurred_at: now_ms() - 1_000,
+                    tokens: 1,
+                });
+        }
+        let credential = HostCredential {
+            secret: "not-used".to_string(),
+            account_id: None,
+            kind: HostCredentialKind::ApiKey,
+            source: "test".to_string(),
+        };
+        let error = execute_host_request_with(&state, request, &credential, "http://127.0.0.1:9")
+            .await
+            .expect_err("quota should block before network");
+        assert!(error.contains("5 小时限额已用完"));
     }
 
     #[test]
@@ -1362,6 +1394,9 @@ mod tests {
                 state: SeatState::Connected,
                 tool: None,
                 usage: SeatUsageSummary::default(),
+                token_limits: crate::models::MemberTokenLimits::default(),
+                token_limit_status: crate::models::MemberTokenLimitStatus::default(),
+                token_usage_events: Vec::new(),
             });
             bindings.push((
                 (*code).to_string(),
@@ -1387,6 +1422,7 @@ mod tests {
                 expires_at: now + 60_000,
                 enabled_tools: vec![ToolKind::Codex],
                 seats,
+                account_quotas: Vec::new(),
             });
             runtime.host_bindings.extend(bindings);
         }

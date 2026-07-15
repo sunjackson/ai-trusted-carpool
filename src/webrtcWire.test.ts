@@ -88,4 +88,22 @@ describe('trusted WebRTC wire protocol', () => {
     });
     expect(decoded).toEqual(events);
   });
+
+  it('carries member-safe car quota snapshots over the same ordered channel', () => {
+    const message: WireMessage = {
+      type: 'car_status_snapshot',
+      bridgeRequestId: 'status-1',
+      payloadJson: JSON.stringify({
+        carId: 'car-1',
+        accountQuotas: [{ tool: 'codex', windows: [{ label: '5 小时', remainingPercent: 58 }] }],
+        member: { seatNo: 2, nickname: '小雨' },
+      }),
+    };
+    const assemblies = new Map<string, Assembly>();
+    let decoded: WireMessage | null = null;
+    for (const frame of createChunkFrames(message, 'status-frame')) {
+      decoded = acceptChunkFrame(assemblies, frame);
+    }
+    expect(decoded).toEqual(message);
+  });
 });

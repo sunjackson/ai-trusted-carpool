@@ -24,6 +24,9 @@ host can enable either or both, and each of four seats can run requests concurre
 - Official price figures are USD API list-price estimates calculated per request at the price in
   effect at that time. They are not invoices or Claude/Codex subscription usage. Unknown models
   remain unpriced rather than inheriting a similar model's rate.
+- The host can assign independent rolling 5-hour, 24-hour, and 7-day token limits to each seat.
+  The relay checks all windows before contacting the provider. Because output usage is known only
+  after a response, the final admitted request can overshoot a window; the next request is denied.
 - Each completed request appends a local `usage-history.jsonl` event under the app-data directory.
   It stores the car, passenger, tool, model, token categories, and price estimate, but never the
   prompt, response body, credential, session secret, or invite code.
@@ -45,6 +48,20 @@ host can enable either or both, and each of four seats can run requests concurre
    encrypted data channel without waiting for a complete model response.
 7. The host validates the official endpoint, calls the provider locally, extracts provider usage,
    and updates that seat's model-specific counters and official list-price estimate.
+
+## Quota Visibility
+
+- Claude OAuth quota is read from `https://api.anthropic.com/api/oauth/usage`; Codex/ChatGPT OAuth
+  quota is read from `https://chatgpt.com/backend-api/wham/usage`. This follows the upstream shape
+  documented by the [Sub2API implementation](https://github.com/Wei-Shaw/sub2api).
+- The host queries those fixed official HTTPS endpoints with local credentials. Credentials,
+  ChatGPT account IDs, and raw provider payloads never leave the host.
+- Every two seconds the host sends each connected member a sanitized WebRTC snapshot containing
+  the common account quota plus only that member's own usage and seat limits. Members cannot query
+  another seat's details.
+- API-key authentication has no Claude/Codex subscription quota endpoint, so the UI reports
+  “unsupported” rather than inventing a remaining percentage. A transient refresh error preserves
+  the last successful snapshot and labels it stale.
 
 ## Cross-platform Delivery
 

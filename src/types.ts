@@ -41,6 +41,26 @@ export type SeatUsageSummary = {
   models: ModelUsageSummary[];
 };
 
+export type MemberTokenLimits = {
+  fiveHourTokens: number | null;
+  dailyTokens: number | null;
+  weeklyTokens: number | null;
+};
+
+export type TokenWindowStatus = {
+  limitTokens: number | null;
+  usedTokens: number;
+  remainingTokens: number | null;
+  resetsAt: number | null;
+  exhausted: boolean;
+};
+
+export type MemberTokenLimitStatus = {
+  fiveHour: TokenWindowStatus;
+  daily: TokenWindowStatus;
+  weekly: TokenWindowStatus;
+};
+
 export type Seat = {
   seatNo: number;
   code: string;
@@ -48,6 +68,25 @@ export type Seat = {
   state: 'waiting' | 'connected' | 'using' | 'blocked';
   tool: ToolKind | null;
   usage: SeatUsageSummary;
+  tokenLimits: MemberTokenLimits;
+  tokenLimitStatus: MemberTokenLimitStatus;
+};
+
+export type AccountQuotaWindow = {
+  label: string;
+  usedPercent: number;
+  remainingPercent: number;
+  resetsAt: number | null;
+};
+
+export type AccountQuotaSnapshot = {
+  tool: ToolKind;
+  state: 'pending' | 'available' | 'unsupported' | 'error';
+  planName: string | null;
+  fetchedAt: number | null;
+  source: string;
+  message: string | null;
+  windows: AccountQuotaWindow[];
 };
 
 export type CarSession = {
@@ -58,6 +97,19 @@ export type CarSession = {
   expiresAt: number;
   enabledTools: ToolKind[];
   seats: Seat[];
+  accountQuotas: AccountQuotaSnapshot[];
+};
+
+export type SharedMemberStatus = Omit<Seat, 'code'>;
+
+export type SharedCarStatus = {
+  carId: string;
+  carName: string;
+  startedAt: number;
+  expiresAt: number;
+  enabledTools: ToolKind[];
+  accountQuotas: AccountQuotaSnapshot[];
+  member: SharedMemberStatus;
 };
 
 export type JoinPreview = {

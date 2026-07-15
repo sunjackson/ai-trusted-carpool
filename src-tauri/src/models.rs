@@ -47,6 +47,42 @@ pub struct Seat {
     pub state: SeatState,
     pub tool: Option<ToolKind>,
     pub usage: SeatUsageSummary,
+    pub token_limits: MemberTokenLimits,
+    pub token_limit_status: MemberTokenLimitStatus,
+    #[serde(skip)]
+    pub token_usage_events: Vec<TokenUsageEvent>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MemberTokenLimits {
+    pub five_hour_tokens: Option<u64>,
+    pub daily_tokens: Option<u64>,
+    pub weekly_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MemberTokenLimitStatus {
+    pub five_hour: TokenWindowStatus,
+    pub daily: TokenWindowStatus,
+    pub weekly: TokenWindowStatus,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenWindowStatus {
+    pub limit_tokens: Option<u64>,
+    pub used_tokens: u64,
+    pub remaining_tokens: Option<u64>,
+    pub resets_at: Option<i64>,
+    pub exhausted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenUsageEvent {
+    pub occurred_at: i64,
+    pub tokens: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -94,6 +130,61 @@ pub struct CarSession {
     pub expires_at: i64,
     pub enabled_tools: Vec<ToolKind>,
     pub seats: Vec<Seat>,
+    pub account_quotas: Vec<AccountQuotaSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountQuotaSnapshot {
+    pub tool: ToolKind,
+    pub state: AccountQuotaState,
+    pub plan_name: Option<String>,
+    pub fetched_at: Option<i64>,
+    pub source: String,
+    pub message: Option<String>,
+    pub windows: Vec<AccountQuotaWindow>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AccountQuotaState {
+    Pending,
+    Available,
+    Unsupported,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountQuotaWindow {
+    pub label: String,
+    pub used_percent: f64,
+    pub remaining_percent: f64,
+    pub resets_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SharedCarStatus {
+    pub car_id: String,
+    pub car_name: String,
+    pub started_at: i64,
+    pub expires_at: i64,
+    pub enabled_tools: Vec<ToolKind>,
+    pub account_quotas: Vec<AccountQuotaSnapshot>,
+    pub member: SharedMemberStatus,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SharedMemberStatus {
+    pub seat_no: u8,
+    pub nickname: String,
+    pub state: SeatState,
+    pub tool: Option<ToolKind>,
+    pub usage: SeatUsageSummary,
+    pub token_limits: MemberTokenLimits,
+    pub token_limit_status: MemberTokenLimitStatus,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -103,6 +194,15 @@ pub struct StartCarInput {
     pub enabled_tools: Vec<ToolKind>,
     pub starts_at: i64,
     pub ends_at: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateMemberTokenLimitsInput {
+    pub seat_no: u8,
+    pub five_hour_tokens: Option<u64>,
+    pub daily_tokens: Option<u64>,
+    pub weekly_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]

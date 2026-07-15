@@ -1,3 +1,4 @@
+mod account_quota;
 mod commands;
 mod coordinator;
 mod crypto;
@@ -6,6 +7,7 @@ mod local_proxy;
 mod models;
 mod pricing;
 mod protocol;
+mod quota;
 mod relay;
 mod runtime;
 mod terminal_launcher;
@@ -13,9 +15,10 @@ mod usage;
 mod usage_history;
 
 use commands::{
-    detect_tools, execute_relay_request, get_active_car, get_ice_servers, join_car, launch_tool,
-    leave_car, poll_webrtc_signals, preview_invite, send_webrtc_signal, start_car,
-    start_relay_request, stop_car, submit_relay_response, submit_relay_stream_event,
+    detect_tools, execute_relay_request, get_active_car, get_ice_servers, get_shared_car_status,
+    join_car, launch_tool, leave_car, poll_webrtc_signals, preview_invite, refresh_account_quotas,
+    send_webrtc_signal, start_car, start_relay_request, stop_car, submit_relay_response,
+    submit_relay_stream_event, update_member_token_limits,
 };
 use relay::RelayBridge;
 use runtime::RuntimeState;
@@ -50,6 +53,9 @@ pub fn run() {
             start_car,
             stop_car,
             get_active_car,
+            refresh_account_quotas,
+            update_member_token_limits,
+            get_shared_car_status,
             preview_invite,
             join_car,
             leave_car,

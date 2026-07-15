@@ -145,6 +145,12 @@ pub fn extract_usage(
 }
 
 pub fn apply_usage(car: &mut CarSession, code: &str, delta: UsageDelta) -> Result<(), String> {
+    let delta_total_tokens = delta
+        .input_tokens
+        .saturating_add(delta.output_tokens)
+        .saturating_add(delta.cache_read_tokens)
+        .saturating_add(delta.cache_write_5m_tokens)
+        .saturating_add(delta.cache_write_1h_tokens);
     let delta_price = estimate(
         delta.tool,
         &delta.model,
@@ -272,6 +278,7 @@ pub fn apply_usage(car: &mut CarSession, code: &str, delta: UsageDelta) -> Resul
         .map(|item| item.unpriced_request_count)
         .sum();
     seat.usage.last_used_at = Some(delta.occurred_at);
+    crate::quota::record_tokens(seat, delta.occurred_at, delta_total_tokens);
     Ok(())
 }
 
@@ -355,7 +362,11 @@ data: [DONE]
                 state: SeatState::Connected,
                 tool: None,
                 usage: SeatUsageSummary::default(),
+                token_limits: crate::models::MemberTokenLimits::default(),
+                token_limit_status: crate::models::MemberTokenLimitStatus::default(),
+                token_usage_events: Vec::new(),
             }],
+            account_quotas: Vec::new(),
         };
         apply_usage(
             &mut car,
@@ -409,7 +420,11 @@ data: [DONE]
                 state: SeatState::Connected,
                 tool: None,
                 usage: SeatUsageSummary::default(),
+                token_limits: crate::models::MemberTokenLimits::default(),
+                token_limit_status: crate::models::MemberTokenLimitStatus::default(),
+                token_usage_events: Vec::new(),
             }],
+            account_quotas: Vec::new(),
         };
         for occurred_at in [1_788_220_799_999, 1_788_220_800_000] {
             apply_usage(

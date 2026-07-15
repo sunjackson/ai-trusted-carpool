@@ -1,5 +1,10 @@
 export type WireMessage = {
-  type: 'relay_request' | 'relay_response' | 'relay_stream_event';
+  type:
+    | 'relay_request'
+    | 'relay_response'
+    | 'relay_stream_event'
+    | 'car_status_request'
+    | 'car_status_snapshot';
   bridgeRequestId: string;
   payloadJson: string;
 };
@@ -41,7 +46,9 @@ const isWireMessage = (value: unknown): value is WireMessage => {
   return (
     (message.type === 'relay_request' ||
       message.type === 'relay_response' ||
-      message.type === 'relay_stream_event') &&
+      message.type === 'relay_stream_event' ||
+      message.type === 'car_status_request' ||
+      message.type === 'car_status_snapshot') &&
     typeof message.bridgeRequestId === 'string' &&
     message.bridgeRequestId.length > 0 &&
     typeof message.payloadJson === 'string'

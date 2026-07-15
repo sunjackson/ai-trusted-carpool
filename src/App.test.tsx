@@ -24,16 +24,21 @@ describe('Trusted Carpool simple flow', () => {
     expect(screen.queryByText(/信令|中继|密钥输入/)).not.toBeInTheDocument();
   });
 
-  it('shows live usage per person and per model with official API estimates', async () => {
+  it('keeps the member list concise and opens detailed usage on demand', async () => {
     render(<App />);
     fireEvent.click(screen.getByRole('button', { name: /我要发车/ }));
     const startButton = await screen.findByRole('button', { name: /开始发车/ });
     await waitFor(() => expect(startButton).toBeEnabled());
     fireEvent.click(startButton);
 
+    expect(await screen.findByText('车队账号额度')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /查看阿杰详情/ })).toBeInTheDocument();
+    expect(screen.queryByText('claude-sonnet-4-6')).not.toBeInTheDocument();
+    expect(screen.queryByText('gpt-5.6-luna')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /查看阿杰详情/ }));
+
     expect(await screen.findByText('claude-sonnet-4-6')).toBeInTheDocument();
     expect(screen.getByText('claude-haiku-4-5')).toBeInTheDocument();
-    expect(screen.getByText('gpt-5.6-luna')).toBeInTheDocument();
     expect(screen.getAllByText('输入').length).toBeGreaterThan(0);
     expect(screen.getAllByText('输出').length).toBeGreaterThan(0);
     expect(screen.getAllByText('缓存读').length).toBeGreaterThan(0);
@@ -44,6 +49,16 @@ describe('Trusted Carpool simple flow', () => {
     expect(screen.getByText('缓存写 1,500')).toBeInTheDocument();
     expect(screen.getByText(/缓存写入：5 分钟 1,100 · 1 小时 400/)).toBeInTheDocument();
     expect(screen.getAllByText(/官价估算 \$/).length).toBeGreaterThan(0);
+    expect(screen.getByLabelText('5 小时 Token 限额')).toHaveValue(60000);
+    expect(screen.getByLabelText('24 小时 Token 限额')).toHaveValue(180000);
+    expect(screen.getByLabelText('7 天 Token 限额')).toHaveValue(800000);
+    const saveButton = screen.getByRole('button', { name: '保存成员限额' });
+    expect(saveButton).toBeEnabled();
+    fireEvent.change(screen.getByLabelText('5 小时 Token 限额'), { target: { value: '0' } });
+    expect(screen.getByRole('alert')).toHaveTextContent('限额必须是 1—1万亿之间的整数');
+    expect(saveButton).toBeDisabled();
+    fireEvent.change(screen.getByLabelText('5 小时 Token 限额'), { target: { value: '' } });
+    expect(saveButton).toBeEnabled();
     expect(screen.getByText(/明细仅保存在车主本机/)).toBeInTheDocument();
     expect(screen.getByText(/官方 API 标准价估算，不是账单/)).toBeInTheDocument();
   });
