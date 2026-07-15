@@ -359,7 +359,7 @@ function AccountQuotaPanel({
       <div className="account-quota-panel__header">
         <div>
           <span><Gauge size={17} /> 车队账号额度</span>
-          <small>来自车主本机官方账号，车主和所有成员看到相同结果</small>
+          <small>读取车主本机官方 OAuth 套餐，车主和所有成员看到相同结果</small>
         </div>
         {onRefresh && (
           <button onClick={onRefresh} disabled={refreshing}>

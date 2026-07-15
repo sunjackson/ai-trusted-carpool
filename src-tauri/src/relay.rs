@@ -475,6 +475,30 @@ fn claude_settings_bearer(path: &Path) -> Option<HostCredential> {
     })
 }
 
+fn claude_env_oauth() -> Option<HostCredential> {
+    let configured_base = std::env::var("ANTHROPIC_BASE_URL").ok();
+    if configured_base
+        .as_deref()
+        .is_some_and(|base| base.trim_end_matches('/') != "https://api.anthropic.com")
+    {
+        return None;
+    }
+    ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN"]
+        .into_iter()
+        .find_map(|env_name| {
+            std::env::var(env_name)
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .map(|secret| HostCredential {
+                    secret,
+                    account_id: None,
+                    kind: HostCredentialKind::ClaudeOAuth,
+                    source: format!("环境变量 {env_name}"),
+                })
+        })
+}
+
 #[cfg(target_os = "macos")]
 fn claude_keychain_oauth() -> Option<HostCredential> {
     let output = std::process::Command::new("security")
@@ -521,6 +545,43 @@ fn credential_candidates(kind: ToolKind, home: &Path) -> Vec<(PathBuf, &'static 
     }
 }
 
+fn load_host_oauth_credential_from(
+    kind: ToolKind,
+    home: &Path,
+    include_claude_keychain: bool,
+) -> Option<HostCredential> {
+    match kind {
+        ToolKind::Claude => {
+            let path = home.join(".claude/.credentials.json");
+            read_json(&path)
+                .and_then(|value| {
+                    claude_oauth_from_value(&value, path.to_string_lossy().into_owned())
+                })
+                .or_else(|| claude_settings_bearer(&home.join(".claude/settings.json")))
+                .or_else(|| {
+                    include_claude_keychain
+                        .then(claude_keychain_oauth)
+                        .flatten()
+                })
+        }
+        ToolKind::Codex => codex_oauth_credential(&home.join(".codex/auth.json")),
+    }
+}
+
+/// Loads only subscription OAuth credentials for official quota queries.
+///
+/// Relay routing may intentionally prefer an API key. Quota monitoring must not:
+/// API keys do not expose Claude/ChatGPT subscription windows and may be inherited
+/// from an unrelated shell profile while the official CLI OAuth session is valid.
+pub fn load_host_oauth_credential(kind: ToolKind) -> Option<HostCredential> {
+    if kind == ToolKind::Claude {
+        if let Some(credential) = claude_env_oauth() {
+            return Some(credential);
+        }
+    }
+    load_host_oauth_credential_from(kind, &dirs::home_dir()?, true)
+}
+
 pub fn load_host_credential(kind: ToolKind) -> Option<HostCredential> {
     let env_name = match kind {
         ToolKind::Claude => "ANTHROPIC_API_KEY",
@@ -538,23 +599,8 @@ pub fn load_host_credential(kind: ToolKind) -> Option<HostCredential> {
         }
     }
     if kind == ToolKind::Claude {
-        let configured_base = std::env::var("ANTHROPIC_BASE_URL").ok();
-        if configured_base
-            .as_deref()
-            .is_none_or(|base| base.trim_end_matches('/') == "https://api.anthropic.com")
-        {
-            for env_name in ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN"] {
-                if let Ok(value) = std::env::var(env_name) {
-                    if !value.trim().is_empty() {
-                        return Some(HostCredential {
-                            secret: value.trim().to_string(),
-                            account_id: None,
-                            kind: HostCredentialKind::ClaudeOAuth,
-                            source: format!("环境变量 {env_name}"),
-                        });
-                    }
-                }
-            }
+        if let Some(credential) = claude_env_oauth() {
+            return Some(credential);
         }
     }
     let home = dirs::home_dir()?;
@@ -572,18 +618,7 @@ pub fn load_host_credential(kind: ToolKind) -> Option<HostCredential> {
     {
         return Some(credential);
     }
-    match kind {
-        ToolKind::Claude => {
-            let path = home.join(".claude/.credentials.json");
-            read_json(&path)
-                .and_then(|value| {
-                    claude_oauth_from_value(&value, path.to_string_lossy().into_owned())
-                })
-                .or_else(|| claude_settings_bearer(&home.join(".claude/settings.json")))
-                .or_else(claude_keychain_oauth)
-        }
-        ToolKind::Codex => codex_oauth_credential(&home.join(".codex/auth.json")),
-    }
+    load_host_oauth_credential_from(kind, &home, true)
 }
 
 fn binding_for_request(
@@ -1137,6 +1172,55 @@ mod tests {
             json_api_key(&path, &["/OPENAI_API_KEY"]).as_deref(),
             Some("sk-official")
         );
+    }
+
+    #[test]
+    fn quota_oauth_loader_ignores_codex_api_key_in_the_same_auth_file() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let codex = directory.path().join(".codex");
+        std::fs::create_dir_all(&codex).expect("create codex directory");
+        std::fs::write(
+            codex.join("auth.json"),
+            r#"{
+              "OPENAI_API_KEY":"sk-unrelated-api-key",
+              "tokens":{"access_token":"oauth-official","account_id":"account-1"}
+            }"#,
+        )
+        .expect("write");
+
+        let credential = load_host_oauth_credential_from(ToolKind::Codex, directory.path(), false)
+            .expect("OAuth credential");
+        assert_eq!(credential.kind, HostCredentialKind::CodexChatGptOAuth);
+        assert_eq!(credential.secret, "oauth-official");
+        assert_eq!(credential.account_id.as_deref(), Some("account-1"));
+    }
+
+    #[test]
+    fn quota_oauth_loader_reads_claude_credentials_without_accepting_custom_base_tokens() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let claude = directory.path().join(".claude");
+        std::fs::create_dir_all(&claude).expect("create claude directory");
+        std::fs::write(
+            claude.join("settings.json"),
+            r#"{"env":{"ANTHROPIC_AUTH_TOKEN":"proxy-token","ANTHROPIC_BASE_URL":"https://proxy.example"}}"#,
+        )
+        .expect("write settings");
+        assert!(
+            load_host_oauth_credential_from(ToolKind::Claude, directory.path(), false).is_none()
+        );
+
+        std::fs::write(
+            claude.join(".credentials.json"),
+            format!(
+                r#"{{"claudeAiOauth":{{"accessToken":"oauth-official","expiresAt":{}}}}}"#,
+                now_ms() + 120_000
+            ),
+        )
+        .expect("write credentials");
+        let credential = load_host_oauth_credential_from(ToolKind::Claude, directory.path(), false)
+            .expect("OAuth credential");
+        assert_eq!(credential.kind, HostCredentialKind::ClaudeOAuth);
+        assert_eq!(credential.secret, "oauth-official");
     }
 
     #[test]

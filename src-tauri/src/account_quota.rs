@@ -1,5 +1,7 @@
 use crate::models::{AccountQuotaSnapshot, AccountQuotaState, AccountQuotaWindow, ToolKind};
-use crate::relay::{load_host_credential, HostCredential, HostCredentialKind};
+use crate::relay::{
+    load_host_credential, load_host_oauth_credential, HostCredential, HostCredentialKind,
+};
 use serde::Deserialize;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -136,45 +138,48 @@ fn parse_rfc3339_ms(value: &str) -> Option<i64> {
     Some(seconds.saturating_mul(1_000))
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct ClaudeWindow {
+    #[serde(default)]
     utilization: f64,
+    #[serde(default)]
     resets_at: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct ClaudeUsageResponse {
     #[serde(default)]
-    five_hour: ClaudeWindow,
+    five_hour: Option<ClaudeWindow>,
     #[serde(default)]
-    seven_day: ClaudeWindow,
+    seven_day: Option<ClaudeWindow>,
     #[serde(default)]
-    seven_day_sonnet: ClaudeWindow,
+    seven_day_sonnet: Option<ClaudeWindow>,
+    #[serde(default)]
+    seven_day_opus: Option<ClaudeWindow>,
+    #[serde(default)]
+    seven_day_overage_included: Option<ClaudeWindow>,
 }
 
 fn parse_claude_usage(body: &[u8], fetched_at: i64) -> Result<AccountQuotaSnapshot, String> {
     let response: ClaudeUsageResponse = serde_json::from_slice(body)
         .map_err(|error| format!("Claude 官方额度格式无效: {error}"))?;
-    let mut windows = vec![window(
-        "5 小时",
-        response.five_hour.utilization,
-        parse_rfc3339_ms(&response.five_hour.resets_at),
-    )];
-    if !response.seven_day.resets_at.is_empty() || response.seven_day.utilization > 0.0 {
+    let mut windows = Vec::new();
+    for (label, item) in [
+        ("5 小时", response.five_hour.as_ref()),
+        ("7 天", response.seven_day.as_ref()),
+        ("7 天 Sonnet", response.seven_day_sonnet.as_ref()),
+        ("7 天 Opus", response.seven_day_opus.as_ref()),
+        ("7 天扩展用量", response.seven_day_overage_included.as_ref()),
+    ] {
+        let Some(item) = item else { continue };
         windows.push(window(
-            "7 天",
-            response.seven_day.utilization,
-            parse_rfc3339_ms(&response.seven_day.resets_at),
+            label,
+            item.utilization,
+            parse_rfc3339_ms(&item.resets_at),
         ));
     }
-    if !response.seven_day_sonnet.resets_at.is_empty()
-        || response.seven_day_sonnet.utilization > 0.0
-    {
-        windows.push(window(
-            "7 天 Sonnet",
-            response.seven_day_sonnet.utilization,
-            parse_rfc3339_ms(&response.seven_day_sonnet.resets_at),
-        ));
+    if windows.is_empty() {
+        return Err("Claude 官方额度响应没有可用窗口".to_string());
     }
     Ok(AccountQuotaSnapshot {
         tool: ToolKind::Claude,
@@ -339,16 +344,29 @@ async fn query_codex(credential: &HostCredential) -> Result<AccountQuotaSnapshot
 }
 
 pub async fn query(tool: ToolKind) -> AccountQuotaSnapshot {
-    let Some(credential) = load_host_credential(tool) else {
-        return failed(tool, "未检测到可用的本机官方账号");
+    if let Some(credential) = load_host_oauth_credential(tool) {
+        return match (tool, credential.kind) {
+            (ToolKind::Claude, HostCredentialKind::ClaudeOAuth) => query_claude(&credential)
+                .await
+                .unwrap_or_else(|error| failed(tool, error)),
+            (ToolKind::Codex, HostCredentialKind::CodexChatGptOAuth) => query_codex(&credential)
+                .await
+                .unwrap_or_else(|error| failed(tool, error)),
+            _ => failed(tool, "本机 OAuth 账号类型与工具不匹配"),
+        };
+    }
+
+    let credential = load_host_credential(tool);
+    let Some(credential) = credential else {
+        return match tool {
+            ToolKind::Claude => failed(
+                tool,
+                "未检测到 Claude 官方 OAuth 登录；自定义地址或本地代理账号无法查询官方套餐额度",
+            ),
+            ToolKind::Codex => failed(tool, "未检测到 Codex 的 ChatGPT OAuth 登录，请先登录 Codex"),
+        };
     };
     match (tool, credential.kind) {
-        (ToolKind::Claude, HostCredentialKind::ClaudeOAuth) => query_claude(&credential)
-            .await
-            .unwrap_or_else(|error| failed(tool, error)),
-        (ToolKind::Codex, HostCredentialKind::CodexChatGptOAuth) => query_codex(&credential)
-            .await
-            .unwrap_or_else(|error| failed(tool, error)),
         (ToolKind::Claude, HostCredentialKind::ApiKey) => unsupported(
             tool,
             "Claude API Key 官方未提供订阅额度查询；成员限额仍按本车实际 Token 统计",
@@ -357,7 +375,7 @@ pub async fn query(tool: ToolKind) -> AccountQuotaSnapshot {
             tool,
             "OpenAI API Key 官方未提供 ChatGPT 套餐额度查询；成员限额仍按本车实际 Token 统计",
         ),
-        _ => failed(tool, "本机账号类型与工具不匹配"),
+        _ => failed(tool, "未找到可用于套餐额度查询的官方 OAuth 登录"),
     }
 }
 
@@ -383,6 +401,23 @@ mod tests {
     }
 
     #[test]
+    fn parses_claude_nullable_model_windows() {
+        let snapshot = parse_claude_usage(
+            br#"{
+              "five_hour":{"utilization":12,"resets_at":"2026-07-15T08:00:00Z"},
+              "seven_day":{"utilization":34,"resets_at":"2026-07-20T08:00:00Z"},
+              "seven_day_sonnet":null,
+              "seven_day_opus":{"utilization":56,"resets_at":"2026-07-20T08:00:00Z"}
+            }"#,
+            124,
+        )
+        .expect("snapshot");
+        assert_eq!(snapshot.windows.len(), 3);
+        assert_eq!(snapshot.windows[2].label, "7 天 Opus");
+        assert_eq!(snapshot.windows[2].remaining_percent, 44.0);
+    }
+
+    #[test]
     fn parses_codex_primary_secondary_and_feature_windows() {
         let snapshot = parse_codex_usage(
             br#"{
@@ -398,6 +433,23 @@ mod tests {
         assert_eq!(snapshot.windows[1].label, "7 天");
         assert_eq!(snapshot.windows[2].label, "Spark · 5 小时");
         assert_eq!(snapshot.windows[0].remaining_percent, 58.0);
+    }
+
+    #[test]
+    fn parses_codex_pro_weekly_window_when_secondary_is_null() {
+        let snapshot = parse_codex_usage(
+            br#"{
+              "plan_type":"pro",
+              "rate_limit":{"primary_window":{"used_percent":17,"limit_window_seconds":604800,"reset_at":1784707200},"secondary_window":null},
+              "additional_rate_limits":[{"limit_name":"Spark","rate_limit":{"primary_window":{"used_percent":0,"limit_window_seconds":604800,"reset_at":1784707200},"secondary_window":null}}]
+            }"#,
+            457,
+        )
+        .expect("snapshot");
+        assert_eq!(snapshot.plan_name.as_deref(), Some("pro"));
+        assert_eq!(snapshot.windows[0].label, "7 天");
+        assert_eq!(snapshot.windows[0].remaining_percent, 83.0);
+        assert_eq!(snapshot.windows[1].label, "Spark · 7 天");
     }
 
     #[test]
