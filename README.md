@@ -36,7 +36,7 @@ cargo test --manifest-path src-tauri/Cargo.toml --all-targets --all-features
 ./scripts/build-linux-docker.sh
 ```
 
-GitHub Actions 会在 macOS、Windows 与 Ubuntu 原生环境中执行完整检查并生成安装包。macOS 正式分发仍需 Apple Developer ID 与公证；Windows 正式分发仍需代码签名证书。
+GitHub Actions 会先执行前后端与协调服务自测，再并行生成 macOS 通用 DMG、Windows x64 NSIS、Linux x64 DEB 与 AppImage；每次运行的安装包在 Actions Artifacts 保留 30 天。推送与应用版本一致的 `vX.Y.Z` 标签会自动创建 GitHub Release、附加全部安装包和 `SHA256SUMS.txt`。macOS 正式分发仍需 Apple Developer ID 与公证；Windows 正式分发仍需代码签名证书。
 
 ## 安全边界
 
