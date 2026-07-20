@@ -157,3 +157,65 @@ test('rate limits invite enumeration by source address', async () => {
     assert.match(limited.body.error, /too many/);
   }, { resolveRateLimit: 2 });
 });
+
+test('issues verifiable time-limited turn credentials bound to a peer', async () => {
+  const secret = 'test-shared-turn-secret';
+  const urls = ['turn:relay.example.com:3478?transport=udp', 'turns:relay.example.com:5349'];
+  await withServer(async base => {
+    const peer = identity();
+    const before = Math.floor(Date.now() / 1000);
+    const response = await request(
+      `${base}/api/v1/turn-credentials?peer_id=${encodeURIComponent(peer.peerId)}`
+    );
+    assert.equal(response.status, 200);
+    assert.deepEqual(response.body.urls, urls);
+    assert.equal(response.body.ttl_seconds, 120);
+
+    const [expiry, embeddedPeerId] = response.body.username.split(':');
+    assert.equal(embeddedPeerId, peer.peerId);
+    const expiresAt = Number(expiry);
+    assert.ok(expiresAt >= before + 120 && expiresAt <= before + 121);
+
+    const expected = crypto
+      .createHmac('sha1', secret)
+      .update(response.body.username)
+      .digest('base64');
+    assert.equal(response.body.credential, expected);
+  }, { turnSecret: secret, turnUrls: urls, turnTtlSeconds: 120 });
+});
+
+test('rejects turn credential requests with an invalid peer id', async () => {
+  await withServer(async base => {
+    const missing = await request(`${base}/api/v1/turn-credentials`);
+    assert.equal(missing.status, 400);
+    const malformed = await request(`${base}/api/v1/turn-credentials?peer_id=not-a-peer`);
+    assert.equal(malformed.status, 400);
+  }, { turnSecret: 'test-shared-turn-secret', turnUrls: ['turn:relay.example.com:3478?transport=udp'] });
+});
+
+test('reports turn relay as unconfigured without a shared secret', async () => {
+  await withServer(async base => {
+    const peer = identity();
+    const response = await request(
+      `${base}/api/v1/turn-credentials?peer_id=${encodeURIComponent(peer.peerId)}`
+    );
+    assert.equal(response.status, 404);
+    assert.match(response.body.error, /not configured/);
+  }, { turnSecret: '', turnUrls: [] });
+});
+
+test('rate limits turn credential requests by source address', async () => {
+  await withServer(async base => {
+    const peer = identity();
+    const target = `${base}/api/v1/turn-credentials?peer_id=${encodeURIComponent(peer.peerId)}`;
+    assert.equal((await request(target)).status, 200);
+    assert.equal((await request(target)).status, 200);
+    const limited = await request(target);
+    assert.equal(limited.status, 429);
+    assert.match(limited.body.error, /too many/);
+  }, {
+    resolveRateLimit: 2,
+    turnSecret: 'test-shared-turn-secret',
+    turnUrls: ['turn:relay.example.com:3478?transport=udp'],
+  });
+});

@@ -43,6 +43,9 @@ jobs:
         run: npm audit --audit-level=high
       - name: Test frontend
         run: npm test -- --run
+      - name: Report frontend coverage (non-blocking)
+        run: npm run test:coverage
+        continue-on-error: true
       - name: Lint frontend
         run: npm run lint
       - name: Build frontend
@@ -55,6 +58,12 @@ jobs:
         run: cargo test --manifest-path src-tauri/Cargo.toml --all-targets --all-features
       - name: Lint Rust backend
         run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: Audit Rust dependencies
+        run: cargo audit --file src-tauri/Cargo.lock
 
   build:
     name: Build ${{ matrix.label }}

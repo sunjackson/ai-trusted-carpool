@@ -16,11 +16,30 @@ import type {
 const inTauri = (): boolean => '__TAURI_INTERNALS__' in window;
 const JOIN_LINK_EVENT = 'trusted-carpool:join-link';
 const JOIN_CODE_PATTERN = /^[A-HJ-NP-Z2-9]{12}$/;
+const DEFAULT_COORDINATOR_URL = 'https://p2p.cnaigc.ai';
+
+// Self-hosted builds point elsewhere via VITE_TRUSTED_CARPOOL_COORDINATOR_URL
+// (see docs/SELF-HOSTING.md); the Rust side follows TRUSTED_CARPOOL_COORDINATOR_URL.
+export function coordinatorBaseUrl(): string {
+  const configured = import.meta.env.VITE_TRUSTED_CARPOOL_COORDINATOR_URL;
+  if (typeof configured === 'string' && configured.trim()) {
+    return configured.trim().replace(/\/+$/, '');
+  }
+  return DEFAULT_COORDINATOR_URL;
+}
+
+export function coordinatorHost(): string {
+  try {
+    return new URL(coordinatorBaseUrl()).host;
+  } catch {
+    return new URL(DEFAULT_COORDINATOR_URL).host;
+  }
+}
 
 export function serverJoinUrl(code: string): string {
   const normalized = code.trim().toUpperCase();
   if (!JOIN_CODE_PATTERN.test(normalized)) throw new Error('上车码格式不正确');
-  return `https://p2p.cnaigc.ai/api/v1/carpool/join/${normalized}`;
+  return `${coordinatorBaseUrl()}/api/v1/carpool/join/${normalized}`;
 }
 
 export async function takePendingJoinCode(): Promise<string | null> {

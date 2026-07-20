@@ -136,9 +136,34 @@ struct ErrorResponse {
     error: Option<String>,
 }
 
+/// Accepts a TURN/TURNS URI only when its host equals the trusted
+/// coordinator host. The port stays flexible for self-hosted relays, but the
+/// host is the trust anchor and must match exactly.
+fn turn_url_matches_host(url: &str, host: &str) -> bool {
+    let Some(rest) = url
+        .strip_prefix("turns:")
+        .or_else(|| url.strip_prefix("turn:"))
+    else {
+        return false;
+    };
+    let authority = rest.split('?').next().unwrap_or_default();
+    let (candidate, port) = match authority.rsplit_once(':') {
+        Some((candidate, port)) => (candidate, Some(port)),
+        None => (authority, None),
+    };
+    let port_is_valid = match port {
+        Some(port) => {
+            !port.is_empty() && port.len() <= 5 && port.bytes().all(|byte| byte.is_ascii_digit())
+        }
+        None => true,
+    };
+    port_is_valid && !candidate.is_empty() && candidate.eq_ignore_ascii_case(host)
+}
+
 #[derive(Clone)]
 pub struct CoordinatorClient {
     base_url: String,
+    trusted_host: String,
     client: reqwest::Client,
 }
 
@@ -157,8 +182,13 @@ impl CoordinatorClient {
         {
             return Err("协调服务必须使用 HTTPS".to_string());
         }
+        let trusted_host = url::Url::parse(base_url)
+            .ok()
+            .and_then(|parsed| parsed.host_str().map(str::to_ascii_lowercase))
+            .ok_or_else(|| "协调服务地址缺少有效域名".to_string())?;
         Ok(Self {
             base_url: base_url.to_string(),
+            trusted_host,
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
                 .build()
@@ -443,12 +473,12 @@ impl CoordinatorClient {
             .await
             .map_err(|error| format!("TURN 中继凭据格式无效: {error}"))?;
         if credentials.urls.is_empty()
-            || credentials.urls.iter().any(|url| {
-                !url.starts_with("turn:p2p.cnaigc.ai:3478?transport=")
-                    && !url.starts_with("turns:p2p.cnaigc.ai:")
-            })
+            || credentials
+                .urls
+                .iter()
+                .any(|url| !turn_url_matches_host(url, &self.trusted_host))
         {
-            return Err("TURN 中继地址不是受信任的 p2p.cnaigc.ai".to_string());
+            return Err(format!("TURN 中继地址不是受信任的 {}", self.trusted_host));
         }
         Ok(vec![IceServer {
             urls: credentials.urls,
@@ -467,6 +497,52 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
             .as_millis() as i64
+    }
+
+    #[test]
+    fn trusted_turn_host_is_derived_from_the_configured_coordinator_url() {
+        let official = CoordinatorClient::new("https://p2p.cnaigc.ai").expect("official client");
+        assert_eq!(official.trusted_host, "p2p.cnaigc.ai");
+        assert!(turn_url_matches_host(
+            "turn:p2p.cnaigc.ai:3478?transport=udp",
+            &official.trusted_host
+        ));
+        assert!(turn_url_matches_host(
+            "turns:p2p.cnaigc.ai:5349",
+            &official.trusted_host
+        ));
+
+        let self_hosted =
+            CoordinatorClient::new("https://carpool.example.org").expect("self-hosted client");
+        assert_eq!(self_hosted.trusted_host, "carpool.example.org");
+        assert!(turn_url_matches_host(
+            "turn:carpool.example.org:3478?transport=udp",
+            &self_hosted.trusted_host
+        ));
+        assert!(!turn_url_matches_host(
+            "turn:p2p.cnaigc.ai:3478?transport=udp",
+            &self_hosted.trusted_host
+        ));
+
+        assert!(CoordinatorClient::new("https://").is_err());
+    }
+
+    #[test]
+    fn turn_urls_from_other_hosts_or_schemes_are_rejected() {
+        let host = "p2p.cnaigc.ai";
+        assert!(!turn_url_matches_host("turn:evil.example:3478", host));
+        assert!(!turn_url_matches_host(
+            "turn:p2p.cnaigc.ai.evil.example:3478",
+            host
+        ));
+        assert!(!turn_url_matches_host("stun:p2p.cnaigc.ai:3478", host));
+        assert!(!turn_url_matches_host("https://p2p.cnaigc.ai", host));
+        assert!(!turn_url_matches_host("turn:", host));
+        assert!(!turn_url_matches_host("turn:p2p.cnaigc.ai:abc", host));
+        assert!(turn_url_matches_host(
+            "turn:P2P.CNAIGC.AI:3478?transport=tcp",
+            host
+        ));
     }
 
     #[test]

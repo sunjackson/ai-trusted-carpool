@@ -106,6 +106,14 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .trust-row { display: flex; align-items: center; justify-content: center; gap: 34px; color: #8d949e; font-size: 12px; }
 .trust-row span { display: flex; align-items: center; gap: 7px; }
 
+.first-run { width: min(640px, 100%); min-height: calc(100vh - 128px); margin: 0 auto; display: flex; flex-direction: column; justify-content: center; align-items: center; padding: 32px 0 24px; text-align: center; }
+.first-run__icon { width: 66px; height: 66px; display: grid; place-items: center; margin-bottom: 20px; color: #1a1407; border-radius: 22px; background: linear-gradient(145deg, #ffe680, #ffb827); box-shadow: 0 18px 60px rgba(255,190,47,.22), inset 0 1px #fff8; }
+.first-run h1 { margin: 0; font-size: clamp(26px, 3.4vw, 36px); line-height: 1.2; letter-spacing: -1.2px; }
+.first-run__points { width: 100%; display: flex; flex-direction: column; gap: 12px; margin: 26px 0 28px; padding: 0; list-style: none; }
+.first-run__points li { display: flex; align-items: flex-start; gap: 12px; padding: 15px 18px; text-align: left; color: #c8cdd5; font-size: 14px; line-height: 1.65; border: 1px solid var(--line-soft); border-radius: 16px; background: rgba(20,23,28,.72); }
+.first-run__points li svg { flex-shrink: 0; margin-top: 3px; color: var(--gold); }
+.first-run .primary-button { width: min(420px, 100%); }
+
 .flow-page { padding: 8px 0 20px; }
 .back-button { display: flex; align-items: center; gap: 7px; border: 0; padding: 8px 0; color: #a8afb9; background: transparent; cursor: pointer; }
 .back-button:hover { color: white; }

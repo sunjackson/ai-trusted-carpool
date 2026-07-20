@@ -11,6 +11,8 @@ const MAX_INVITES = 20_000;
 const MAX_MESSAGES_PER_PEER = 128;
 const DEFAULT_RESOLVE_RATE_LIMIT = 60;
 const RATE_WINDOW_MS = 60_000;
+const DEFAULT_TURN_TTL_SECONDS = 3600;
+const MAX_TURN_TTL_SECONDS = 24 * 60 * 60;
 const ALLOWED_MESSAGE_KINDS = new Set([
   'carpool_claim',
   'carpool_access',
@@ -114,6 +116,23 @@ function peerIdFromPublicKey(publicKeyBase64) {
   return `p2p-${hash.toString('base64url')}`;
 }
 
+// coturn "TURN REST API" ephemeral credentials: username is
+// "<expiry-unixtime>:<peer_id>" and the credential is
+// base64(hmac-sha1(static-auth-secret, username)).
+function turnRestCredentials(secret, peerId, ttlSeconds, nowMsValue) {
+  const expiresAt = Math.floor(nowMsValue / 1000) + ttlSeconds;
+  const username = `${expiresAt}:${peerId}`;
+  const credential = crypto.createHmac('sha1', secret).update(username).digest('base64');
+  return { username, credential, expires_at_s: expiresAt };
+}
+
+function parseTurnUrls(value) {
+  return String(value || '')
+    .split(',')
+    .map(entry => entry.trim())
+    .filter(entry => /^turns?:/.test(entry));
+}
+
 function p256PublicKey(rawBase64) {
   const raw = Buffer.from(rawBase64, 'base64');
   if (raw.length !== 65 || raw[0] !== 4) throw new Error('expected uncompressed P-256 key');
@@ -212,6 +231,15 @@ function createCoordinator(options = {}) {
   const clock = options.clock || nowMs;
   const trustProxy = options.trustProxy ?? process.env.TRUSTED_CARPOOL_TRUST_PROXY === '1';
   const resolveRateLimit = options.resolveRateLimit ?? DEFAULT_RESOLVE_RATE_LIMIT;
+  const turnSecret = options.turnSecret ?? process.env.TRUSTED_CARPOOL_TURN_SECRET ?? '';
+  const turnUrls = options.turnUrls ?? parseTurnUrls(process.env.TRUSTED_CARPOOL_TURN_URLS);
+  const configuredTurnTtl = Number(
+    options.turnTtlSeconds ?? process.env.TRUSTED_CARPOOL_TURN_TTL_SECONDS ?? DEFAULT_TURN_TTL_SECONDS
+  );
+  const turnTtlSeconds =
+    Number.isSafeInteger(configuredTurnTtl) && configuredTurnTtl > 0
+      ? Math.min(configuredTurnTtl, MAX_TURN_TTL_SECONDS)
+      : DEFAULT_TURN_TTL_SECONDS;
 
   function clientIp(req) {
     if (trustProxy) {
@@ -248,6 +276,24 @@ function createCoordinator(options = {}) {
     const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
     if (req.method === 'GET' && ['/health', '/api/v1/health'].includes(url.pathname)) {
       return json(res, 200, { ok: true, invites: invites.size, messages: [...mailboxes.values()].reduce((sum, list) => sum + list.length, 0), now_ms: clock() });
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/v1/turn-credentials') {
+      if (!turnSecret || turnUrls.length === 0) {
+        return error(res, 404, 'turn relay is not configured');
+      }
+      if (!allowRate(`turn:${clientIp(req)}`, resolveRateLimit)) {
+        return error(res, 429, 'too many turn credential requests', { 'retry-after': '60' });
+      }
+      const peerId = url.searchParams.get('peer_id');
+      if (!validPeerId(peerId)) return error(res, 400, 'invalid peer_id');
+      const credentials = turnRestCredentials(turnSecret, peerId, turnTtlSeconds, clock());
+      return json(res, 200, {
+        urls: turnUrls,
+        username: credentials.username,
+        credential: credentials.credential,
+        ttl_seconds: turnTtlSeconds,
+      });
     }
 
     const joinMatch = url.pathname.match(/^(?:\/join|\/api\/v1\/carpool\/join)\/([A-HJ-NP-Z2-9]{12})$/);
@@ -349,6 +395,7 @@ module.exports = {
   createCoordinator,
   joinPage,
   peerIdFromPublicKey,
+  turnRestCredentials,
   validCode,
   validPeerId,
 };

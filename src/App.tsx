@@ -16,12 +16,14 @@ import {
   SlidersHorizontal,
   Sparkles,
   SquareTerminal,
+  TriangleAlert,
   Users,
   Wifi,
   X,
 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  coordinatorHost,
   detectTools,
   getActiveCar,
   joinCar,
@@ -49,6 +51,7 @@ import type {
   ToolKind,
   LaunchMode,
 } from './types';
+import { t } from './i18n';
 import { trustedWebRtc } from './trustedWebRtc';
 
 type Screen = 'welcome' | 'host-setup' | 'host-live' | 'join' | 'ready' | 'ride';
@@ -88,6 +91,47 @@ const initialScreen = (): Screen => {
   return candidate === 'host-setup' || candidate === 'join' ? candidate : 'welcome';
 };
 
+const RISK_ACK_KEY = 'trusted-carpool:risk-acknowledged';
+
+const readRiskAcknowledged = (): boolean => {
+  try {
+    return window.localStorage.getItem(RISK_ACK_KEY) === '1';
+  } catch {
+    // A blocked storage API must not lock people out of the app.
+    return true;
+  }
+};
+
+function FirstRunNotice({ onConfirm }: { onConfirm: () => void }) {
+  return (
+    <section className="first-run page-enter">
+      <span className="first-run__icon">
+        <TriangleAlert size={30} />
+      </span>
+      <p className="eyebrow">{t('firstRun.eyebrow')}</p>
+      <h1>{t('firstRun.title')}</h1>
+      <ul className="first-run__points">
+        <li>
+          <ShieldCheck size={18} />
+          <span>{t('firstRun.pointKeys')}</span>
+        </li>
+        <li>
+          <TriangleAlert size={18} />
+          <span>{t('firstRun.pointTerms')}</span>
+        </li>
+        <li>
+          <Users size={18} />
+          <span>{t('firstRun.pointTrust')}</span>
+        </li>
+      </ul>
+      <button className="primary-button" onClick={onConfirm}>
+        <Check size={20} /> {t('firstRun.confirm')}
+      </button>
+      <p className="quiet-note">{t('firstRun.note')}</p>
+    </section>
+  );
+}
+
 function ToolMark({ kind }: { kind: ToolKind }) {
   return (
     <span className={`tool-mark tool-mark--${kind}`} aria-hidden="true">
@@ -103,7 +147,7 @@ function Brand() {
         <CarFront size={24} strokeWidth={2.4} />
       </span>
       <span className="brand__name">可信拼车</span>
-      <span className="brand__tagline">共享算力，不共享密钥</span>
+      <span className="brand__tagline">{t('brand.tagline')}</span>
     </div>
   );
 }
@@ -119,7 +163,7 @@ function WindowShell({ children, onHome }: { children: React.ReactNode; onHome: 
         </button>
         <div className="titlebar__right">
           <span className="official-pill">
-            <ShieldCheck size={14} /> 只连官方地址
+            <ShieldCheck size={14} /> {t('titlebar.officialOnly')}
           </span>
         </div>
       </header>
@@ -128,7 +172,8 @@ function WindowShell({ children, onHome }: { children: React.ReactNode; onHome: 
   );
 }
 
-function BackButton({ onClick, label = '返回' }: { onClick: () => void; label?: string }) {
+function BackButton({ onClick, label }: { onClick: () => void; label?: string }) {
+  label ??= t('common.back');
   return (
     <button className="back-button" onClick={onClick}>
       <ArrowLeft size={18} /> {label}
@@ -158,9 +203,9 @@ function Welcome({ onHost, onJoin }: { onHost: () => void; onJoin: () => void })
             <CarFront size={44} />
           </span>
         </div>
-        <p className="eyebrow">TRUSTED CARPOOL</p>
-        <h1>一起用，密钥仍只在你的电脑里</h1>
-        <p className="welcome__lead">发车的人保持应用在线，上车的人点一次就能打开工具。</p>
+        <p className="eyebrow">{t('welcome.eyebrow')}</p>
+        <h1>{t('welcome.title')}</h1>
+        <p className="welcome__lead">{t('welcome.lead')}</p>
       </div>
 
       <div className="role-grid">
@@ -169,8 +214,8 @@ function Welcome({ onHost, onJoin }: { onHost: () => void; onJoin: () => void })
             <CarFront size={34} />
           </span>
           <span className="role-card__copy">
-            <strong>我要发车</strong>
-            <small>选本机账号，分享四个上车码</small>
+            <strong>{t('welcome.host')}</strong>
+            <small>{t('welcome.hostHint')}</small>
           </span>
           <span className="role-card__arrow">→</span>
         </button>
@@ -179,17 +224,17 @@ function Welcome({ onHost, onJoin }: { onHost: () => void; onJoin: () => void })
             <Users size={34} />
           </span>
           <span className="role-card__copy">
-            <strong>我要上车</strong>
-            <small>输入上车码，立即打开工具</small>
+            <strong>{t('welcome.join')}</strong>
+            <small>{t('welcome.joinHint')}</small>
           </span>
           <span className="role-card__arrow">→</span>
         </button>
       </div>
 
       <div className="trust-row">
-        <span><ShieldCheck size={16} /> 本机数据</span>
-        <span><Wifi size={16} /> 自动连接</span>
-        <span><LogOut size={16} /> 随时退出</span>
+        <span><ShieldCheck size={16} /> {t('welcome.trustLocal')}</span>
+        <span><Wifi size={16} /> {t('welcome.trustAuto')}</span>
+        <span><LogOut size={16} /> {t('welcome.trustLeave')}</span>
       </div>
     </section>
   );
@@ -982,7 +1027,7 @@ function JoinPage({
             : '向车主要一个 12 位上车码，粘贴后自动确认车队。'}
         </p>
         {fromServerLink && (
-          <span className="server-link-badge"><ShieldCheck size={14} /> 来自 p2p.cnaigc.ai</span>
+          <span className="server-link-badge"><ShieldCheck size={14} /> 来自 {coordinatorHost()}</span>
         )}
       </div>
 
@@ -1197,6 +1242,7 @@ function RidePage({ access, tools, initiallyOpened, onLeave, onError }: { access
 
 export default function App() {
   const [screen, setScreen] = useState<Screen>(initialScreen);
+  const [riskAcknowledged, setRiskAcknowledged] = useState(readRiskAcknowledged);
   const [tools, setTools] = useState<ToolDetection[]>([]);
   const [loadingTools, setLoadingTools] = useState(true);
   const [car, setCar] = useState<CarSession | null>(null);
@@ -1259,6 +1305,15 @@ export default function App() {
     setError(null);
   };
 
+  const confirmRisk = () => {
+    try {
+      window.localStorage.setItem(RISK_ACK_KEY, '1');
+    } catch {
+      // A blocked storage API only means the notice shows again next launch.
+    }
+    setRiskAcknowledged(true);
+  };
+
   const page = useMemo(() => {
     if (screen === 'host-setup') return <HostSetup tools={tools} loadingTools={loadingTools} onRefresh={loadTools} onBack={goHome} onStarted={next => { setCar(next); setScreen('host-live'); }} onError={setError} />;
     if (screen === 'host-live' && car) return <HostLive car={car} onStopped={() => { setCar(null); goHome(); }} onError={setError} />;
@@ -1271,7 +1326,7 @@ export default function App() {
   return (
     <WindowShell onHome={goHome}>
       {error && <ErrorBanner message={error} onClose={() => setError(null)} />}
-      {page}
+      {riskAcknowledged ? page : <FirstRunNotice onConfirm={confirmRisk} />}
     </WindowShell>
   );
 }
