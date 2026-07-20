@@ -29,6 +29,7 @@
 ## 核心能力
 
 - Claude Code 与 Codex 平等支持，可单独或同时发车。
+- 自动检测本机 Claude Code / Codex 命令行与官方桌面客户端；未安装命令行时可在应用内一键安装（调用官方 npm 包 `@anthropic-ai/claude-code`、`@openai/codex`，思路参考 CC Switch）。
 - 车主复制 `https://p2p.cnaigc.ai/api/v1/carpool/join/<上车码>` 官方链接；好友点击后自动唤起客户端并带入座位，已保存昵称时直接发起上车。
 - 上车后可一键打开 Claude/Codex 终端或官方桌面客户端；已安装客户端时默认优先客户端。
 - 每辆车最多四名乘客并发，每个座位独立绑定设备。

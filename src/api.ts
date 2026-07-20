@@ -64,6 +64,8 @@ const demoTools: ToolDetection[] = [
     executablePath: '/usr/local/bin/claude',
     configPath: '~/.claude',
     detail: '已就绪',
+    version: 'v2.1.178',
+    npmAvailable: true,
     desktopSupported: true,
     desktopInstalled: true,
     desktopPath: '/Applications/Claude.app',
@@ -77,6 +79,8 @@ const demoTools: ToolDetection[] = [
     executablePath: '/usr/local/bin/codex',
     configPath: '~/.codex/auth.json',
     detail: '已就绪',
+    version: 'v0.140.0',
+    npmAvailable: true,
     desktopSupported: true,
     desktopInstalled: true,
     desktopPath: '/Applications/ChatGPT.app',
@@ -253,6 +257,13 @@ let demoActiveCar: CarSession | null = null;
 
 export async function detectTools(): Promise<ToolDetection[]> {
   return inTauri() ? invoke<ToolDetection[]>('detect_tools') : demoTools;
+}
+
+export async function installTool(kind: ToolKind): Promise<ToolDetection> {
+  if (inTauri()) return invoke<ToolDetection>('install_tool', { kind });
+  const detection = demoTools.find(tool => tool.kind === kind);
+  if (!detection) throw new Error('未知工具');
+  return { ...detection, installed: true, detail: '已就绪' };
 }
 
 export async function startCar(input: {

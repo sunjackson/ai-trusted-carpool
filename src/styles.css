@@ -141,6 +141,13 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .tool-card__body small { display: flex; align-items: center; gap: 6px; color: #9da4ae; font-size: 11px; }
 .status-ok span, .seat-state i, .ride-tool small i { width: 7px; height: 7px; border-radius: 50%; background: var(--green); box-shadow: 0 0 10px #22c55e88; }
 .status-off span { width: 7px; height: 7px; border-radius: 50%; background: #727a85; }
+.tool-card--missing { cursor: default; }
+.tool-card--missing:hover { transform: none; border-color: #343a43; }
+.install-button { display: inline-flex; align-items: center; gap: 7px; padding: 10px 14px; color: #1a1407; font-weight: 700; font-size: 12px; white-space: nowrap; border: 0; border-radius: 11px; background: linear-gradient(145deg, #ffd85e, var(--gold-2)); cursor: pointer; transition: .2s; }
+.install-button:not(:disabled):hover { transform: translateY(-1px); box-shadow: 0 10px 30px rgba(255,190,47,.25); }
+.install-button:disabled { opacity: .55; cursor: wait; }
+.install-inline { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; padding: 13px 16px; color: #c8cdd5; font-size: 13px; border: 1px dashed #4b4127; border-radius: 14px; background: rgba(37,35,28,.55); }
+.install-button--compact { padding: 8px 11px; font-size: 11px; border-radius: 9px; }
 .check-box { width: 23px; height: 23px; display: grid; place-items: center; border: 1px solid #454c56; border-radius: 7px; }
 .check-box--on { color: #1d1607; border-color: var(--gold); background: var(--gold); }
 .setup-stack { display: grid; grid-template-columns: minmax(220px,.72fr) minmax(0,1.6fr); align-items: start; gap: 14px; margin: 18px 0; }

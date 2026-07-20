@@ -9,6 +9,8 @@ export type ToolDetection = {
   executablePath: string | null;
   configPath: string | null;
   detail: string;
+  version: string | null;
+  npmAvailable: boolean;
   desktopSupported: boolean;
   desktopInstalled: boolean;
   desktopPath: string | null;

@@ -8,6 +8,7 @@ import {
   Clock3,
   Code2,
   Copy,
+  Download,
   Gauge,
   LogOut,
   MonitorUp,
@@ -26,6 +27,7 @@ import {
   coordinatorHost,
   detectTools,
   getActiveCar,
+  installTool,
   joinCar,
   launchTool,
   leaveCar,
@@ -240,9 +242,57 @@ function Welcome({ onHost, onJoin }: { onHost: () => void; onJoin: () => void })
   );
 }
 
+function InstallToolButton({
+  kind,
+  installingTool,
+  npmAvailable,
+  onInstall,
+  label,
+  className = 'install-button',
+}: {
+  kind: ToolKind;
+  installingTool: ToolKind | null;
+  npmAvailable: boolean;
+  onInstall: (kind: ToolKind) => void;
+  label?: string;
+  className?: string;
+}) {
+  const busy = installingTool === kind;
+  const [elapsed, setElapsed] = useState(0);
+  useEffect(() => {
+    if (!busy) {
+      setElapsed(0);
+      return;
+    }
+    const timer = window.setInterval(() => setElapsed(seconds => seconds + 1), 1000);
+    return () => window.clearInterval(timer);
+  }, [busy]);
+  return (
+    <button
+      className={className}
+      onClick={() => onInstall(kind)}
+      disabled={installingTool !== null || !npmAvailable}
+      aria-label={label ?? `一键安装 ${TOOL_LABEL[kind]}`}
+      title={npmAvailable ? '调用官方 npm 包安装，通常需要 1-3 分钟' : '需要先安装 Node.js（nodejs.org）'}
+    >
+      {busy ? (
+        <>
+          <RefreshCw className="spin" size={15} /> 正在安装 {elapsed}s
+        </>
+      ) : (
+        <>
+          <Download size={15} /> {label ?? '一键安装'}
+        </>
+      )}
+    </button>
+  );
+}
+
 function HostSetup({
   tools,
   loadingTools,
+  installingTool,
+  onInstall,
   onRefresh,
   onBack,
   onStarted,
@@ -250,6 +300,8 @@ function HostSetup({
 }: {
   tools: ToolDetection[];
   loadingTools: boolean;
+  installingTool: ToolKind | null;
+  onInstall: (kind: ToolKind) => void;
   onRefresh: () => void;
   onBack: () => void;
   onStarted: (car: CarSession) => void;
@@ -368,7 +420,7 @@ function HostSetup({
 
       <div className="tool-detection-header">
         <span>自动检测到以下可用工具</span>
-        <button onClick={onRefresh} disabled={loadingTools}>
+        <button onClick={onRefresh} disabled={loadingTools || installingTool !== null}>
           <RefreshCw size={15} className={loadingTools ? 'spin' : ''} /> 重新检测
         </button>
       </div>
@@ -376,6 +428,25 @@ function HostSetup({
         {tools.map(tool => {
           const enabled = tool.installed && tool.authenticated;
           const checked = selected.includes(tool.kind);
+          if (!tool.installed) {
+            return (
+              <div className="tool-card tool-card--missing" key={tool.kind}>
+                <ToolMark kind={tool.kind} />
+                <span className="tool-card__body">
+                  <strong>{tool.name}</strong>
+                  <small className="status-off">
+                    <span /> {tool.detail}
+                  </small>
+                </span>
+                <InstallToolButton
+                  kind={tool.kind}
+                  installingTool={installingTool}
+                  npmAvailable={tool.npmAvailable}
+                  onInstall={onInstall}
+                />
+              </div>
+            );
+          }
           return (
             <button
               className={`tool-card ${checked ? 'tool-card--selected' : ''}`}
@@ -387,7 +458,7 @@ function HostSetup({
               <span className="tool-card__body">
                 <strong>{tool.name}</strong>
                 <small className={enabled ? 'status-ok' : 'status-off'}>
-                  <span /> {enabled ? '已就绪' : tool.detail}
+                  <span /> {enabled ? `已就绪${tool.version ? ` · ${tool.version}` : ''}` : tool.detail}
                 </small>
               </span>
               <span className={`check-box ${checked ? 'check-box--on' : ''}`}>
@@ -1069,7 +1140,7 @@ function JoinPage({
   );
 }
 
-function ToolChooser({ access, tools, onOpened, onError }: { access: RideAccess; tools: ToolDetection[]; onOpened: (target: LaunchTarget) => void; onError: (message: string) => void }) {
+function ToolChooser({ access, tools, installingTool, onInstall, onOpened, onError }: { access: RideAccess; tools: ToolDetection[]; installingTool: ToolKind | null; onInstall: (kind: ToolKind) => void; onOpened: (target: LaunchTarget) => void; onError: (message: string) => void }) {
   const [selected, setSelected] = useState<ToolKind>(access.enabledTools[0] ?? 'claude');
   const initialDetection = tools.find(tool => tool.kind === (access.enabledTools[0] ?? 'claude'));
   const [mode, setMode] = useState<LaunchMode>(initialDetection?.desktopInstalled ? 'desktop' : 'terminal');
@@ -1125,9 +1196,25 @@ function ToolChooser({ access, tools, onOpened, onError }: { access: RideAccess;
           <MonitorUp size={19} /><span><strong>客户端</strong><small>{detection?.desktopDetail ?? '正在检测'}</small></span>
         </button>
         <button className={mode === 'terminal' ? 'launch-mode--selected' : ''} onClick={() => setMode('terminal')} disabled={!terminalAvailable} aria-pressed={mode === 'terminal'}>
-          <SquareTerminal size={19} /><span><strong>终端</strong><small>{terminalAvailable ? '已安装，可直接打开' : '未找到命令行工具'}</small></span>
+          <SquareTerminal size={19} /><span><strong>终端</strong><small>{terminalAvailable ? `已安装${detection?.version ? ` ${detection.version}` : ''}，可直接打开` : '未找到命令行工具'}</small></span>
         </button>
       </div>
+      {!terminalAvailable && (
+        <div className="install-inline page-enter">
+          <span>
+            {detection?.npmAvailable === false
+              ? `一键安装 ${TOOL_LABEL[selected]} 需要 Node.js，请先从 nodejs.org 安装`
+              : `这台电脑还没有 ${TOOL_LABEL[selected]} 命令行工具`}
+          </span>
+          <InstallToolButton
+            kind={selected}
+            installingTool={installingTool}
+            npmAvailable={detection?.npmAvailable ?? false}
+            onInstall={onInstall}
+            label={`一键安装 ${TOOL_LABEL[selected]} 命令行`}
+          />
+        </div>
+      )}
       {mode === 'terminal' && <>
         <button className="folder-toggle" onClick={() => setShowDir(value => !value)}>
           <span>项目目录（可选）</span><ChevronDown size={17} className={showDir ? 'turn' : ''} />
@@ -1142,7 +1229,7 @@ function ToolChooser({ access, tools, onOpened, onError }: { access: RideAccess;
   );
 }
 
-function RidePage({ access, tools, initiallyOpened, onLeave, onError }: { access: RideAccess; tools: ToolDetection[]; initiallyOpened: LaunchTarget; onLeave: () => void; onError: (message: string) => void }) {
+function RidePage({ access, tools, initiallyOpened, installingTool, onInstall, onLeave, onError }: { access: RideAccess; tools: ToolDetection[]; initiallyOpened: LaunchTarget; installingTool: ToolKind | null; onInstall: (kind: ToolKind) => void; onLeave: () => void; onError: (message: string) => void }) {
   const [opened, setOpened] = useState<LaunchTarget[]>([initiallyOpened]);
   const [busy, setBusy] = useState<string | null>(null);
   const [leaving, setLeaving] = useState(false);
@@ -1220,9 +1307,20 @@ function RidePage({ access, tools, initiallyOpened, onLeave, onError }: { access
                 <button onClick={() => open(kind, 'desktop')} disabled={busy === `${kind}-desktop` || !detection?.desktopInstalled} title={detection?.desktopDetail}>
                   <MonitorUp size={15} /> {busy === `${kind}-desktop` ? '打开中' : desktopOpen ? '新客户端' : '客户端'}
                 </button>
-                <button onClick={() => open(kind, 'terminal')} disabled={busy === `${kind}-terminal` || !detection?.installed}>
-                  <SquareTerminal size={15} /> {busy === `${kind}-terminal` ? '打开中' : terminalOpen ? '新终端' : '终端'}
-                </button>
+                {detection?.installed === false ? (
+                  <InstallToolButton
+                    kind={kind}
+                    installingTool={installingTool}
+                    npmAvailable={detection.npmAvailable}
+                    onInstall={onInstall}
+                    label="安装命令行"
+                    className="install-button install-button--compact"
+                  />
+                ) : (
+                  <button onClick={() => open(kind, 'terminal')} disabled={busy === `${kind}-terminal` || !detection?.installed}>
+                    <SquareTerminal size={15} /> {busy === `${kind}-terminal` ? '打开中' : terminalOpen ? '新终端' : '终端'}
+                  </button>
+                )}
               </div>
             </article>
           );
@@ -1245,21 +1343,42 @@ export default function App() {
   const [riskAcknowledged, setRiskAcknowledged] = useState(readRiskAcknowledged);
   const [tools, setTools] = useState<ToolDetection[]>([]);
   const [loadingTools, setLoadingTools] = useState(true);
+  const [installingTool, setInstallingTool] = useState<ToolKind | null>(null);
   const [car, setCar] = useState<CarSession | null>(null);
   const [access, setAccess] = useState<RideAccess | null>(null);
   const [pendingServerJoin, setPendingServerJoin] = useState<PendingServerJoin | null>(null);
   const [openedTarget, setOpenedTarget] = useState<LaunchTarget>({ kind: 'claude', mode: 'terminal' });
   const [error, setError] = useState<string | null>(null);
   const joinRequestId = useRef(0);
+  const toolsRequestId = useRef(0);
 
   const loadTools = async () => {
+    const requestId = ++toolsRequestId.current;
     setLoadingTools(true);
     try {
-      setTools(await detectTools());
+      const detected = await detectTools();
+      // Drop detections that went stale while an install finished.
+      if (requestId === toolsRequestId.current) setTools(detected);
+    } catch (reason) {
+      if (requestId === toolsRequestId.current) {
+        setError(reason instanceof Error ? reason.message : String(reason));
+      }
+    } finally {
+      setLoadingTools(false);
+    }
+  };
+
+  const installMissingTool = async (kind: ToolKind) => {
+    setInstallingTool(kind);
+    setError(null);
+    try {
+      const updated = await installTool(kind);
+      toolsRequestId.current += 1;
+      setTools(current => current.map(tool => (tool.kind === kind ? updated : tool)));
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
-      setLoadingTools(false);
+      setInstallingTool(null);
     }
   };
 
@@ -1315,13 +1434,13 @@ export default function App() {
   };
 
   const page = useMemo(() => {
-    if (screen === 'host-setup') return <HostSetup tools={tools} loadingTools={loadingTools} onRefresh={loadTools} onBack={goHome} onStarted={next => { setCar(next); setScreen('host-live'); }} onError={setError} />;
+    if (screen === 'host-setup') return <HostSetup tools={tools} loadingTools={loadingTools} installingTool={installingTool} onInstall={installMissingTool} onRefresh={loadTools} onBack={goHome} onStarted={next => { setCar(next); setScreen('host-live'); }} onError={setError} />;
     if (screen === 'host-live' && car) return <HostLive car={car} onStopped={() => { setCar(null); goHome(); }} onError={setError} />;
     if (screen === 'join') return <JoinPage key={pendingServerJoin?.requestId ?? 'manual'} initialCode={pendingServerJoin?.code} fromServerLink={pendingServerJoin !== null} onBack={goHome} onJoined={next => { setPendingServerJoin(null); setAccess(next); setScreen('ready'); }} onError={setError} />;
-    if (screen === 'ready' && access) return <ToolChooser access={access} tools={tools} onOpened={target => { setOpenedTarget(target); setScreen('ride'); }} onError={setError} />;
-    if (screen === 'ride' && access) return <RidePage access={access} tools={tools} initiallyOpened={openedTarget} onLeave={() => { setAccess(null); goHome(); }} onError={setError} />;
+    if (screen === 'ready' && access) return <ToolChooser access={access} tools={tools} installingTool={installingTool} onInstall={installMissingTool} onOpened={target => { setOpenedTarget(target); setScreen('ride'); }} onError={setError} />;
+    if (screen === 'ride' && access) return <RidePage access={access} tools={tools} initiallyOpened={openedTarget} installingTool={installingTool} onInstall={installMissingTool} onLeave={() => { setAccess(null); goHome(); }} onError={setError} />;
     return <Welcome onHost={() => setScreen('host-setup')} onJoin={() => { setPendingServerJoin(null); setScreen('join'); }} />;
-  }, [screen, tools, loadingTools, car, access, pendingServerJoin, openedTarget]);
+  }, [screen, tools, loadingTools, installingTool, car, access, pendingServerJoin, openedTarget]);
 
   return (
     <WindowShell onHome={goHome}>

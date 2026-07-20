@@ -29,6 +29,7 @@ A desktop app for sharing a locally signed-in Claude Code / Codex account among 
 ## Highlights
 
 - Claude Code and Codex are supported as equals; host either or both.
+- Auto-detects the local Claude Code / Codex CLIs and official desktop clients; a missing CLI can be installed in-app with one click (via the official npm packages `@anthropic-ai/claude-code` and `@openai/codex`, CC Switch style).
 - The host copies an official `https://p2p.cnaigc.ai/api/v1/carpool/join/<code>` link; a friend clicks it, the client launches with the seat pre-filled, and a saved nickname makes joining one click.
 - After joining, passengers open the Claude/Codex terminal or the official desktop client with one click; the desktop client is preferred when installed.
 - Up to four concurrent passengers per car; every seat is bound to one device.

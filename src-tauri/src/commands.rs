@@ -254,9 +254,14 @@ fn detect_tool(kind: ToolKind) -> ToolDetection {
     let credential = crate::relay::load_host_credential(kind);
     let installed = executable.is_some();
     let authenticated = credential.is_some();
+    let npm_available = find_executable("npm").is_some();
+    let version = executable
+        .as_deref()
+        .and_then(|path| crate::tool_installer::installed_version(kind, path));
     let detail = match (installed, authenticated, local_config.is_some()) {
         (true, true, _) => "已就绪",
-        (false, _, _) => "未安装",
+        (false, _, _) if npm_available => "未安装",
+        (false, _, _) => "未安装，一键安装需要先装 Node.js",
         (true, false, true) => "已登录，但缺少官方 API Key",
         (true, false, false) => "缺少官方 API Key",
     };
@@ -271,6 +276,8 @@ fn detect_tool(kind: ToolKind) -> ToolDetection {
             .map(|value| value.source)
             .or_else(|| local_config.map(|path| path.to_string_lossy().into_owned())),
         detail: detail.to_string(),
+        version,
+        npm_available,
         desktop_supported: desktop.supported,
         desktop_installed: desktop.installed,
         desktop_path: desktop.path,
@@ -593,6 +600,32 @@ pub async fn detect_tools() -> Result<Vec<ToolDetection>, String> {
         detect_tool(ToolKind::Claude),
         detect_tool(ToolKind::Codex),
     ])
+}
+
+#[tauri::command]
+pub async fn install_tool(kind: ToolKind) -> Result<ToolDetection, String> {
+    let guard = crate::tool_installer::InstallGuard::acquire(kind)?;
+    if find_executable(kind.command()).is_none() {
+        let npm = find_executable("npm").ok_or_else(|| {
+            format!(
+                "未找到 npm，无法一键安装。请先安装 Node.js（nodejs.org），或在终端手动执行：{}",
+                crate::tool_installer::manual_install_command(kind)
+            )
+        })?;
+        tauri::async_runtime::spawn_blocking(move || crate::tool_installer::install(kind, &npm))
+            .await
+            .map_err(|error| format!("安装任务意外中断: {error}"))??;
+    }
+    drop(guard);
+    let detection = detect_tool(kind);
+    if !detection.installed {
+        return Err(format!(
+            "安装已完成，但仍未检测到 {} 命令。请重启应用后重试，或在终端手动执行：{}",
+            kind.command(),
+            crate::tool_installer::manual_install_command(kind)
+        ));
+    }
+    Ok(detection)
 }
 
 #[tauri::command]

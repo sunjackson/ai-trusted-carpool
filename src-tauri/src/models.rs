@@ -26,6 +26,8 @@ pub struct ToolDetection {
     pub executable_path: Option<String>,
     pub config_path: Option<String>,
     pub detail: String,
+    pub version: Option<String>,
+    pub npm_available: bool,
     pub desktop_supported: bool,
     pub desktop_installed: bool,
     pub desktop_path: Option<String>,

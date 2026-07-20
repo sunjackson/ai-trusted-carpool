@@ -6,6 +6,8 @@
 
 ### Added
 
+- Claude Code / Codex 命令行一键安装（参考 CC Switch）：发车页、乘客选择工具页与使用中页面在检测到未安装时提供安装按钮，调用官方 npm 包并给出权限/网络失败的可读提示与手动命令；安装中显示已用时长。
+- 工具检测增强：npm 安装的 CLI 显示版本号（读取全局包 `package.json`，不拖慢检测）；未安装 Node.js 时提前禁用一键安装并给出指引。
 - 开源基础设施：Apache-2.0 许可证、NOTICE、贡献指南、行为准则、安全政策、issue/PR 模板与 Dependabot 配置。
 - 使用须知与免责声明（`LEGAL.md`），应用首次启动时的一次性风险确认页。
 - Open Core 商业模式说明（`docs/BUSINESS-MODEL.md`）、自建部署指南（`docs/SELF-HOSTING.md`）与发布签名清单（`docs/RELEASE.md`）。
