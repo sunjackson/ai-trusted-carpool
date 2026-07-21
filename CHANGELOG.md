@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.0.1] - 2026-07-21
+
 ### Added
 
 - 乘客 0 门槛一键启动：缺少 Claude Code / Codex 命令行时，应用直接从官方渠道下载原生独立程序（Claude 走 `downloads.claude.ai` 官方清单流程，Codex 走 GitHub `openai/codex` 官方发布），SHA-256 强校验后原子启用到应用托管目录，无需 Node.js、无需管理员权限；乘客选择工具页提供"下载并打开"单动作，实时字节级进度、可取消。
@@ -27,7 +29,7 @@
 - 前端最小 i18n 骨架（默认 `zh-CN`，可选 `en`），首启确认页与欢迎页已迁移。
 - CI 安全加固：`cargo audit` 与 CodeQL（JavaScript/TypeScript + Rust）扫描；Vitest 覆盖率报告。
 
-### 初始开发（2026-07，尚未发布正式版本）
+### 初始开发（2026-07）
 
 - Claude Code 与 Codex 的一键发车/一键上车核心流程：签名邀请、设备绑定、四座并发。
 - WebRTC 直连优先、TURN 兜底的端到端加密转发，本地 HTTP 代理流式透传官方响应。
