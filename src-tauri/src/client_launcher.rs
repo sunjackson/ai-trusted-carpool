@@ -845,6 +845,7 @@ fn current_claude_paths() -> Result<ClaudePaths, String> {
     Err("Claude 官方尚未提供 Linux 桌面客户端".to_string())
 }
 
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
 fn claude_paths_from_dirs(normal: PathBuf, threep: PathBuf) -> ClaudePaths {
     let library = threep.join("configLibrary");
     ClaudePaths {
