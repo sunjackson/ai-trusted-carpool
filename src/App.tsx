@@ -1001,7 +1001,7 @@ function HostLive({ car, onStopped, onError }: { car: CarSession; onStopped: () 
                   <div className="avatar">{seat.nickname.slice(0, 1)}</div>
                   <div>
                     <strong>{seat.nickname}</strong>
-                    <span className="seat-state"><i /> {seat.state === 'using' ? '使用中' : '已连接'}{seat.tool ? ` · ${TOOL_LABEL[seat.tool]}` : ''}</span>
+                    <span className="seat-state"><i /> {seat.state === 'using' ? '使用中' : seat.state === 'joining' ? '连接中' : '已连接'}{seat.tool ? ` · ${TOOL_LABEL[seat.tool]}` : ''}</span>
                   </div>
                   <div className="seat-total">
                     <strong>{formatTokens(seat.usage.totalTokens)} Token</strong>

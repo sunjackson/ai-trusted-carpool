@@ -91,7 +91,7 @@ export type Seat = {
   seatNo: number;
   code: string;
   nickname: string | null;
-  state: 'waiting' | 'connected' | 'using' | 'blocked';
+  state: 'waiting' | 'joining' | 'connected' | 'using' | 'blocked';
   tool: ToolKind | null;
   usage: SeatUsageSummary;
   tokenLimits: MemberTokenLimits;

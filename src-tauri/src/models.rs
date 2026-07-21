@@ -49,6 +49,8 @@ pub enum LaunchMode {
 #[allow(dead_code)] // Reserved for the proxy lifecycle and local risk controls.
 pub enum SeatState {
     Waiting,
+    /// Claim accepted and access granted; WebRTC data channel not open yet.
+    Joining,
     Connected,
     Using,
     Blocked,

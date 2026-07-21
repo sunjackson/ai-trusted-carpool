@@ -471,7 +471,7 @@ fn access_grant_for_claim(
     }))
 }
 
-fn mark_seat_connected(state: &RuntimeState, grant: &AccessGrant, nickname: &str) {
+fn mark_seat_joining(state: &RuntimeState, grant: &AccessGrant, nickname: &str) {
     let Ok(mut runtime) = state.inner.lock() else {
         return;
     };
@@ -489,8 +489,49 @@ fn mark_seat_connected(state: &RuntimeState, grant: &AccessGrant, nickname: &str
     }
     if let Some(seat) = car.seats.iter_mut().find(|seat| seat.code == grant.code) {
         seat.nickname = Some(nickname.to_string());
+        seat.state = SeatState::Joining;
+    }
+}
+
+fn mark_seat_connected_by_peer(
+    state: &RuntimeState,
+    passenger_peer_id: &str,
+) -> Result<(), String> {
+    let mut runtime = state
+        .inner
+        .lock()
+        .map_err(|_| "运行状态暂时不可用".to_string())?;
+    let code = runtime
+        .host_bindings
+        .values()
+        .find(|binding| binding.passenger_peer_id == passenger_peer_id)
+        .map(|binding| binding.code.clone())
+        .ok_or_else(|| "成员不属于当前有效车队".to_string())?;
+    let car = runtime
+        .active_car
+        .as_mut()
+        .ok_or_else(|| "当前没有正在发车的车队".to_string())?;
+    let seat = car
+        .seats
+        .iter_mut()
+        .find(|seat| seat.code == code)
+        .ok_or_else(|| "成员座位不存在".to_string())?;
+    if matches!(seat.state, SeatState::Waiting | SeatState::Blocked) {
+        return Err("座位尚未完成认领".to_string());
+    }
+    if !matches!(seat.state, SeatState::Using) {
         seat.state = SeatState::Connected;
     }
+    Ok(())
+}
+
+/// Called by the host UI when the WebRTC data channel to a passenger opens.
+#[tauri::command]
+pub fn confirm_passenger_link(
+    passenger_peer_id: String,
+    state: State<'_, RuntimeState>,
+) -> Result<(), String> {
+    mark_seat_connected_by_peer(&state, &passenger_peer_id)
 }
 
 fn handle_leave_message(
@@ -630,7 +671,7 @@ async fn handle_host_message(
             now_ms(),
         )
         .await?;
-    mark_seat_connected(state, &grant, &claim.nickname);
+    mark_seat_joining(state, &grant, &claim.nickname);
     Ok(())
 }
 
@@ -657,7 +698,9 @@ fn spawn_host_claim_loop(
                     sleep(Duration::from_secs(2)).await;
                 }
             }
-            sleep(Duration::from_millis(400)).await;
+            // Keep well under the coordinator per-peer poll budget so same-NAT
+            // passengers can still drain answers and ICE candidates.
+            sleep(Duration::from_millis(1_000)).await;
         }
     });
 }

@@ -12,9 +12,12 @@ const MAX_INVITES_PER_OWNER = 16;
 const MAX_MESSAGES_PER_PEER = 128;
 const DEFAULT_RESOLVE_RATE_LIMIT = 60;
 const DEFAULT_REGISTER_RATE_LIMIT = 30;
-const DEFAULT_MESSAGE_RATE_LIMIT = 120;
-const DEFAULT_MESSAGE_PEER_RATE_LIMIT = 60;
-const DEFAULT_POLL_RATE_LIMIT = 180;
+// WebRTC trickle ICE can burst many small messages; keep IP soft and peer hard.
+const DEFAULT_MESSAGE_RATE_LIMIT = 480;
+const DEFAULT_MESSAGE_PEER_RATE_LIMIT = 180;
+// Poll is primarily per peer (host + passenger share one public IP on home Wi-Fi).
+const DEFAULT_POLL_RATE_LIMIT = 600;
+const DEFAULT_POLL_PEER_RATE_LIMIT = 180;
 const DEFAULT_TURN_RATE_LIMIT = 30;
 const RATE_WINDOW_MS = 60_000;
 const DEFAULT_TURN_TTL_SECONDS = 3600;
@@ -255,6 +258,7 @@ function createCoordinator(options = {}) {
   const messageRateLimit = options.messageRateLimit ?? DEFAULT_MESSAGE_RATE_LIMIT;
   const messagePeerRateLimit = options.messagePeerRateLimit ?? DEFAULT_MESSAGE_PEER_RATE_LIMIT;
   const pollRateLimit = options.pollRateLimit ?? DEFAULT_POLL_RATE_LIMIT;
+  const pollPeerRateLimit = options.pollPeerRateLimit ?? DEFAULT_POLL_PEER_RATE_LIMIT;
   const turnRateLimit = options.turnRateLimit ?? DEFAULT_TURN_RATE_LIMIT;
   const maxInvitesPerOwner = options.maxInvitesPerOwner ?? MAX_INVITES_PER_OWNER;
   const turnSecret = options.turnSecret ?? process.env.TRUSTED_CARPOOL_TURN_SECRET ?? '';
@@ -427,14 +431,17 @@ function createCoordinator(options = {}) {
     }
 
     if (req.method === 'POST' && url.pathname === '/api/v1/carpool/messages/poll') {
-      const ip = clientIp(req);
-      if (!allowRate(`poll:${ip}`, pollRateLimit)) {
-        return error(res, 429, 'too many polls', { 'retry-after': '60' });
-      }
       let input;
       try { input = await readJson(req); } catch (cause) { return error(res, cause.statusCode || 400, cause.message); }
       const validation = validatePoll(input, clock());
       if (validation) return error(res, 400, validation);
+      // Peer first: one shared NAT must not starve the passenger while the host polls.
+      if (!allowRate(`poll-peer:${input.peer_id}`, pollPeerRateLimit)) {
+        return error(res, 429, 'too many polls for peer', { 'retry-after': '60' });
+      }
+      if (!allowRate(`poll:${clientIp(req)}`, pollRateLimit)) {
+        return error(res, 429, 'too many polls', { 'retry-after': '60' });
+      }
       const queue = mailboxes.get(input.peer_id) || [];
       const after = input.after_ms || 0;
       const limit = Math.min(input.limit || 64, MAX_MESSAGES_PER_PEER);

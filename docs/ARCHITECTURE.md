@@ -16,7 +16,8 @@ host can enable either or both, and each of four seats can run requests concurre
   polling, and TURN credential minting are rate-limited per IP and per peer identity; each owner
   may hold a bounded number of active invites. TURN credentials are issued only after a signed
   proof of possession of the device identity (POST `/api/v1/turn-credentials`), so anonymous
-  scrapers cannot mint relay credentials from a guessed `peer_id`.
+  scrapers cannot mint relay credentials from a guessed `peer_id`. Polling is primarily limited
+  per peer so a host and passenger sharing one home NAT do not starve each other's signaling.
 - A passenger creates a local P-256/X25519 identity. The host encrypts the seat access grant to
   that identity after the passenger claims the invite.
 - Every accepted claim receives a separate 256-bit session secret bound to the passenger identity;

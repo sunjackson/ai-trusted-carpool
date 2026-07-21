@@ -307,6 +307,28 @@ test('rejects more than the configured active invites per owner', async () => {
   }, { maxInvitesPerOwner: 2, registerRateLimit: 100 });
 });
 
+test('allows concurrent polls from different peers behind one IP', async () => {
+  await withServer(async base => {
+    const host = identity();
+    const passenger = identity();
+    async function poll(peer) {
+      const body = {
+        peer_id: peer.peerId,
+        public_key: peer.publicKey,
+        after_ms: null,
+        limit: 10,
+        timestamp_ms: Date.now(),
+      };
+      body.signature = peer.sign(canonicalPoll(body));
+      return request(`${base}/api/v1/carpool/messages/poll`, 'POST', body);
+    }
+    for (let i = 0; i < 5; i += 1) {
+      assert.equal((await poll(host)).status, 200);
+      assert.equal((await poll(passenger)).status, 200);
+    }
+  }, { pollRateLimit: 12, pollPeerRateLimit: 6 });
+});
+
 test('rate limits outbound messages by source address', async () => {
   await withServer(async base => {
     const passenger = identity();

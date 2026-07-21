@@ -36,6 +36,8 @@ const inTauri = (): boolean => '__TAURI_INTERNALS__' in window;
 const MAX_BUFFERED_AMOUNT = 1024 * 1024;
 const POLL_INTERVAL_MS = 700;
 const POLL_MAX_BACKOFF_MS = 5_000;
+const CONNECT_TIMEOUT_MS = 45_000;
+const EARLY_ICE_TTL_MS = 30_000;
 // The host broadcasts a status snapshot every 2s; missing six in a row means
 // the link is effectively dead even if ICE has not noticed yet.
 const HEARTBEAT_TIMEOUT_MS = 12_000;
@@ -73,6 +75,8 @@ class TrustedWebRtcRuntime {
   private healthTimer: number | null = null;
   private reconnecting = false;
   private stopping = false;
+  private earlyIce = new Map<string, { candidates: RTCIceCandidateInit[]; expiresAt: number }>();
+  private lastPollError = '';
 
   subscribeCarStatus(listener: (status: SharedCarStatus) => void): () => void {
     this.statusListeners.add(listener);
@@ -156,7 +160,7 @@ class TrustedWebRtcRuntime {
     await this.sendSignal(ownerPeerId, 'webrtc_offer', {
       sdp: connection.pc.localDescription ?? offer,
     });
-    await this.waitForOpen(connection, 20_000);
+    await this.waitForOpen(connection, CONNECT_TIMEOUT_MS);
   }
 
   async stop(): Promise<void> {
@@ -197,6 +201,8 @@ class TrustedWebRtcRuntime {
     this.connections.clear();
     this.pendingBridge.clear();
     this.hostRequests.clear();
+    this.earlyIce.clear();
+    this.lastPollError = '';
     this.lastStatus = null;
     this.lastSnapshotAt = 0;
     this.reconnecting = false;
@@ -335,6 +341,9 @@ class TrustedWebRtcRuntime {
         }
       }
       if (this.role === 'host') {
+        void invoke('confirm_passenger_link', {
+          passengerPeerId: connection.peerId,
+        }).catch(() => undefined);
         void this.sendCarStatus(connection).catch(() => undefined);
       } else if (this.role === 'passenger') {
         void this.queueWire(connection, {
@@ -362,7 +371,10 @@ class TrustedWebRtcRuntime {
     return new Promise((resolve, reject) => {
       const deadline = window.setTimeout(() => {
         cleanup();
-        reject(new Error('连接车主超时，请确认车主应用保持打开'));
+        const hint = this.lastPollError
+          ? `（信令同步失败：${this.lastPollError}）`
+          : '，请确认车主应用保持打开且双方网络可达';
+        reject(new Error(`连接车主超时${hint}`));
       }, timeoutMs);
       const check = window.setInterval(() => {
         if (connection.channel?.readyState === 'open') {
@@ -548,6 +560,7 @@ class TrustedWebRtcRuntime {
       }
       const connection = this.createConnection(message.fromPeerId);
       await connection.pc.setRemoteDescription(payload.sdp);
+      await this.flushEarlyIce(connection);
       await this.flushCandidates(connection);
       const answer = await connection.pc.createAnswer();
       await connection.pc.setLocalDescription(answer);
@@ -565,12 +578,42 @@ class TrustedWebRtcRuntime {
     }
     if (message.kind === 'ice_candidate' && payload.candidate) {
       const connection = this.connections.get(message.fromPeerId);
-      if (!connection) return;
+      if (!connection) {
+        // Host may receive trickle ICE before the offer is processed.
+        this.bufferEarlyIce(message.fromPeerId, payload.candidate);
+        return;
+      }
       if (connection.pc.remoteDescription) {
         await connection.pc.addIceCandidate(payload.candidate);
       } else {
         connection.pendingCandidates.push(payload.candidate);
       }
+    }
+  }
+
+  private bufferEarlyIce(peerId: string, candidate: RTCIceCandidateInit): void {
+    const now = Date.now();
+    for (const [id, entry] of this.earlyIce) {
+      if (entry.expiresAt <= now) this.earlyIce.delete(id);
+    }
+    const existing = this.earlyIce.get(peerId);
+    if (existing) {
+      existing.candidates.push(candidate);
+      existing.expiresAt = now + EARLY_ICE_TTL_MS;
+      return;
+    }
+    this.earlyIce.set(peerId, {
+      candidates: [candidate],
+      expiresAt: now + EARLY_ICE_TTL_MS,
+    });
+  }
+
+  private async flushEarlyIce(connection: Connection): Promise<void> {
+    const buffered = this.earlyIce.get(connection.peerId);
+    this.earlyIce.delete(connection.peerId);
+    if (!buffered) return;
+    for (const candidate of buffered.candidates) {
+      connection.pendingCandidates.push(candidate);
     }
   }
 
@@ -593,10 +636,12 @@ class TrustedWebRtcRuntime {
           accessId: this.role === 'passenger' ? this.accessId : null,
         });
         delay = POLL_INTERVAL_MS;
+        this.lastPollError = '';
         for (const message of messages) {
           await this.handleSignal(message).catch(() => undefined);
         }
-      } catch {
+      } catch (error) {
+        this.lastPollError = errorMessage(error);
         // Polling keeps retrying; passenger connection setup has its own visible timeout.
         delay = Math.min(delay * 2, POLL_MAX_BACKOFF_MS);
       }

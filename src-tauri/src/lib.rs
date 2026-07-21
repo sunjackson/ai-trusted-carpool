@@ -20,11 +20,11 @@ mod usage;
 mod usage_history;
 
 use commands::{
-    cancel_tool_install, check_app_update, detect_tools, execute_relay_request, get_active_car,
-    get_ice_servers, get_shared_car_status, install_tool, join_car, launch_tool, leave_car,
-    open_releases_page, poll_webrtc_signals, preview_invite, refresh_account_quotas,
-    send_webrtc_signal, start_car, start_relay_request, stop_car, submit_relay_response,
-    submit_relay_stream_event, update_member_token_limits,
+    cancel_tool_install, check_app_update, confirm_passenger_link, detect_tools,
+    execute_relay_request, get_active_car, get_ice_servers, get_shared_car_status, install_tool,
+    join_car, launch_tool, leave_car, open_releases_page, poll_webrtc_signals, preview_invite,
+    refresh_account_quotas, send_webrtc_signal, start_car, start_relay_request, stop_car,
+    submit_relay_response, submit_relay_stream_event, update_member_token_limits,
 };
 use relay::RelayBridge;
 use runtime::RuntimeState;
@@ -115,6 +115,7 @@ pub fn run() {
             leave_car,
             launch_tool,
             get_ice_servers,
+            confirm_passenger_link,
             send_webrtc_signal,
             poll_webrtc_signals,
             execute_relay_request,
