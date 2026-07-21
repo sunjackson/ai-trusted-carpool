@@ -14,6 +14,13 @@ const CLAUDE_PROFILE_NAME: &str = "可信拼车";
 const ROUTE_STATE_DIR: &str = "client-routes";
 const CODEX_PROFILE_DIR: &str = "client-profiles/codex";
 
+#[cfg(target_os = "windows")]
+fn hide_console_window(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
 #[derive(Debug, Clone)]
 pub struct DesktopClientDetection {
     pub supported: bool,
@@ -754,10 +761,10 @@ fn windows_versioned_executables(parent: &Path, executable: &str) -> Vec<PathBuf
 
 #[cfg(target_os = "windows")]
 fn windows_app_uri(package_query: &str) -> Option<String> {
-    let output = Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", package_query])
-        .output()
-        .ok()?;
+    let mut command = Command::new("powershell.exe");
+    command.args(["-NoProfile", "-NonInteractive", "-Command", package_query]);
+    hide_console_window(&mut command);
+    let output = command.output().ok()?;
     let family = String::from_utf8_lossy(&output.stdout).trim().to_string();
     (output.status.success() && !family.is_empty())
         .then(|| format!("shell:AppsFolder\\{family}!App"))
@@ -924,9 +931,10 @@ fn close_client(kind: ToolKind) {
         &["ChatGPT.exe", "Codex.exe"]
     };
     for image in images {
-        let _ = Command::new("taskkill")
-            .args(["/IM", image, "/F", "/T"])
-            .status();
+        let mut command = Command::new("taskkill");
+        command.args(["/IM", image, "/F", "/T"]);
+        hide_console_window(&mut command);
+        let _ = command.status();
     }
 }
 

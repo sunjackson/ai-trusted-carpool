@@ -10,6 +10,7 @@ import {
   Copy,
   Download,
   Gauge,
+  KeyRound,
   LogOut,
   MonitorUp,
   RefreshCw,
@@ -22,7 +23,7 @@ import {
   Wifi,
   X,
 } from 'lucide-react';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   cancelToolInstall,
   checkAppUpdate,
@@ -60,7 +61,11 @@ import type {
   LaunchMode,
 } from './types';
 import { t } from './i18n';
+import { DebugPanel } from './DebugPanel';
+import { AccountManager } from './AccountManager';
+import { debugLog } from './debugLog';
 import { trustedWebRtc, type P2pConnectionState } from './trustedWebRtc';
+import appIcon from '../src-tauri/icons/128x128.png';
 
 type Screen = 'welcome' | 'host-setup' | 'host-live' | 'join' | 'ready' | 'ride';
 type PendingServerJoin = { code: string; requestId: number };
@@ -148,14 +153,34 @@ function ToolMark({ kind }: { kind: ToolKind }) {
   );
 }
 
-function Brand() {
+function Brand({ onHome, onDebug }: { onHome: () => void; onDebug: () => void }) {
+  const logoClickCount = useRef(0);
+  const logoClickTimer = useRef<number | null>(null);
+
+  const handleLogoClick = () => {
+    logoClickCount.current += 1;
+    if (logoClickTimer.current !== null) window.clearTimeout(logoClickTimer.current);
+    if (logoClickCount.current === 3) {
+      logoClickCount.current = 0;
+      logoClickTimer.current = null;
+      onDebug();
+      return;
+    }
+    logoClickTimer.current = window.setTimeout(() => {
+      logoClickCount.current = 0;
+      logoClickTimer.current = null;
+    }, 800);
+  };
+
   return (
-    <div className="brand" aria-label="可信拼车">
-      <span className="brand__mark">
-        <CarFront size={24} strokeWidth={2.4} />
-      </span>
-      <span className="brand__name">可信拼车</span>
-      <span className="brand__tagline">{t('brand.tagline')}</span>
+    <div className="brand">
+      <button className="brand__mark" onClick={handleLogoClick} aria-label="应用标志">
+        <img src={appIcon} alt="" data-testid="app-logo" draggable={false} />
+      </button>
+      <button className="brand__identity" onClick={onHome} aria-label="返回首页">
+        <span className="brand__name">可信拼车</span>
+        <span className="brand__tagline">{t('brand.tagline')}</span>
+      </button>
     </div>
   );
 }
@@ -169,15 +194,32 @@ function WindowShell({
   onHome: () => void;
   appUpdate: AppUpdateInfo | null;
 }) {
+  const [debugOpen, setDebugOpen] = useState(false);
+  const [accountManagerOpen, setAccountManagerOpen] = useState(false);
+  const openDebug = () => {
+    debugLog('info', 'Debug', '调试模式已打开');
+    setDebugOpen(true);
+  };
+  const closeDebug = () => {
+    debugLog('info', 'Debug', '调试模式已关闭');
+    setDebugOpen(false);
+  };
+
   return (
     <main className="app-shell">
       <div className="ambient ambient--one" />
       <div className="ambient ambient--two" />
       <header className="titlebar" data-tauri-drag-region>
-        <button className="brand-button" onClick={onHome} aria-label="返回首页">
-          <Brand />
-        </button>
+        <Brand onHome={onHome} onDebug={openDebug} />
         <div className="titlebar__right">
+          <button
+            className="icon-button"
+            onClick={() => setAccountManagerOpen(true)}
+            aria-label="管理本机账号"
+            title="管理本机账号"
+          >
+            <KeyRound size={17} />
+          </button>
           {appUpdate && (
             <button
               className="update-pill"
@@ -193,6 +235,8 @@ function WindowShell({
         </div>
       </header>
       <div className="content-frame">{children}</div>
+      {accountManagerOpen && <AccountManager onClose={() => setAccountManagerOpen(false)} />}
+      {debugOpen && <DebugPanel onClose={closeDebug} />}
     </main>
   );
 }
@@ -225,7 +269,7 @@ function Welcome({ onHost, onJoin }: { onHost: () => void; onJoin: () => void })
         <div className="hero-orbit">
           <span className="hero-orbit__ring" />
           <span className="hero-orbit__icon">
-            <CarFront size={44} />
+            <img src={appIcon} alt="" data-testid="app-logo" draggable={false} />
           </span>
         </div>
         <p className="eyebrow">{t('welcome.eyebrow')}</p>
@@ -1457,8 +1501,12 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const joinRequestId = useRef(0);
   const toolsRequestId = useRef(0);
+  const showError = useCallback((message: string) => {
+    debugLog('error', 'UI', message);
+    setError(message);
+  }, []);
 
-  const loadTools = async () => {
+  const loadTools = useCallback(async () => {
     const requestId = ++toolsRequestId.current;
     setLoadingTools(true);
     try {
@@ -1467,12 +1515,12 @@ export default function App() {
       if (requestId === toolsRequestId.current) setTools(detected);
     } catch (reason) {
       if (requestId === toolsRequestId.current) {
-        setError(reason instanceof Error ? reason.message : String(reason));
+        showError(reason instanceof Error ? reason.message : String(reason));
       }
     } finally {
       setLoadingTools(false);
     }
-  };
+  }, [showError]);
 
   const installMissingTool = async (kind: ToolKind): Promise<ToolDetection | null> => {
     setInstallingTool(kind);
@@ -1485,7 +1533,7 @@ export default function App() {
     } catch (reason) {
       const message = reason instanceof Error ? reason.message : String(reason);
       // A user-initiated cancel is not an error worth a banner.
-      if (!message.includes('已取消')) setError(message);
+      if (!message.includes('已取消')) showError(message);
       return null;
     } finally {
       setInstallingTool(null);
@@ -1497,7 +1545,7 @@ export default function App() {
     void cancelToolInstall(kind).catch(() => undefined);
   };
 
-  useEffect(() => { void loadTools(); }, []);
+  useEffect(() => { void loadTools(); }, [loadTools]);
   useEffect(() => {
     let disposed = false;
     // Best-effort awareness of newer app releases; failures stay silent.
@@ -1526,9 +1574,9 @@ export default function App() {
   }, []);
   useEffect(() => {
     void trustedWebRtc.initialize().catch(reason =>
-      setError(reason instanceof Error ? reason.message : String(reason))
+      showError(reason instanceof Error ? reason.message : String(reason))
     );
-  }, []);
+  }, [showError]);
   useEffect(() => {
     let disposed = false;
     let unlisten: (() => void) | undefined;
@@ -1552,12 +1600,12 @@ export default function App() {
       });
       const initialCode = await takePendingJoinCode();
       if (initialCode) openServerJoin(initialCode);
-    })().catch(reason => setError(reason instanceof Error ? reason.message : String(reason)));
+    })().catch(reason => showError(reason instanceof Error ? reason.message : String(reason)));
     return () => {
       disposed = true;
       unlisten?.();
     };
-  }, []);
+  }, [showError]);
 
   const goHome = () => {
     setPendingServerJoin(null);
@@ -1574,14 +1622,14 @@ export default function App() {
     setRiskAcknowledged(true);
   };
 
-  const page = useMemo(() => {
-    if (screen === 'host-setup') return <HostSetup tools={tools} loadingTools={loadingTools} installingTool={installingTool} installProgress={installProgress} onInstall={installMissingTool} onCancelInstall={cancelInstall} onRefresh={loadTools} onBack={goHome} onStarted={next => { setCar(next); setScreen('host-live'); }} onError={setError} />;
-    if (screen === 'host-live' && car) return <HostLive car={car} onStopped={() => { setCar(null); goHome(); }} onError={setError} />;
-    if (screen === 'join') return <JoinPage key={pendingServerJoin?.requestId ?? 'manual'} initialCode={pendingServerJoin?.code} fromServerLink={pendingServerJoin !== null} onBack={goHome} onJoined={next => { setPendingServerJoin(null); setAccess(next); setScreen('ready'); }} onError={setError} />;
-    if (screen === 'ready' && access) return <ToolChooser access={access} tools={tools} installingTool={installingTool} installProgress={installProgress} onInstall={installMissingTool} onCancelInstall={cancelInstall} onOpened={target => { setOpenedTarget(target); setScreen('ride'); }} onError={setError} />;
-    if (screen === 'ride' && access) return <RidePage access={access} tools={tools} initiallyOpened={openedTarget} installingTool={installingTool} installProgress={installProgress} onInstall={installMissingTool} onCancelInstall={cancelInstall} onLeave={() => { setAccess(null); goHome(); }} onError={setError} />;
+  const page = (() => {
+    if (screen === 'host-setup') return <HostSetup tools={tools} loadingTools={loadingTools} installingTool={installingTool} installProgress={installProgress} onInstall={installMissingTool} onCancelInstall={cancelInstall} onRefresh={loadTools} onBack={goHome} onStarted={next => { setCar(next); setScreen('host-live'); }} onError={showError} />;
+    if (screen === 'host-live' && car) return <HostLive car={car} onStopped={() => { setCar(null); goHome(); }} onError={showError} />;
+    if (screen === 'join') return <JoinPage key={pendingServerJoin?.requestId ?? 'manual'} initialCode={pendingServerJoin?.code} fromServerLink={pendingServerJoin !== null} onBack={goHome} onJoined={next => { setPendingServerJoin(null); setAccess(next); setScreen('ready'); }} onError={showError} />;
+    if (screen === 'ready' && access) return <ToolChooser access={access} tools={tools} installingTool={installingTool} installProgress={installProgress} onInstall={installMissingTool} onCancelInstall={cancelInstall} onOpened={target => { setOpenedTarget(target); setScreen('ride'); }} onError={showError} />;
+    if (screen === 'ride' && access) return <RidePage access={access} tools={tools} initiallyOpened={openedTarget} installingTool={installingTool} installProgress={installProgress} onInstall={installMissingTool} onCancelInstall={cancelInstall} onLeave={() => { setAccess(null); goHome(); }} onError={showError} />;
     return <Welcome onHost={() => setScreen('host-setup')} onJoin={() => { setPendingServerJoin(null); setScreen('join'); }} />;
-  }, [screen, tools, loadingTools, installingTool, installProgress, car, access, pendingServerJoin, openedTarget]);
+  })();
 
   return (
     <WindowShell onHome={goHome} appUpdate={appUpdate}>

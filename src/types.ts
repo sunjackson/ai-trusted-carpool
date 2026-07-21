@@ -1,6 +1,48 @@
 export type ToolKind = 'claude' | 'codex';
 export type LaunchMode = 'terminal' | 'desktop';
 
+export type AccountAuthKind = 'apiKey' | 'oauth';
+
+export type LocalAccountSummary = {
+  id: string;
+  tool: ToolKind;
+  name: string;
+  authKind: AccountAuthKind;
+  enabled: boolean;
+  priority: number;
+  source: string;
+  createdAtMs: number;
+  updatedAtMs: number;
+};
+
+export type AccountImportResult = {
+  imported: number;
+  updated: number;
+  accounts: LocalAccountSummary[];
+};
+
+// Keep the domain name available to callers that do not need to distinguish
+// persisted summaries from the account pool's internal records.
+export type AccountSummary = LocalAccountSummary;
+
+export type AccountImportInput = {
+  content: string;
+  tool?: ToolKind;
+  name?: string;
+  source?: 'json' | 'file';
+  /** Legacy UI spelling; API adapters convert it to `name`. */
+  displayName?: string;
+};
+
+export type AccountUpdateInput = {
+  id: string;
+  name?: string;
+  /** Legacy UI spelling; API adapters convert it to `name`. */
+  displayName?: string;
+  enabled?: boolean;
+  priority?: number;
+};
+
 export type ToolDetection = {
   kind: ToolKind;
   name: string;

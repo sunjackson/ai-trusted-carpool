@@ -1,3 +1,4 @@
+use crate::account_router::AccountRouterState;
 use crate::coordinator::CoordinatorMessage;
 use crate::models::{CarSession, RideAccess};
 use std::collections::HashMap;
@@ -19,6 +20,8 @@ pub struct AppRuntime {
     pub pending_signals: Vec<CoordinatorMessage>,
     pub relay_request_seen_at: HashMap<String, i64>,
     pub usage_history_path: Option<PathBuf>,
+    pub account_pool_path: Option<PathBuf>,
+    pub account_router: AccountRouterState,
     pub pending_join_code: Option<String>,
 }
 

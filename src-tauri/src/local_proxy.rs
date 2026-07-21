@@ -4,6 +4,7 @@ use crate::relay::RelayResponse;
 use crate::relay::{
     allowed_path, allowed_relay_header, decode_body, sha256_label, sign_request, RelayBridge,
     RelayHeader, RelayRequest, RelayStreamEvent, RelayStreamKind, MAX_RELAY_RESPONSE_BYTES,
+    RELAY_START_TIMEOUT_MS,
 };
 use crate::runtime::RuntimeState;
 use base64::{engine::general_purpose, Engine as _};
@@ -28,7 +29,6 @@ use uuid::Uuid;
 
 pub const LOCAL_PROXY_PORT: u16 = 25_342;
 const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
-const STREAM_START_TIMEOUT_MS: u64 = 30_000;
 
 type ProxyBody = UnsyncBoxBody<Bytes, io::Error>;
 
@@ -388,7 +388,7 @@ where
         Err(error) => return json_response(StatusCode::BAD_GATEWAY, &error),
     };
     let first = match tokio::time::timeout(
-        std::time::Duration::from_millis(STREAM_START_TIMEOUT_MS),
+        std::time::Duration::from_millis(RELAY_START_TIMEOUT_MS),
         receiver.recv(),
     )
     .await
@@ -510,7 +510,11 @@ pub fn start(state: RuntimeState) -> Result<(), String> {
         let listener = match TcpListener::from_std(listener) {
             Ok(listener) => listener,
             Err(error) => {
-                eprintln!("failed to start local proxy runtime: {error}");
+                crate::diagnostics::record(
+                    "error",
+                    "local-proxy",
+                    format!("failed to start local proxy runtime: {error}"),
+                );
                 return;
             }
         };
@@ -518,7 +522,11 @@ pub fn start(state: RuntimeState) -> Result<(), String> {
             let (stream, _) = match listener.accept().await {
                 Ok(value) => value,
                 Err(error) => {
-                    eprintln!("local proxy accept failed: {error}");
+                    crate::diagnostics::record(
+                        "error",
+                        "local-proxy",
+                        format!("local proxy accept failed: {error}"),
+                    );
                     continue;
                 }
             };
@@ -532,7 +540,11 @@ pub fn start(state: RuntimeState) -> Result<(), String> {
                     )
                     .await
                 {
-                    eprintln!("local proxy connection failed: {error}");
+                    crate::diagnostics::record(
+                        "warn",
+                        "local-proxy",
+                        format!("local proxy connection failed: {error}"),
+                    );
                 }
             });
         }

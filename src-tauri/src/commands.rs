@@ -1,3 +1,6 @@
+use crate::account_pool::{
+    AccountPool, AccountSource, AccountSummary, ImportOptions, ImportResult, UpdateAccountInput,
+};
 use crate::coordinator::{CoordinatorClient, CoordinatorMessage, IceServer, PublicInvitePayload};
 use crate::crypto::{decrypt_access, encrypt_access, EncryptedEnvelope};
 use crate::identity::{load_or_create, DeviceIdentity, PublicIdentity};
@@ -35,6 +38,50 @@ pub struct SendWebRtcSignalInput {
     pub payload_json: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportAccountsInput {
+    pub content: String,
+    #[serde(default)]
+    pub tool: Option<ToolKind>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub priority: Option<i32>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub source: Option<ManualAccountSource>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ManualAccountSource {
+    Json,
+    File,
+}
+
+impl From<ManualAccountSource> for AccountSource {
+    fn from(source: ManualAccountSource) -> Self {
+        match source {
+            ManualAccountSource::Json => AccountSource::Json,
+            ManualAccountSource::File => AccountSource::File,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateManagedAccountInput {
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub priority: Option<i32>,
+}
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -42,14 +89,43 @@ fn now_ms() -> i64 {
         .unwrap_or_default()
 }
 
-async fn query_account_quotas(tools: &[ToolKind]) -> Vec<AccountQuotaSnapshot> {
+fn account_pool(state: &RuntimeState) -> Result<AccountPool, String> {
+    let path = state
+        .inner
+        .lock()
+        .map_err(|_| "运行状态暂时不可用".to_string())?
+        .account_pool_path
+        .clone()
+        .ok_or_else(|| "本地账号存储尚未初始化".to_string())?;
+    Ok(AccountPool::new(path))
+}
+
+fn clear_managed_account_routes<'a>(
+    state: &RuntimeState,
+    account_ids: impl IntoIterator<Item = &'a str>,
+) {
+    if let Ok(mut runtime) = state.inner.lock() {
+        for id in account_ids {
+            runtime.account_router.remove(&format!("managed:{id}"));
+        }
+    }
+}
+
+fn account_update_resets_route_health(input: &UpdateManagedAccountInput) -> bool {
+    input.enabled.is_some()
+}
+
+async fn query_account_quotas(
+    tools: &[ToolKind],
+    account_pool_path: Option<&Path>,
+) -> Vec<AccountQuotaSnapshot> {
     let has_claude = tools.contains(&ToolKind::Claude);
     let has_codex = tools.contains(&ToolKind::Codex);
     match (has_claude, has_codex) {
         (true, true) => {
             let (claude, codex) = tokio::join!(
-                crate::account_quota::query(ToolKind::Claude),
-                crate::account_quota::query(ToolKind::Codex)
+                crate::account_quota::query(ToolKind::Claude, account_pool_path),
+                crate::account_quota::query(ToolKind::Codex, account_pool_path)
             );
             tools
                 .iter()
@@ -59,8 +135,12 @@ async fn query_account_quotas(tools: &[ToolKind]) -> Vec<AccountQuotaSnapshot> {
                 })
                 .collect()
         }
-        (true, false) => vec![crate::account_quota::query(ToolKind::Claude).await],
-        (false, true) => vec![crate::account_quota::query(ToolKind::Codex).await],
+        (true, false) => {
+            vec![crate::account_quota::query(ToolKind::Claude, account_pool_path).await]
+        }
+        (false, true) => {
+            vec![crate::account_quota::query(ToolKind::Codex, account_pool_path).await]
+        }
         (false, false) => Vec::new(),
     }
 }
@@ -91,7 +171,7 @@ fn merge_account_quotas(
 fn spawn_account_quota_loop(state: RuntimeState, car_id: String) {
     tauri::async_runtime::spawn(async move {
         loop {
-            let tools = {
+            let (tools, account_pool_path) = {
                 let Ok(runtime) = state.inner.lock() else {
                     break;
                 };
@@ -101,9 +181,9 @@ fn spawn_account_quota_loop(state: RuntimeState, car_id: String) {
                 if car.car_id != car_id {
                     break;
                 }
-                car.enabled_tools.clone()
+                (car.enabled_tools.clone(), runtime.account_pool_path.clone())
             };
-            let snapshots = query_account_quotas(&tools).await;
+            let snapshots = query_account_quotas(&tools, account_pool_path.as_deref()).await;
             {
                 let Ok(mut runtime) = state.inner.lock() else {
                     break;
@@ -246,7 +326,11 @@ fn resolve_tool_executable(kind: ToolKind, managed_root: Option<&Path>) -> Optio
         .map(|tool| (tool.path, true))
 }
 
-fn detect_tool(kind: ToolKind, managed_root: Option<&Path>) -> ToolDetection {
+fn detect_tool(
+    kind: ToolKind,
+    managed_root: Option<&Path>,
+    account_pool_path: Option<&Path>,
+) -> ToolDetection {
     let system_executable = find_executable(kind.command());
     let managed = if system_executable.is_none() {
         managed_root.and_then(|root| crate::tool_provisioner::managed_tool(root, kind))
@@ -275,8 +359,12 @@ fn detect_tool(kind: ToolKind, managed_root: Option<&Path>) -> ToolDetection {
     };
     let local_config = first_existing_path(&config_candidates);
     let credential = crate::relay::load_host_credential(kind);
+    let pool_authenticated = account_pool_path
+        .map(|path| crate::account_pool::AccountPool::new(path.to_path_buf()))
+        .and_then(|pool| pool.has_enabled(kind).ok())
+        .unwrap_or(false);
     let installed = executable.is_some();
-    let authenticated = credential.is_some();
+    let authenticated = pool_authenticated || credential.is_some();
     let npm_available = find_executable("npm").is_some();
     let version = managed
         .as_ref()
@@ -309,9 +397,13 @@ fn detect_tool(kind: ToolKind, managed_root: Option<&Path>) -> ToolDetection {
         installed,
         authenticated,
         executable_path: executable.map(|path| path.to_string_lossy().into_owned()),
-        config_path: credential
-            .map(|value| value.source)
-            .or_else(|| local_config.map(|path| path.to_string_lossy().into_owned())),
+        config_path: if pool_authenticated {
+            Some("可信拼车本地账号池".to_string())
+        } else {
+            credential
+                .map(|value| value.source)
+                .or_else(|| local_config.map(|path| path.to_string_lossy().into_owned()))
+        },
         detail: detail.to_string(),
         version,
         npm_available,
@@ -689,12 +781,20 @@ fn spawn_host_claim_loop(
                         if let Err(error) =
                             handle_host_message(&state, &coordinator, &identity, message).await
                         {
-                            eprintln!("ignored invalid carpool claim: {error}");
+                            crate::diagnostics::record(
+                                "warn",
+                                "coordinator",
+                                format!("ignored invalid carpool claim: {error}"),
+                            );
                         }
                     }
                 }
                 Err(error) => {
-                    eprintln!("carpool claim poll failed: {error}");
+                    crate::diagnostics::record(
+                        "warn",
+                        "coordinator",
+                        format!("carpool claim poll failed: {error}"),
+                    );
                     sleep(Duration::from_secs(2)).await;
                 }
             }
@@ -706,15 +806,115 @@ fn spawn_host_claim_loop(
 }
 
 #[tauri::command]
-pub async fn detect_tools(app: AppHandle) -> Result<Vec<ToolDetection>, String> {
+pub fn list_accounts(state: State<'_, RuntimeState>) -> Result<Vec<AccountSummary>, String> {
+    account_pool(&state)?.list()
+}
+
+#[tauri::command]
+pub fn import_local_accounts(state: State<'_, RuntimeState>) -> Result<ImportResult, String> {
+    let result = account_pool(&state)?.import_local()?;
+    clear_managed_account_routes(
+        &state,
+        result.accounts.iter().map(|account| account.id.as_str()),
+    );
+    crate::diagnostics::record(
+        "info",
+        "account-pool",
+        format!(
+            "local account import completed: {} imported, {} updated",
+            result.imported, result.updated
+        ),
+    );
+    Ok(result)
+}
+
+#[tauri::command]
+pub fn import_accounts(
+    input: ImportAccountsInput,
+    state: State<'_, RuntimeState>,
+) -> Result<ImportResult, String> {
+    let result = account_pool(&state)?.import_content(
+        &input.content,
+        ImportOptions {
+            tool: input.tool,
+            name: input.name,
+            priority: input.priority,
+            enabled: input.enabled,
+            source: input.source.map(AccountSource::from),
+        },
+    )?;
+    clear_managed_account_routes(
+        &state,
+        result.accounts.iter().map(|account| account.id.as_str()),
+    );
+    crate::diagnostics::record(
+        "info",
+        "account-pool",
+        format!(
+            "account import completed: {} imported, {} updated",
+            result.imported, result.updated
+        ),
+    );
+    Ok(result)
+}
+
+#[tauri::command]
+pub fn update_account(
+    input: UpdateManagedAccountInput,
+    state: State<'_, RuntimeState>,
+) -> Result<AccountSummary, String> {
+    let reset_route_health = account_update_resets_route_health(&input);
+    let id = input.id;
+    let summary = account_pool(&state)?.update(
+        &id,
+        UpdateAccountInput {
+            name: input.name,
+            enabled: input.enabled,
+            priority: input.priority,
+        },
+    )?;
+    if reset_route_health {
+        clear_managed_account_routes(&state, [id.as_str()]);
+    }
+    Ok(summary)
+}
+
+#[tauri::command]
+pub fn delete_account(id: String, state: State<'_, RuntimeState>) -> Result<bool, String> {
+    let deleted = account_pool(&state)?.delete(&id)?;
+    if deleted {
+        clear_managed_account_routes(&state, [id.as_str()]);
+    }
+    Ok(deleted)
+}
+
+#[tauri::command]
+pub async fn detect_tools(
+    app: AppHandle,
+    state: State<'_, RuntimeState>,
+) -> Result<Vec<ToolDetection>, String> {
     let root = managed_tools_root(&app);
+    let account_pool_path = state
+        .inner
+        .lock()
+        .map_err(|_| "运行状态暂时不可用".to_string())?
+        .account_pool_path
+        .clone();
     if let Some(root) = root.clone() {
         // Refresh update metadata in the background; detection stays instant.
         tauri::async_runtime::spawn(crate::tool_provisioner::refresh_release_caches(root));
     }
     Ok(vec![
-        detect_tool(ToolKind::Claude, root.as_deref()),
-        detect_tool(ToolKind::Codex, root.as_deref()),
+        detect_tool(
+            ToolKind::Claude,
+            root.as_deref(),
+            account_pool_path.as_deref(),
+        ),
+        detect_tool(
+            ToolKind::Codex,
+            root.as_deref(),
+            account_pool_path.as_deref(),
+        ),
     ])
 }
 
@@ -722,7 +922,11 @@ pub async fn detect_tools(app: AppHandle) -> Result<Vec<ToolDetection>, String> 
 /// binary is downloaded and verified first; npm is only a fallback when the
 /// official channel is unreachable and Node.js already exists.
 #[tauri::command]
-pub async fn install_tool(kind: ToolKind, app: AppHandle) -> Result<ToolDetection, String> {
+pub async fn install_tool(
+    kind: ToolKind,
+    app: AppHandle,
+    state: State<'_, RuntimeState>,
+) -> Result<ToolDetection, String> {
     let guard = crate::tool_installer::InstallGuard::acquire(kind)?;
     let root = managed_tools_root(&app).ok_or_else(|| "无法定位应用数据目录".to_string())?;
     let system_install = find_executable(kind.command());
@@ -767,7 +971,13 @@ pub async fn install_tool(kind: ToolKind, app: AppHandle) -> Result<ToolDetectio
         }
     }
     drop(guard);
-    let detection = detect_tool(kind, Some(&root));
+    let account_pool_path = state
+        .inner
+        .lock()
+        .map_err(|_| "运行状态暂时不可用".to_string())?
+        .account_pool_path
+        .clone();
+    let detection = detect_tool(kind, Some(&root), account_pool_path.as_deref());
     if !detection.installed {
         return Err(format!(
             "安装已完成，但仍未检测到 {} 命令。请重启应用后重试。{}",
@@ -809,8 +1019,14 @@ pub async fn start_car(
     let now = now_ms();
     validate_schedule(input.starts_at, input.ends_at, now)?;
     let managed_root = managed_tools_root(&app);
+    let account_pool_path = state
+        .inner
+        .lock()
+        .map_err(|_| "运行状态暂时不可用".to_string())?
+        .account_pool_path
+        .clone();
     for kind in &input.enabled_tools {
-        let detection = detect_tool(*kind, managed_root.as_deref());
+        let detection = detect_tool(*kind, managed_root.as_deref(), account_pool_path.as_deref());
         if !detection.installed || !detection.authenticated {
             return Err(format!("{} 尚未就绪，请先完成安装和登录", detection.name));
         }
@@ -915,7 +1131,7 @@ pub async fn get_active_car(state: State<'_, RuntimeState>) -> Result<Option<Car
 pub async fn refresh_account_quotas(
     state: State<'_, RuntimeState>,
 ) -> Result<Vec<AccountQuotaSnapshot>, String> {
-    let (car_id, tools) = {
+    let (car_id, tools, account_pool_path) = {
         let runtime = state
             .inner
             .lock()
@@ -924,9 +1140,13 @@ pub async fn refresh_account_quotas(
             .active_car
             .as_ref()
             .ok_or_else(|| "当前没有正在发车的车队".to_string())?;
-        (car.car_id.clone(), car.enabled_tools.clone())
+        (
+            car.car_id.clone(),
+            car.enabled_tools.clone(),
+            runtime.account_pool_path.clone(),
+        )
     };
-    let snapshots = query_account_quotas(&tools).await;
+    let snapshots = query_account_quotas(&tools, account_pool_path.as_deref()).await;
     let mut runtime = state
         .inner
         .lock()
@@ -1145,7 +1365,11 @@ pub async fn join_car(
                     return Ok(access);
                 }
                 Ok(None) => {}
-                Err(error) => eprintln!("ignored invalid carpool access message: {error}"),
+                Err(error) => crate::diagnostics::record(
+                    "warn",
+                    "coordinator",
+                    format!("ignored invalid carpool access message: {error}"),
+                ),
             }
         }
         sleep(Duration::from_millis(500)).await;
@@ -1217,7 +1441,11 @@ pub async fn leave_car(
         runtime.passenger_contexts.remove(&access_id);
     }
     if let Err(error) = send_result {
-        eprintln!("failed to notify owner about passenger leave: {error}");
+        crate::diagnostics::record(
+            "warn",
+            "coordinator",
+            format!("failed to notify owner about passenger leave: {error}"),
+        );
     }
     Ok(())
 }
@@ -1541,6 +1769,25 @@ pub async fn submit_relay_stream_event(event: RelayStreamEvent) -> Result<bool, 
 mod tests {
     use super::*;
 
+    #[test]
+    fn metadata_only_account_updates_preserve_route_health() {
+        let metadata_only = UpdateManagedAccountInput {
+            id: "account".to_string(),
+            name: Some("新名称".to_string()),
+            enabled: None,
+            priority: Some(10),
+        };
+        let toggle = UpdateManagedAccountInput {
+            id: "account".to_string(),
+            name: None,
+            enabled: Some(true),
+            priority: None,
+        };
+
+        assert!(!account_update_resets_route_health(&metadata_only));
+        assert!(account_update_resets_route_health(&toggle));
+    }
+
     fn identity(path: &Path) -> DeviceIdentity {
         crate::identity::load_or_create_at(path).expect("identity")
     }
@@ -1566,6 +1813,22 @@ mod tests {
             serde_json::to_string(&envelope).expect("envelope json"),
             now,
         )
+    }
+
+    #[test]
+    fn manual_account_import_cannot_claim_local_provenance() {
+        let local = serde_json::from_value::<ImportAccountsInput>(serde_json::json!({
+            "content": "sk-test",
+            "source": "local"
+        }));
+        assert!(local.is_err());
+
+        let file = serde_json::from_value::<ImportAccountsInput>(serde_json::json!({
+            "content": "sk-test",
+            "source": "file"
+        }))
+        .expect("file source");
+        assert!(matches!(file.source, Some(ManualAccountSource::File)));
     }
 
     #[test]

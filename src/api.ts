@@ -1,6 +1,9 @@
-import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { invoke } from './tauriInvoke';
 import type {
+  AccountImportInput,
+  AccountImportResult,
+  AccountUpdateInput,
   AppUpdateInfo,
   CarSession,
   JoinPreview,
@@ -13,6 +16,7 @@ import type {
   ToolInstallProgress,
   ToolKind,
   LaunchMode,
+  LocalAccountSummary,
 } from './types';
 
 const inTauri = (): boolean => '__TAURI_INTERNALS__' in window;
@@ -262,6 +266,172 @@ const demoCar = (
 });
 
 let demoActiveCar: CarSession | null = null;
+let demoAccounts: LocalAccountSummary[] = [];
+
+const normalizeAccountSummary = (value: unknown): LocalAccountSummary => {
+  const record = (value && typeof value === 'object' ? value : {}) as Record<string, unknown>;
+  const authKind = String(record.authKind ?? record.auth_kind ?? 'apiKey').toLowerCase();
+  const source = String(record.source ?? 'unknown');
+  return {
+    id: String(record.id ?? crypto.randomUUID()),
+    tool: record.tool === 'claude' ? 'claude' : 'codex',
+    name: String(record.name ?? '未命名账号'),
+    authKind: authKind === 'oauth' || authKind === 'o_auth' ? 'oauth' : 'apiKey',
+    enabled: record.enabled !== false,
+    priority: Number.isFinite(Number(record.priority)) ? Number(record.priority) : 100,
+    source,
+    createdAtMs: Number(record.createdAtMs ?? record.created_at_ms ?? Date.now()),
+    updatedAtMs: Number(record.updatedAtMs ?? record.updated_at_ms ?? Date.now()),
+  };
+};
+
+const normalizeAccountList = (value: unknown): LocalAccountSummary[] => {
+  if (Array.isArray(value)) return value.map(normalizeAccountSummary);
+  if (value && typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    if (Array.isArray(record.accounts)) return record.accounts.map(normalizeAccountSummary);
+    if (record.account) return [normalizeAccountSummary(record.account)];
+  }
+  return [];
+};
+
+const normalizeImportCount = (value: unknown, fallback: number): number => {
+  const count = typeof value === 'number' ? value : Number(value);
+  return Number.isSafeInteger(count) && count >= 0 ? count : fallback;
+};
+
+const normalizeAccountImportResult = (value: unknown): AccountImportResult => {
+  if (Array.isArray(value)) {
+    const accounts = value.map(normalizeAccountSummary);
+    return { imported: accounts.length, updated: 0, accounts };
+  }
+  const record = (value && typeof value === 'object' ? value : {}) as Record<string, unknown>;
+  const accounts = normalizeAccountList(value);
+  return {
+    imported: normalizeImportCount(record.imported, accounts.length),
+    updated: normalizeImportCount(record.updated, 0),
+    accounts,
+  };
+};
+
+const inferDemoAccount = (
+  content: string,
+  tool: ToolKind | undefined,
+  name: string | undefined,
+  index: number
+): LocalAccountSummary => {
+  const normalized = content.trim();
+  let parsed: Record<string, unknown> | null = null;
+  try {
+    const value = JSON.parse(normalized) as unknown;
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      parsed = value as Record<string, unknown>;
+    }
+  } catch {
+    // Raw API keys are supported alongside JSON credentials.
+  }
+  const serialized = parsed ? JSON.stringify(parsed) : normalized;
+  const inferredTool =
+    tool ??
+    (serialized.includes('ANTHROPIC_API_KEY') || normalized.startsWith('sk-ant-')
+      ? 'claude'
+      : 'codex');
+  const authKind: LocalAccountSummary['authKind'] =
+    serialized.includes('access_token') || serialized.includes('accessToken') ? 'oauth' : 'apiKey';
+  const now = Date.now();
+  return {
+    id: crypto.randomUUID(),
+    tool: inferredTool,
+    name: name?.trim() || `${inferredTool === 'claude' ? 'Claude' : 'Codex'} 账号${index > 0 ? ` ${index + 1}` : ''}`,
+    authKind,
+    enabled: true,
+    priority: 100,
+    source: '手动导入',
+    createdAtMs: now,
+    updatedAtMs: now,
+  };
+};
+
+const demoImportItems = (input: AccountImportInput): LocalAccountSummary[] => {
+  const normalized = input.content.trim();
+  if (!normalized) throw new Error('请输入 API Key 或账号 JSON');
+  try {
+    const parsed = JSON.parse(normalized) as unknown;
+    if (Array.isArray(parsed)) {
+      if (parsed.length === 0) throw new Error('账号 JSON 中没有可导入的记录');
+      return parsed.map((item, index) =>
+        inferDemoAccount(JSON.stringify(item), input.tool, input.name, index)
+      );
+    }
+  } catch (error) {
+    if (error instanceof Error && error.message.includes('没有可导入')) throw error;
+  }
+  return [inferDemoAccount(normalized, input.tool, input.name, 0)];
+};
+
+export async function listAccounts(): Promise<LocalAccountSummary[]> {
+  return inTauri()
+    ? invoke<unknown>('list_accounts').then(normalizeAccountList)
+    : structuredClone(demoAccounts);
+}
+
+export async function importLocalAccounts(): Promise<AccountImportResult> {
+  return inTauri()
+    ? invoke<unknown>('import_local_accounts').then(normalizeAccountImportResult)
+    : { imported: 0, updated: 0, accounts: [] };
+}
+
+export async function importAccounts(
+  input: AccountImportInput
+): Promise<AccountImportResult> {
+  const { displayName, ...rest } = input;
+  const commandInput = {
+    ...rest,
+    ...(rest.name === undefined && displayName !== undefined ? { name: displayName } : {}),
+  };
+  if (inTauri()) {
+    return invoke<unknown>('import_accounts', { input: commandInput }).then(normalizeAccountImportResult);
+  }
+  const imported = demoImportItems(commandInput);
+  demoAccounts = [...demoAccounts, ...imported];
+  return { imported: imported.length, updated: 0, accounts: structuredClone(imported) };
+}
+
+export async function updateAccount(input: AccountUpdateInput): Promise<LocalAccountSummary> {
+  const { displayName, ...rest } = input;
+  const commandInput = {
+    ...rest,
+    ...(rest.name === undefined && displayName !== undefined ? { name: displayName } : {}),
+  };
+  if (inTauri()) {
+    return invoke<unknown>('update_account', { input: commandInput }).then(value => {
+      if (value && typeof value === 'object' && 'account' in value) {
+        return normalizeAccountSummary((value as { account: unknown }).account);
+      }
+      return normalizeAccountSummary(value);
+    });
+  }
+  const index = demoAccounts.findIndex(account => account.id === commandInput.id);
+  if (index < 0) throw new Error('账号不存在');
+  const current = demoAccounts[index];
+  const updated = {
+    ...current,
+    ...(commandInput.name === undefined ? {} : { name: commandInput.name }),
+    ...(commandInput.enabled === undefined ? {} : { enabled: commandInput.enabled }),
+    ...(commandInput.priority === undefined ? {} : { priority: commandInput.priority }),
+    updatedAtMs: Date.now(),
+  };
+  demoAccounts[index] = updated;
+  return structuredClone(updated);
+}
+
+export async function deleteAccount(id: string): Promise<void> {
+  if (inTauri()) {
+    await invoke('delete_account', { id });
+    return;
+  }
+  demoAccounts = demoAccounts.filter(account => account.id !== id);
+}
 
 export async function detectTools(): Promise<ToolDetection[]> {
   return inTauri() ? invoke<ToolDetection[]>('detect_tools') : demoTools;

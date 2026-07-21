@@ -1,8 +1,11 @@
+mod account_pool;
 mod account_quota;
+mod account_router;
 mod client_launcher;
 mod commands;
 mod coordinator;
 mod crypto;
+mod diagnostics;
 mod identity;
 mod join_link;
 mod local_proxy;
@@ -20,12 +23,14 @@ mod usage;
 mod usage_history;
 
 use commands::{
-    cancel_tool_install, check_app_update, confirm_passenger_link, detect_tools,
-    execute_relay_request, get_active_car, get_ice_servers, get_shared_car_status, install_tool,
-    join_car, launch_tool, leave_car, open_releases_page, poll_webrtc_signals, preview_invite,
-    refresh_account_quotas, send_webrtc_signal, start_car, start_relay_request, stop_car,
-    submit_relay_response, submit_relay_stream_event, update_member_token_limits,
+    cancel_tool_install, check_app_update, confirm_passenger_link, delete_account, detect_tools,
+    execute_relay_request, get_active_car, get_ice_servers, get_shared_car_status, import_accounts,
+    import_local_accounts, install_tool, join_car, launch_tool, leave_car, list_accounts,
+    open_releases_page, poll_webrtc_signals, preview_invite, refresh_account_quotas,
+    send_webrtc_signal, start_car, start_relay_request, stop_car, submit_relay_response,
+    submit_relay_stream_event, update_account, update_member_token_limits,
 };
+use diagnostics::{clear_debug_logs, get_debug_logs};
 use relay::RelayBridge;
 use runtime::RuntimeState;
 use tauri::Manager;
@@ -33,6 +38,7 @@ use tauri_plugin_deep_link::DeepLinkExt;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    diagnostics::record("info", "runtime", "application starting");
     let state = RuntimeState::default();
     let setup_state = state.clone();
     let single_instance_state = state.clone();
@@ -49,31 +55,39 @@ pub fn run() {
         .manage(state)
         .setup(move |app| {
             client_launcher::recover_stale(app.handle()).map_err(std::io::Error::other)?;
-            let history_path = app
-                .path()
-                .app_data_dir()
-                .map_err(std::io::Error::other)?
-                .join("usage-history.jsonl");
+            let app_data_dir = app.path().app_data_dir().map_err(std::io::Error::other)?;
+            let history_path = app_data_dir.join("usage-history.jsonl");
             usage_history::prepare(&history_path).map_err(std::io::Error::other)?;
-            setup_state
+            let mut runtime = setup_state
                 .inner
                 .lock()
-                .map_err(|_| std::io::Error::other("运行状态暂时不可用"))?
-                .usage_history_path = Some(history_path);
+                .map_err(|_| std::io::Error::other("运行状态暂时不可用"))?;
+            runtime.usage_history_path = Some(history_path);
+            runtime.account_pool_path = Some(app_data_dir.join("accounts.json"));
+            drop(runtime);
             tauri::async_runtime::block_on(
                 RelayBridge::global().set_app_handle(app.handle().clone()),
             );
             local_proxy::start(setup_state.clone()).map_err(std::io::Error::other)?;
+            diagnostics::record("info", "local-proxy", "local relay proxy started");
             match status_tray::setup(app) {
                 Ok(()) => {
                     status_tray::spawn_refresh_loop(app.handle().clone(), setup_state.clone())
                 }
-                Err(error) => eprintln!("system status tray is unavailable: {error}"),
+                Err(error) => diagnostics::record(
+                    "warn",
+                    "status-tray",
+                    format!("system status tray is unavailable: {error}"),
+                ),
             }
 
             #[cfg(any(windows, target_os = "linux"))]
             if let Err(error) = app.deep_link().register_all() {
-                eprintln!("runtime deep-link registration is unavailable: {error}");
+                diagnostics::record(
+                    "warn",
+                    "deep-link",
+                    format!("runtime deep-link registration is unavailable: {error}"),
+                );
             }
 
             if let Some(urls) = app
@@ -100,6 +114,11 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             detect_tools,
+            list_accounts,
+            import_local_accounts,
+            import_accounts,
+            update_account,
+            delete_account,
             install_tool,
             cancel_tool_install,
             check_app_update,
@@ -122,6 +141,8 @@ pub fn run() {
             start_relay_request,
             submit_relay_response,
             submit_relay_stream_event,
+            get_debug_logs,
+            clear_debug_logs,
             join_link::take_pending_join_code
         ])
         .build(tauri::generate_context!())
@@ -142,7 +163,11 @@ pub fn run() {
             }
             if matches!(event, tauri::RunEvent::Exit) {
                 if let Err(error) = client_launcher::recover_stale(app) {
-                    eprintln!("failed to restore desktop client configuration on exit: {error}");
+                    diagnostics::record(
+                        "error",
+                        "client-launcher",
+                        format!("failed to restore desktop client configuration on exit: {error}"),
+                    );
                 }
             }
         });

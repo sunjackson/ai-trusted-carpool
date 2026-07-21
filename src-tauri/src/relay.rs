@@ -1,3 +1,9 @@
+use crate::account_pool::{
+    codex_local_config_allows_official_api, codex_oauth_account_id, codex_oauth_expires_at_ms,
+    is_official_provider_base_url, reject_non_official_provider_base_urls, AccountAuthKind,
+    AccountPool,
+};
+use crate::account_router::{retryable_status, RouteCandidate, RouteFailure};
 use crate::models::ToolKind;
 use crate::runtime::{HostSeatBinding, RuntimeState};
 use crate::usage::{apply_usage, extract_usage};
@@ -21,6 +27,8 @@ const MAX_RELAY_BODY_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const MAX_RELAY_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const RELAY_TTL_MS: i64 = 5 * 60 * 1_000;
 const RELAY_TIMEOUT_MS: u64 = 5 * 60 * 1_000;
+pub(crate) const RELAY_START_TIMEOUT_MS: u64 = 30_000;
+const RELAY_ROUTE_START_BUDGET_MS: u64 = 25_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -135,6 +143,12 @@ pub struct HostCredential {
     pub source: String,
 }
 
+struct PreparedHostRequest {
+    body: Vec<u8>,
+    code: String,
+    current_ms: i64,
+}
+
 pub struct RelayBridge {
     app_handle: Mutex<Option<AppHandle>>,
     pending: Mutex<HashMap<String, mpsc::Sender<RelayStreamEvent>>>,
@@ -176,7 +190,7 @@ impl RelayBridge {
             access_id,
             owner_peer_id,
             payload_json,
-            timeout_ms: RELAY_TIMEOUT_MS,
+            timeout_ms: RELAY_START_TIMEOUT_MS,
         };
         let (sender, receiver) = mpsc::channel(64);
         {
@@ -406,8 +420,24 @@ pub fn allowed_relay_header(name: &str) -> bool {
     )
 }
 
-fn json_api_key(path: &Path, pointers: &[&str]) -> Option<String> {
+fn request_allows_ambiguous_retry(request: &RelayRequest) -> bool {
+    request.method == "GET"
+        || request.headers.iter().any(|header| {
+            header.name.trim().eq_ignore_ascii_case("idempotency-key")
+                && !header.value.trim().is_empty()
+        })
+}
+
+fn route_failure_allows_retry(request: &RelayRequest, failure: RouteFailure) -> bool {
+    matches!(
+        failure,
+        RouteFailure::Authentication | RouteFailure::RateLimited
+    ) || request_allows_ambiguous_retry(request)
+}
+
+fn json_api_key(kind: ToolKind, path: &Path, pointers: &[&str]) -> Option<String> {
     let value: Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    reject_non_official_provider_base_urls(&value, Some(kind)).ok()?;
     pointers.iter().find_map(|pointer| {
         value
             .pointer(pointer)
@@ -433,15 +463,23 @@ fn nonempty_string(value: &Value, pointer: &str) -> Option<String> {
 
 fn codex_oauth_credential(path: &Path) -> Option<HostCredential> {
     let value = read_json(path)?;
+    reject_non_official_provider_base_urls(&value, Some(ToolKind::Codex)).ok()?;
+    let access_token = nonempty_string(&value, "/tokens/access_token")?;
+    if codex_oauth_expires_at_ms(&value, &access_token)
+        .is_some_and(|expires_at| expires_at <= now_ms().saturating_add(60_000))
+    {
+        return None;
+    }
     Some(HostCredential {
-        secret: nonempty_string(&value, "/tokens/access_token")?,
-        account_id: nonempty_string(&value, "/tokens/account_id"),
+        account_id: codex_oauth_account_id(&value, &access_token),
+        secret: access_token,
         kind: HostCredentialKind::CodexChatGptOAuth,
         source: path.to_string_lossy().into_owned(),
     })
 }
 
 fn claude_oauth_from_value(value: &Value, source: String) -> Option<HostCredential> {
+    reject_non_official_provider_base_urls(value, Some(ToolKind::Claude)).ok()?;
     let expires_at = value
         .pointer("/claudeAiOauth/expiresAt")
         .and_then(Value::as_i64);
@@ -458,13 +496,7 @@ fn claude_oauth_from_value(value: &Value, source: String) -> Option<HostCredenti
 
 fn claude_settings_bearer(path: &Path) -> Option<HostCredential> {
     let value = read_json(path)?;
-    let configured_base = nonempty_string(&value, "/env/ANTHROPIC_BASE_URL");
-    if configured_base
-        .as_deref()
-        .is_some_and(|base| base.trim_end_matches('/') != "https://api.anthropic.com")
-    {
-        return None;
-    }
+    reject_non_official_provider_base_urls(&value, Some(ToolKind::Claude)).ok()?;
     let secret = nonempty_string(&value, "/env/CLAUDE_CODE_OAUTH_TOKEN")
         .or_else(|| nonempty_string(&value, "/env/ANTHROPIC_AUTH_TOKEN"))?;
     Some(HostCredential {
@@ -476,11 +508,7 @@ fn claude_settings_bearer(path: &Path) -> Option<HostCredential> {
 }
 
 fn claude_env_oauth() -> Option<HostCredential> {
-    let configured_base = std::env::var("ANTHROPIC_BASE_URL").ok();
-    if configured_base
-        .as_deref()
-        .is_some_and(|base| base.trim_end_matches('/') != "https://api.anthropic.com")
-    {
+    if !environment_allows_official_provider(ToolKind::Claude) {
         return None;
     }
     ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN"]
@@ -497,6 +525,18 @@ fn claude_env_oauth() -> Option<HostCredential> {
                     source: format!("环境变量 {env_name}"),
                 })
         })
+}
+
+fn environment_allows_official_provider(kind: ToolKind) -> bool {
+    let env_name = match kind {
+        ToolKind::Claude => "ANTHROPIC_BASE_URL",
+        ToolKind::Codex => "OPENAI_BASE_URL",
+    };
+    let Ok(configured_base) = std::env::var(env_name) else {
+        return true;
+    };
+    let configured_base = configured_base.trim();
+    configured_base.is_empty() || is_official_provider_base_url(configured_base, Some(kind))
 }
 
 #[cfg(target_os = "macos")]
@@ -574,6 +614,9 @@ fn load_host_oauth_credential_from(
 /// API keys do not expose Claude/ChatGPT subscription windows and may be inherited
 /// from an unrelated shell profile while the official CLI OAuth session is valid.
 pub fn load_host_oauth_credential(kind: ToolKind) -> Option<HostCredential> {
+    if !environment_allows_official_provider(kind) {
+        return None;
+    }
     if kind == ToolKind::Claude {
         if let Some(credential) = claude_env_oauth() {
             return Some(credential);
@@ -583,19 +626,30 @@ pub fn load_host_oauth_credential(kind: ToolKind) -> Option<HostCredential> {
 }
 
 pub fn load_host_credential(kind: ToolKind) -> Option<HostCredential> {
+    if !environment_allows_official_provider(kind) {
+        return None;
+    }
+    let home = dirs::home_dir();
+    let local_config_allows_api_key = kind != ToolKind::Codex
+        || home
+            .as_deref()
+            .map(codex_local_config_allows_official_api)
+            .unwrap_or(true);
     let env_name = match kind {
         ToolKind::Claude => "ANTHROPIC_API_KEY",
         ToolKind::Codex => "OPENAI_API_KEY",
     };
-    if let Ok(value) = std::env::var(env_name) {
-        let value = value.trim();
-        if !value.is_empty() && !value.starts_with("trusted-carpool-") {
-            return Some(HostCredential {
-                secret: value.to_string(),
-                account_id: None,
-                kind: HostCredentialKind::ApiKey,
-                source: format!("环境变量 {env_name}"),
-            });
+    if local_config_allows_api_key {
+        if let Ok(value) = std::env::var(env_name) {
+            let value = value.trim();
+            if !value.is_empty() && !value.starts_with("trusted-carpool-") {
+                return Some(HostCredential {
+                    secret: value.to_string(),
+                    account_id: None,
+                    kind: HostCredentialKind::ApiKey,
+                    source: format!("环境变量 {env_name}"),
+                });
+            }
         }
     }
     if kind == ToolKind::Claude {
@@ -603,22 +657,150 @@ pub fn load_host_credential(kind: ToolKind) -> Option<HostCredential> {
             return Some(credential);
         }
     }
-    let home = dirs::home_dir()?;
-    if let Some(credential) =
+    let home = home?;
+    let candidates = if !local_config_allows_api_key {
+        Vec::new()
+    } else {
         credential_candidates(kind, &home)
-            .into_iter()
-            .find_map(|(path, pointers)| {
-                json_api_key(&path, pointers).map(|api_key| HostCredential {
-                    secret: api_key,
-                    account_id: None,
-                    kind: HostCredentialKind::ApiKey,
-                    source: path.to_string_lossy().into_owned(),
-                })
-            })
-    {
+    };
+    if let Some(credential) = candidates.into_iter().find_map(|(path, pointers)| {
+        json_api_key(kind, &path, pointers).map(|api_key| HostCredential {
+            secret: api_key,
+            account_id: None,
+            kind: HostCredentialKind::ApiKey,
+            source: path.to_string_lossy().into_owned(),
+        })
+    }) {
         return Some(credential);
     }
     load_host_oauth_credential_from(kind, &home, true)
+}
+
+fn missing_credential_message(tool: ToolKind) -> String {
+    match tool {
+        ToolKind::Claude => {
+            "本机没有可用的 Claude 账号，请先导入官方 API Key 或 OAuth 授权".to_string()
+        }
+        ToolKind::Codex => {
+            "本机没有可用的 Codex 账号，请先导入 OpenAI API Key 或 ChatGPT OAuth 授权".to_string()
+        }
+    }
+}
+
+fn managed_host_credential(
+    candidate: crate::account_pool::AccountCandidate,
+) -> Option<RouteCandidate> {
+    let kind = match (candidate.tool, candidate.credential.auth_kind()) {
+        (ToolKind::Claude, AccountAuthKind::ApiKey)
+        | (ToolKind::Codex, AccountAuthKind::ApiKey) => HostCredentialKind::ApiKey,
+        (ToolKind::Claude, AccountAuthKind::OAuth) => HostCredentialKind::ClaudeOAuth,
+        (ToolKind::Codex, AccountAuthKind::OAuth) => HostCredentialKind::CodexChatGptOAuth,
+    };
+    if candidate
+        .credential
+        .is_expired_at(now_ms().saturating_add(60_000))
+    {
+        return None;
+    }
+    Some(RouteCandidate {
+        id: format!("managed:{}", candidate.id),
+        priority: candidate.priority,
+        credential: HostCredential {
+            secret: candidate.credential.secret().to_string(),
+            account_id: candidate.credential.account_id().map(str::to_string),
+            kind,
+            source: format!("托管账号 {}", candidate.name),
+        },
+    })
+}
+
+fn route_candidates(state: &RuntimeState, tool: ToolKind) -> Result<Vec<RouteCandidate>, String> {
+    let pool_path = state
+        .inner
+        .lock()
+        .map_err(|_| "运行状态暂时不可用".to_string())?
+        .account_pool_path
+        .clone();
+    let mut candidates = Vec::new();
+    let mut pool_failed = false;
+    if let Some(path) = pool_path {
+        match AccountPool::new(path).candidates(tool) {
+            Ok(managed) => {
+                candidates.extend(managed.into_iter().filter_map(managed_host_credential))
+            }
+            Err(error) => {
+                pool_failed = true;
+                crate::diagnostics::record(
+                    "error",
+                    "account-pool",
+                    format!("failed to read the local account pool: {error}"),
+                );
+            }
+        }
+    }
+    if let Some(credential) = load_host_credential(tool) {
+        let duplicate = candidates.iter().any(|candidate| {
+            candidate.credential.kind == credential.kind
+                && candidate.credential.secret == credential.secret
+        });
+        if !duplicate {
+            candidates.push(RouteCandidate {
+                id: format!("local:{}", tool.command()),
+                priority: u32::MAX,
+                credential,
+            });
+        }
+    }
+    if candidates.is_empty() && pool_failed {
+        return Err("本地账号池暂时无法读取，请打开调试模式查看详细日志".to_string());
+    }
+    if candidates.is_empty() {
+        return Err(missing_credential_message(tool));
+    }
+    Ok(candidates)
+}
+
+fn reserve_route_candidates(
+    state: &RuntimeState,
+    candidates: Vec<RouteCandidate>,
+    tool: ToolKind,
+) -> Result<Vec<RouteCandidate>, String> {
+    let mut runtime = state
+        .inner
+        .lock()
+        .map_err(|_| "运行状态暂时不可用".to_string())?;
+    let ordered = runtime
+        .account_router
+        .order_and_reserve_candidates(candidates, now_ms());
+    if ordered.is_empty() {
+        let tool_label = match tool {
+            ToolKind::Claude => "Claude",
+            ToolKind::Codex => "Codex",
+        };
+        return Err(format!(
+            "所有 {} 账号暂时处于冷却期，请稍后重试",
+            tool_label
+        ));
+    }
+    Ok(ordered)
+}
+
+fn mark_route_attempt(state: &RuntimeState, id: &str) {
+    if let Ok(mut runtime) = state.inner.lock() {
+        runtime.account_router.mark_attempt(id);
+    }
+}
+
+fn mark_route_success(state: &RuntimeState, id: &str) {
+    if let Ok(mut runtime) = state.inner.lock() {
+        runtime.account_router.mark_success(id);
+    }
+}
+
+fn mark_route_failure(state: &RuntimeState, id: &str, failure: RouteFailure, current_ms: i64) {
+    if let Ok(mut runtime) = state.inner.lock() {
+        runtime.account_router.mark_failure(id, failure, current_ms);
+    }
 }
 
 fn binding_for_request(
@@ -671,6 +853,23 @@ fn binding_for_request(
         .relay_request_seen_at
         .insert(request.request_id.clone(), current_ms);
     Ok((binding.clone(), binding.code))
+}
+
+fn prepare_host_request(
+    state: &RuntimeState,
+    request: &RelayRequest,
+) -> Result<PreparedHostRequest, String> {
+    let current_ms = now_ms();
+    let (_binding, code) = binding_for_request(state, request, current_ms)?;
+    let body = decode_body(&request.body_base64, MAX_RELAY_BODY_BYTES, "请求")?;
+    if sha256_label(&body) != request.body_sha256 {
+        return Err("请求内容完整性校验失败".to_string());
+    }
+    Ok(PreparedHostRequest {
+        body,
+        code,
+        current_ms,
+    })
 }
 
 fn official_endpoint(tool: ToolKind, credential: &HostCredential) -> Result<&'static str, String> {
@@ -859,7 +1058,11 @@ fn record_usage(
     };
     if let Some((path, record)) = history {
         if let Err(error) = append_usage_history(&path, &record) {
-            eprintln!("usage history append failed: {error}");
+            crate::diagnostics::record(
+                "error",
+                "usage-history",
+                format!("usage history append failed: {error}"),
+            );
         }
     }
     Ok(())
@@ -890,23 +1093,157 @@ pub fn start_host_request_stream(
 async fn execute_host_request_stream<F>(
     state: &RuntimeState,
     request: RelayRequest,
-    mut emit: F,
+    emit: F,
 ) -> Result<(), String>
 where
     F: FnMut(RelayStreamEvent) -> Result<(), String>,
 {
-    let credential = load_host_credential(request.tool).ok_or_else(|| match request.tool {
-        ToolKind::Claude => {
-            "本机没有可用的 Claude 官方 API Key 或未过期的官方 OAuth 授权".to_string()
-        }
-        ToolKind::Codex => {
-            "本机没有可用的 OpenAI API Key 或 ChatGPT Codex 官方 OAuth 授权".to_string()
-        }
-    })?;
-    let endpoint = official_endpoint(request.tool, &credential)?;
-    execute_host_request_stream_with(state, request, &credential, endpoint, &mut emit).await
+    let tool = request.tool;
+    let candidates = route_candidates(state, request.tool)?;
+    execute_host_request_stream_routed_with(state, request, candidates, emit, |candidate| {
+        official_endpoint(tool, &candidate.credential).map(str::to_string)
+    })
+    .await
 }
 
+async fn execute_host_request_stream_routed_with<F, E>(
+    state: &RuntimeState,
+    request: RelayRequest,
+    candidates: Vec<RouteCandidate>,
+    emit: F,
+    endpoint_for: E,
+) -> Result<(), String>
+where
+    F: FnMut(RelayStreamEvent) -> Result<(), String>,
+    E: Fn(&RouteCandidate) -> Result<String, String>,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(RELAY_ROUTE_START_BUDGET_MS);
+    execute_host_request_stream_routed_before(
+        state,
+        request,
+        candidates,
+        emit,
+        endpoint_for,
+        deadline,
+    )
+    .await
+}
+
+async fn execute_host_request_stream_routed_before<F, E>(
+    state: &RuntimeState,
+    request: RelayRequest,
+    candidates: Vec<RouteCandidate>,
+    mut emit: F,
+    endpoint_for: E,
+    deadline: tokio::time::Instant,
+) -> Result<(), String>
+where
+    F: FnMut(RelayStreamEvent) -> Result<(), String>,
+    E: Fn(&RouteCandidate) -> Result<String, String>,
+{
+    let prepared = prepare_host_request(state, &request)?;
+    let candidates = reserve_route_candidates(state, candidates, request.tool)?;
+    let candidate_count = candidates.len();
+    let mut last_error = None;
+    for (index, candidate) in candidates.into_iter().enumerate() {
+        if index > 0 {
+            mark_route_attempt(state, &candidate.id);
+        }
+        let endpoint = endpoint_for(&candidate)?;
+        let started = std::time::Instant::now();
+        let builder = upstream_request(
+            &request,
+            prepared.body.clone(),
+            &candidate.credential,
+            &endpoint,
+        )?;
+        let mut response = match tokio::time::timeout_at(deadline, builder.send()).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                mark_route_failure(state, &candidate.id, RouteFailure::Network, now_ms());
+                crate::diagnostics::record(
+                    "warn",
+                    "account-router",
+                    format!(
+                        "{} upstream connection failed; local account entered cooldown: {error}",
+                        request.tool.command()
+                    ),
+                );
+                last_error = Some(format!("车主连接官方 API 失败: {error}"));
+                if index + 1 < candidate_count
+                    && route_failure_allows_retry(&request, RouteFailure::Network)
+                {
+                    continue;
+                }
+                break;
+            }
+            Err(_) => {
+                mark_route_failure(state, &candidate.id, RouteFailure::Network, now_ms());
+                crate::diagnostics::record(
+                    "warn",
+                    "account-router",
+                    format!(
+                        "{} route start budget expired; upstream request was cancelled",
+                        request.tool.command()
+                    ),
+                );
+                return Err("等待官方 API 响应超时，已停止账号切换".to_string());
+            }
+        };
+        let status_code = response.status().as_u16();
+        let retry_failure = retryable_status(status_code);
+        if let Some(failure) = retry_failure {
+            mark_route_failure(state, &candidate.id, failure, now_ms());
+            crate::diagnostics::record(
+                "warn",
+                "account-router",
+                format!(
+                    "{} upstream returned HTTP {status_code}; local account entered cooldown",
+                    request.tool.command()
+                ),
+            );
+            if index + 1 < candidate_count && route_failure_allows_retry(&request, failure) {
+                continue;
+            }
+        }
+        let result = emit_stream_response_with_started(
+            state,
+            &request,
+            &prepared,
+            &mut response,
+            started,
+            &mut emit,
+        )
+        .await;
+        match result {
+            Ok(()) => {
+                if retry_failure.is_none() {
+                    mark_route_success(state, &candidate.id);
+                }
+                return Ok(());
+            }
+            Err(error) => {
+                if retry_failure.is_none() {
+                    if let Some(failure) = error.route_failure {
+                        mark_route_failure(state, &candidate.id, failure, now_ms());
+                        crate::diagnostics::record(
+                            "warn",
+                            "account-router",
+                            format!(
+                                "{} upstream stream failed after response start; local account entered cooldown",
+                                request.tool.command()
+                            ),
+                        );
+                    }
+                }
+                return Err(error.message);
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| missing_credential_message(request.tool)))
+}
+
+#[cfg(test)]
 pub(crate) async fn execute_host_request_stream_with<F>(
     state: &RuntimeState,
     request: RelayRequest,
@@ -917,36 +1254,80 @@ pub(crate) async fn execute_host_request_stream_with<F>(
 where
     F: FnMut(RelayStreamEvent) -> Result<(), String>,
 {
-    let current_ms = now_ms();
-    let (_binding, code) = binding_for_request(state, &request, current_ms)?;
-    let body = decode_body(&request.body_base64, MAX_RELAY_BODY_BYTES, "请求")?;
-    if sha256_label(&body) != request.body_sha256 {
-        return Err("请求内容完整性校验失败".to_string());
-    }
+    let prepared = prepare_host_request(state, &request)?;
     let started = std::time::Instant::now();
-    let mut response = upstream_request(&request, body.clone(), credential, endpoint)?
+    let mut response = upstream_request(&request, prepared.body.clone(), credential, endpoint)?
         .send()
         .await
         .map_err(|error| format!("车主连接官方 API 失败: {error}"))?;
+    emit_stream_response_with_started(
+        state,
+        &request,
+        &prepared,
+        &mut response,
+        started,
+        &mut emit,
+    )
+    .await
+    .map_err(|error| error.message)
+}
+
+struct StreamResponseError {
+    message: String,
+    route_failure: Option<RouteFailure>,
+}
+
+impl StreamResponseError {
+    fn local(message: String) -> Self {
+        Self {
+            message,
+            route_failure: None,
+        }
+    }
+
+    fn network(message: String) -> Self {
+        Self {
+            message,
+            route_failure: Some(RouteFailure::Network),
+        }
+    }
+}
+
+async fn emit_stream_response_with_started<F>(
+    state: &RuntimeState,
+    request: &RelayRequest,
+    prepared: &PreparedHostRequest,
+    response: &mut reqwest::Response,
+    started: std::time::Instant,
+    emit: &mut F,
+) -> Result<(), StreamResponseError>
+where
+    F: FnMut(RelayStreamEvent) -> Result<(), String>,
+{
     let status_code = response.status().as_u16();
     emit(RelayStreamEvent {
         request_id: request.request_id.clone(),
         kind: RelayStreamKind::Start,
         status_code: Some(status_code),
-        headers: response_headers(&response),
+        headers: response_headers(response),
         chunk_base64: None,
         body_sha256: None,
         latency_ms: None,
         error: None,
-    })?;
+    })
+    .map_err(StreamResponseError::local)?;
     let mut response_body = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|error| format!("读取官方 API 流式响应失败: {error}"))?
-    {
+    loop {
+        let chunk = response.chunk().await.map_err(|error| {
+            StreamResponseError::network(format!("读取官方 API 流式响应失败: {error}"))
+        })?;
+        let Some(chunk) = chunk else {
+            break;
+        };
         if response_body.len().saturating_add(chunk.len()) > MAX_RELAY_RESPONSE_BYTES {
-            return Err("官方 API 响应过大，已安全中止".to_string());
+            return Err(StreamResponseError::local(
+                "官方 API 响应过大，已安全中止".to_string(),
+            ));
         }
         response_body.extend_from_slice(&chunk);
         emit(RelayStreamEvent {
@@ -958,20 +1339,22 @@ where
             body_sha256: None,
             latency_ms: None,
             error: None,
-        })?;
+        })
+        .map_err(StreamResponseError::local)?;
     }
     let body_sha256 = sha256_label(&response_body);
     record_usage(
         state,
-        &request,
-        &code,
-        &body,
+        request,
+        &prepared.code,
+        &prepared.body,
         &response_body,
         status_code,
-        current_ms,
-    )?;
+        prepared.current_ms,
+    )
+    .map_err(StreamResponseError::local)?;
     emit(RelayStreamEvent {
-        request_id: request.request_id,
+        request_id: request.request_id.clone(),
         kind: RelayStreamKind::End,
         status_code: None,
         headers: Vec::new(),
@@ -979,7 +1362,8 @@ where
         body_sha256: Some(body_sha256),
         latency_ms: Some(started.elapsed().as_millis() as u64),
         error: None,
-    })?;
+    })
+    .map_err(StreamResponseError::local)?;
     Ok(())
 }
 
@@ -987,44 +1371,146 @@ pub async fn execute_host_request(
     state: &RuntimeState,
     request: RelayRequest,
 ) -> Result<RelayResponse, String> {
-    let credential = load_host_credential(request.tool).ok_or_else(|| match request.tool {
-        ToolKind::Claude => {
-            "本机没有可用的 Claude 官方 API Key 或未过期的官方 OAuth 授权".to_string()
-        }
-        ToolKind::Codex => {
-            "本机没有可用的 OpenAI API Key 或 ChatGPT Codex 官方 OAuth 授权".to_string()
-        }
-    })?;
-    let endpoint = official_endpoint(request.tool, &credential)?;
-    execute_host_request_with(state, request, &credential, endpoint).await
+    let tool = request.tool;
+    let candidates = route_candidates(state, request.tool)?;
+    execute_host_request_routed_with(state, request, candidates, |candidate| {
+        official_endpoint(tool, &candidate.credential).map(str::to_string)
+    })
+    .await
 }
 
+async fn execute_host_request_routed_with<E>(
+    state: &RuntimeState,
+    request: RelayRequest,
+    candidates: Vec<RouteCandidate>,
+    endpoint_for: E,
+) -> Result<RelayResponse, String>
+where
+    E: Fn(&RouteCandidate) -> Result<String, String>,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(RELAY_ROUTE_START_BUDGET_MS);
+    execute_host_request_routed_before(state, request, candidates, endpoint_for, deadline).await
+}
+
+async fn execute_host_request_routed_before<E>(
+    state: &RuntimeState,
+    request: RelayRequest,
+    candidates: Vec<RouteCandidate>,
+    endpoint_for: E,
+    deadline: tokio::time::Instant,
+) -> Result<RelayResponse, String>
+where
+    E: Fn(&RouteCandidate) -> Result<String, String>,
+{
+    let prepared = prepare_host_request(state, &request)?;
+    let candidates = reserve_route_candidates(state, candidates, request.tool)?;
+    let candidate_count = candidates.len();
+    let mut last_error = None;
+    for (index, candidate) in candidates.into_iter().enumerate() {
+        if index > 0 {
+            mark_route_attempt(state, &candidate.id);
+        }
+        let endpoint = endpoint_for(&candidate)?;
+        match tokio::time::timeout_at(
+            deadline,
+            execute_upstream(
+                &request,
+                prepared.body.clone(),
+                &candidate.credential,
+                &endpoint,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(response)) => {
+                let retry_failure = retryable_status(response.status_code);
+                if let Some(failure) = retry_failure {
+                    mark_route_failure(state, &candidate.id, failure, now_ms());
+                    crate::diagnostics::record(
+                        "warn",
+                        "account-router",
+                        format!(
+                            "{} upstream returned HTTP {}; local account entered cooldown",
+                            request.tool.command(),
+                            response.status_code
+                        ),
+                    );
+                    if index + 1 < candidate_count && route_failure_allows_retry(&request, failure)
+                    {
+                        continue;
+                    }
+                } else {
+                    mark_route_success(state, &candidate.id);
+                }
+                record_prepared_response(state, &request, &prepared, &response)?;
+                return Ok(response);
+            }
+            Ok(Err(error)) => {
+                mark_route_failure(state, &candidate.id, RouteFailure::Network, now_ms());
+                crate::diagnostics::record(
+                    "warn",
+                    "account-router",
+                    format!(
+                        "{} upstream request failed; local account entered cooldown: {error}",
+                        request.tool.command()
+                    ),
+                );
+                last_error = Some(error);
+                if index + 1 < candidate_count
+                    && route_failure_allows_retry(&request, RouteFailure::Network)
+                {
+                    continue;
+                }
+            }
+            Err(_) => {
+                mark_route_failure(state, &candidate.id, RouteFailure::Network, now_ms());
+                crate::diagnostics::record(
+                    "warn",
+                    "account-router",
+                    format!(
+                        "{} route budget expired; upstream request was cancelled",
+                        request.tool.command()
+                    ),
+                );
+                return Err("等待官方 API 响应超时，已停止账号切换".to_string());
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| missing_credential_message(request.tool)))
+}
+
+#[cfg(test)]
 pub(crate) async fn execute_host_request_with(
     state: &RuntimeState,
     request: RelayRequest,
     credential: &HostCredential,
     endpoint: &str,
 ) -> Result<RelayResponse, String> {
-    let current_ms = now_ms();
-    let (_binding, code) = binding_for_request(state, &request, current_ms)?;
-    let body = decode_body(&request.body_base64, MAX_RELAY_BODY_BYTES, "请求")?;
-    if sha256_label(&body) != request.body_sha256 {
-        return Err("请求内容完整性校验失败".to_string());
-    }
-    let response = execute_upstream(&request, body.clone(), credential, endpoint).await?;
+    let prepared = prepare_host_request(state, &request)?;
+    let response = execute_upstream(&request, prepared.body.clone(), credential, endpoint).await?;
+    record_prepared_response(state, &request, &prepared, &response)?;
+    Ok(response)
+}
+
+fn record_prepared_response(
+    state: &RuntimeState,
+    request: &RelayRequest,
+    prepared: &PreparedHostRequest,
+    response: &RelayResponse,
+) -> Result<(), String> {
     if let Ok(response_body) = decode_body(&response.body_base64, MAX_RELAY_RESPONSE_BYTES, "响应")
     {
         record_usage(
             state,
-            &request,
-            &code,
-            &body,
+            request,
+            &prepared.code,
+            &prepared.body,
             &response_body,
             response.status_code,
-            current_ms,
+            prepared.current_ms,
         )?;
     }
-    Ok(response)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1097,6 +1583,47 @@ mod tests {
         state
     }
 
+    fn routed_candidate(id: &str, secret: &str, priority: u32) -> RouteCandidate {
+        RouteCandidate {
+            id: id.to_string(),
+            priority,
+            credential: HostCredential {
+                secret: secret.to_string(),
+                account_id: None,
+                kind: HostCredentialKind::ApiKey,
+                source: "test".to_string(),
+            },
+        }
+    }
+
+    async fn sequence_server(statuses: Vec<u16>) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for status in statuses {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut incoming = vec![0_u8; 16 * 1024];
+                let size = stream.read(&mut incoming).await.expect("read");
+                requests.push(String::from_utf8_lossy(&incoming[..size]).into_owned());
+                let body = if status < 400 {
+                    r#"{"id":"routed-success"}"#
+                } else {
+                    r#"{"error":{"message":"candidate unavailable"}}"#
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} Test\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.expect("write");
+            }
+            requests
+        });
+        (format!("http://{address}"), server)
+    }
+
     #[test]
     fn session_hmac_detects_tampering_and_replay() {
         let secret = crate::protocol::new_session_secret().expect("secret");
@@ -1109,6 +1636,293 @@ mod tests {
         tampered.path = "/v1/models".to_string();
         let tampered_state = state_for(&tampered, &secret);
         assert!(binding_for_request(&tampered_state, &tampered, now_ms()).is_err());
+    }
+
+    #[test]
+    fn concurrent_route_reservations_balance_equal_priority_accounts() {
+        let state = RuntimeState::default();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let handles = (0..2)
+            .map(|_| {
+                let state = state.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    reserve_route_candidates(
+                        &state,
+                        vec![
+                            routed_candidate("a", "first-account", 10),
+                            routed_candidate("b", "second-account", 10),
+                        ],
+                        ToolKind::Codex,
+                    )
+                    .expect("reserved candidates")[0]
+                        .id
+                        .clone()
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let mut primaries = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("reservation thread"))
+            .collect::<Vec<_>>();
+        primaries.sort();
+
+        assert_eq!(primaries, vec!["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn buffered_routing_fails_over_retryable_statuses_in_priority_order() {
+        for status in [401, 403, 429] {
+            let secret = crate::protocol::new_session_secret().expect("secret");
+            let request = request(&secret);
+            let state = state_for(&request, &secret);
+            let (endpoint, server) = sequence_server(vec![status, 200]).await;
+            let candidates = vec![
+                routed_candidate("primary", "first-account", 10),
+                routed_candidate("backup", "second-account", 20),
+            ];
+
+            let response = execute_host_request_routed_with(&state, request, candidates, |_| {
+                Ok(endpoint.clone())
+            })
+            .await
+            .expect("backup response");
+
+            assert_eq!(response.status_code, 200, "status {status}");
+            let requests = server.await.expect("server");
+            assert_eq!(requests.len(), 2, "status {status}");
+            assert!(requests[0].contains("authorization: Bearer first-account"));
+            assert!(requests[1].contains("authorization: Bearer second-account"));
+        }
+    }
+
+    #[tokio::test]
+    async fn buffered_post_does_not_replay_ambiguous_failures_without_idempotency() {
+        for status in [408, 500, 503] {
+            let secret = crate::protocol::new_session_secret().expect("secret");
+            let request = request(&secret);
+            let state = state_for(&request, &secret);
+            let (endpoint, server) = sequence_server(vec![status]).await;
+            let response = execute_host_request_routed_with(
+                &state,
+                request,
+                vec![
+                    routed_candidate("primary", "first-account", 10),
+                    routed_candidate("backup", "second-account", 20),
+                ],
+                |_| Ok(endpoint.clone()),
+            )
+            .await
+            .expect("ambiguous response should be returned without replay");
+
+            assert_eq!(response.status_code, status);
+            let requests = server.await.expect("server");
+            assert_eq!(requests.len(), 1, "status {status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn buffered_post_replays_ambiguous_failures_with_idempotency() {
+        for status in [408, 500, 503] {
+            let secret = crate::protocol::new_session_secret().expect("secret");
+            let mut request = request(&secret);
+            request.headers.push(RelayHeader {
+                name: "idempotency-key".to_string(),
+                value: "request-123".to_string(),
+            });
+            sign_request(&mut request, &secret).expect("resign");
+            let state = state_for(&request, &secret);
+            let (endpoint, server) = sequence_server(vec![status, 200]).await;
+            let response = execute_host_request_routed_with(
+                &state,
+                request,
+                vec![
+                    routed_candidate("primary", "first-account", 10),
+                    routed_candidate("backup", "second-account", 20),
+                ],
+                |_| Ok(endpoint.clone()),
+            )
+            .await
+            .expect("idempotent response should fail over");
+
+            assert_eq!(response.status_code, 200);
+            let requests = server.await.expect("server");
+            assert_eq!(requests.len(), 2, "status {status}");
+        }
+    }
+
+    #[test]
+    fn ambiguous_route_failures_require_an_idempotency_key_for_post() {
+        let secret = crate::protocol::new_session_secret().expect("secret");
+        let mut request = request(&secret);
+        assert!(!route_failure_allows_retry(&request, RouteFailure::Network));
+        assert!(!route_failure_allows_retry(
+            &request,
+            RouteFailure::Upstream
+        ));
+        assert!(route_failure_allows_retry(
+            &request,
+            RouteFailure::Authentication
+        ));
+        request.headers.push(RelayHeader {
+            name: "idempotency-key".to_string(),
+            value: "request-123".to_string(),
+        });
+        assert!(route_failure_allows_retry(&request, RouteFailure::Network));
+        assert!(route_failure_allows_retry(&request, RouteFailure::Upstream));
+    }
+
+    #[tokio::test]
+    async fn route_start_budget_cancels_before_trying_another_account() {
+        let secret = crate::protocol::new_session_secret().expect("secret");
+        let request = request(&secret);
+        let state = state_for(&request, &secret);
+        let mut events = Vec::new();
+        let error = execute_host_request_stream_routed_before(
+            &state,
+            request,
+            vec![
+                routed_candidate("primary", "first-account", 10),
+                routed_candidate("backup", "second-account", 20),
+            ],
+            |event| {
+                events.push(event);
+                Ok(())
+            },
+            |_| Ok("http://127.0.0.1:9".to_string()),
+            tokio::time::Instant::now() - Duration::from_millis(1),
+        )
+        .await
+        .expect_err("expired route budget");
+
+        assert!(error.contains("等待官方 API 响应超时"));
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn cooled_accounts_report_a_cooldown_instead_of_missing_credentials() {
+        let state = RuntimeState::default();
+        {
+            let mut runtime = state.inner.lock().expect("runtime");
+            runtime
+                .account_router
+                .mark_failure("primary", RouteFailure::Network, now_ms());
+        }
+        let error = reserve_route_candidates(
+            &state,
+            vec![routed_candidate("primary", "first-account", 10)],
+            ToolKind::Codex,
+        )
+        .err()
+        .expect("cooled account");
+        assert!(error.contains("暂时处于冷却期"));
+    }
+
+    #[tokio::test]
+    async fn streaming_routing_hides_failed_candidate_before_start() {
+        let secret = crate::protocol::new_session_secret().expect("secret");
+        let request = request(&secret);
+        let state = state_for(&request, &secret);
+        let (endpoint, server) = sequence_server(vec![429, 200]).await;
+        let candidates = vec![
+            routed_candidate("primary", "rate-limited", 10),
+            routed_candidate("backup", "healthy", 20),
+        ];
+        let mut events = Vec::new();
+
+        execute_host_request_stream_routed_with(
+            &state,
+            request,
+            candidates,
+            |event| {
+                events.push(event);
+                Ok(())
+            },
+            |_| Ok(endpoint.clone()),
+        )
+        .await
+        .expect("streamed backup response");
+
+        let starts = events
+            .iter()
+            .filter(|event| event.kind == RelayStreamKind::Start)
+            .collect::<Vec<_>>();
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0].status_code, Some(200));
+        assert_eq!(
+            events.last().map(|event| event.kind),
+            Some(RelayStreamKind::End)
+        );
+        let requests = server.await.expect("server");
+        assert!(requests[0].contains("authorization: Bearer rate-limited"));
+        assert!(requests[1].contains("authorization: Bearer healthy"));
+    }
+
+    #[tokio::test]
+    async fn streaming_read_failure_after_start_cools_account_without_retrying() {
+        let secret = crate::protocol::new_session_secret().expect("secret");
+        let request = request(&secret);
+        let state = state_for(&request, &secret);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut incoming = vec![0_u8; 16 * 1024];
+            let _ = stream.read(&mut incoming).await.expect("read");
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 64\r\nconnection: close\r\n\r\npartial",
+                )
+                .await
+                .expect("truncated response");
+            stream.shutdown().await.expect("shutdown");
+            tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_ok()
+        });
+        let candidates = vec![
+            routed_candidate("broken", "broken-account", 10),
+            routed_candidate("backup", "unused-backup", 20),
+        ];
+        let mut events = Vec::new();
+
+        let error = execute_host_request_stream_routed_with(
+            &state,
+            request,
+            candidates,
+            |event| {
+                events.push(event);
+                Ok(())
+            },
+            |_| Ok(format!("http://{address}")),
+        )
+        .await
+        .expect_err("truncated stream must fail");
+
+        assert!(error.contains("读取官方 API 流式响应失败"));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == RelayStreamKind::Start)
+                .count(),
+            1
+        );
+        assert!(!events
+            .iter()
+            .any(|event| event.kind == RelayStreamKind::End));
+        assert!(!server.await.expect("server"), "must not retry after Start");
+        let mut runtime = state.inner.lock().expect("runtime");
+        assert!(runtime
+            .account_router
+            .order_candidates(
+                vec![routed_candidate("broken", "broken-account", 10)],
+                now_ms()
+            )
+            .is_empty());
     }
 
     #[test]
@@ -1159,7 +1973,7 @@ mod tests {
             r#"{"tokens":{"access_token":"oauth-official","account_id":"account-1"}}"#,
         )
         .expect("write");
-        assert!(json_api_key(&path, &["/OPENAI_API_KEY"]).is_none());
+        assert!(json_api_key(ToolKind::Codex, &path, &["/OPENAI_API_KEY"]).is_none());
         let oauth = codex_oauth_credential(&path).expect("official OAuth");
         assert_eq!(oauth.kind, HostCredentialKind::CodexChatGptOAuth);
         assert_eq!(oauth.account_id.as_deref(), Some("account-1"));
@@ -1169,9 +1983,64 @@ mod tests {
         );
         std::fs::write(&path, r#"{"OPENAI_API_KEY":"sk-official"}"#).expect("write");
         assert_eq!(
-            json_api_key(&path, &["/OPENAI_API_KEY"]).as_deref(),
+            json_api_key(ToolKind::Codex, &path, &["/OPENAI_API_KEY"]).as_deref(),
             Some("sk-official")
         );
+
+        std::fs::write(
+            &path,
+            r#"{"OPENAI_API_KEY":"proxy-key","OPENAI_BASE_URL":"https://proxy.example"}"#,
+        )
+        .expect("write custom provider");
+        assert!(json_api_key(ToolKind::Codex, &path, &["/OPENAI_API_KEY"]).is_none());
+    }
+
+    #[test]
+    fn codex_oauth_requires_an_unexpired_official_access_token() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("auth.json");
+        let token = |expires_at_seconds: i64| {
+            let payload = serde_json::json!({
+                "exp": expires_at_seconds,
+                "https://api.openai.com/auth": {"chatgpt_account_id": "jwt-account"}
+            });
+            format!(
+                "header.{}.signature",
+                general_purpose::URL_SAFE_NO_PAD.encode(payload.to_string())
+            )
+        };
+
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "tokens": {"access_token": token(now_ms() / 1_000 + 30)}
+            })
+            .to_string(),
+        )
+        .expect("write expiring OAuth");
+        assert!(codex_oauth_credential(&path).is_none());
+
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "tokens": {"access_token": token(now_ms() / 1_000 + 120)}
+            })
+            .to_string(),
+        )
+        .expect("write valid OAuth");
+        let credential = codex_oauth_credential(&path).expect("valid OAuth");
+        assert_eq!(credential.account_id.as_deref(), Some("jwt-account"));
+
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "OPENAI_BASE_URL": "https://proxy.example",
+                "tokens": {"access_token": token(now_ms() / 1_000 + 120)}
+            })
+            .to_string(),
+        )
+        .expect("write custom provider OAuth");
+        assert!(codex_oauth_credential(&path).is_none());
     }
 
     #[test]

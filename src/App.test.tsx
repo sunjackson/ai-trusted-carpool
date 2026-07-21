@@ -33,6 +33,39 @@ describe('Trusted Carpool simple flow', () => {
     expect(screen.queryByText(/WebRTC|TURN|P2P|审计/)).not.toBeInTheDocument();
   });
 
+  it('uses the packaged app icon and opens debug logs after three logo clicks', () => {
+    render(<App />);
+    const logoButton = screen.getByRole('button', { name: '应用标志' });
+    const logos = screen.getAllByTestId('app-logo');
+
+    expect(logos).toHaveLength(2);
+    expect(logos[0]).toHaveAttribute('src', logos[1].getAttribute('src'));
+    fireEvent.click(logoButton);
+    fireEvent.click(logoButton);
+    expect(screen.queryByRole('dialog', { name: '调试日志' })).not.toBeInTheDocument();
+    fireEvent.click(logoButton);
+
+    expect(screen.getByRole('dialog', { name: '调试日志' })).toBeInTheDocument();
+    expect(screen.getByText('调试模式已打开')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '关闭调试模式' }));
+    expect(screen.queryByRole('dialog', { name: '调试日志' })).not.toBeInTheDocument();
+  });
+
+  it('opens local account management from the titlebar on every screen', async () => {
+    render(<App />);
+    fireEvent.click(screen.getByRole('button', { name: /我要上车/ }));
+    expect(screen.getByRole('heading', { name: '输入上车码' })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '管理本机账号' }));
+    expect(screen.getByRole('dialog', { name: '本机账号管理' })).toBeInTheDocument();
+    expect(screen.getByText('凭据只保存在这台设备')).toBeInTheDocument();
+    expect(screen.getByText(/乘客维护的账号也不会传给车主/)).toBeInTheDocument();
+    expect(await screen.findByText('还没有导入账号')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '关闭账号管理' }));
+    expect(screen.queryByRole('dialog', { name: '本机账号管理' })).not.toBeInTheDocument();
+  });
+
   it('opens one-click host setup without technical controls', async () => {
     render(<App />);
     fireEvent.click(screen.getByRole('button', { name: /我要发车/ }));

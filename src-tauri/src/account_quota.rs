@@ -1,12 +1,19 @@
+use crate::account_pool::{AccountAuthKind, AccountPool};
 use crate::models::{AccountQuotaSnapshot, AccountQuotaState, AccountQuotaWindow, ToolKind};
 use crate::relay::{
     load_host_credential, load_host_oauth_credential, HostCredential, HostCredentialKind,
 };
 use serde::Deserialize;
+use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::task::JoinSet;
 
 const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+const MAX_QUOTA_CREDENTIAL_ATTEMPTS: usize = 3;
+const QUOTA_TASK_FAILED_MESSAGE: &str = "读取官方额度任务异常结束";
+const ACCOUNT_POOL_UNAVAILABLE_MESSAGE: &str =
+    "本地账号池暂时无法读取；未找到可用于额度查询的本机 OAuth 备用登录";
 
 fn now_ms() -> i64 {
     SystemTime::now()
@@ -343,39 +350,154 @@ async fn query_codex(credential: &HostCredential) -> Result<AccountQuotaSnapshot
     parse_codex_usage(&body, now_ms())
 }
 
-pub async fn query(tool: ToolKind) -> AccountQuotaSnapshot {
-    if let Some(credential) = load_host_oauth_credential(tool) {
-        return match (tool, credential.kind) {
-            (ToolKind::Claude, HostCredentialKind::ClaudeOAuth) => query_claude(&credential)
-                .await
-                .unwrap_or_else(|error| failed(tool, error)),
-            (ToolKind::Codex, HostCredentialKind::CodexChatGptOAuth) => query_codex(&credential)
-                .await
-                .unwrap_or_else(|error| failed(tool, error)),
-            _ => failed(tool, "本机 OAuth 账号类型与工具不匹配"),
+fn quota_credentials(
+    tool: ToolKind,
+    pool_path: Option<&Path>,
+) -> (Vec<HostCredential>, bool, bool) {
+    let mut oauth = Vec::new();
+    let mut has_api_key = false;
+    let mut pool_load_failed = false;
+    if let Some(path) = pool_path {
+        match AccountPool::new(path.to_path_buf()).candidates(tool) {
+            Ok(candidates) => {
+                for candidate in candidates {
+                    match candidate.credential.auth_kind() {
+                        AccountAuthKind::ApiKey => has_api_key = true,
+                        AccountAuthKind::OAuth => {
+                            if candidate
+                                .credential
+                                .is_expired_at(now_ms().saturating_add(60_000))
+                            {
+                                continue;
+                            }
+                            oauth.push(HostCredential {
+                                secret: candidate.credential.secret().to_string(),
+                                account_id: candidate.credential.account_id().map(str::to_string),
+                                kind: match tool {
+                                    ToolKind::Claude => HostCredentialKind::ClaudeOAuth,
+                                    ToolKind::Codex => HostCredentialKind::CodexChatGptOAuth,
+                                },
+                                source: "可信拼车本地账号池".to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                pool_load_failed = true;
+                crate::diagnostics::record(
+                    "error",
+                    "account-quota",
+                    format!(
+                        "failed to read the encrypted local {} account pool for quota lookup; trying local fallback credentials",
+                        tool.command()
+                    ),
+                );
+            }
+        }
+    }
+    if let Some(local) = load_host_oauth_credential(tool) {
+        let duplicate = oauth
+            .iter()
+            .any(|credential| credential.kind == local.kind && credential.secret == local.secret);
+        if !duplicate {
+            oauth.push(local);
+        }
+    }
+    if load_host_credential(tool)
+        .is_some_and(|credential| credential.kind == HostCredentialKind::ApiKey)
+    {
+        has_api_key = true;
+    }
+    (oauth, has_api_key, pool_load_failed)
+}
+
+fn take_decidable_result<T>(
+    outcomes: &mut [Option<Result<T, String>>],
+) -> Option<Result<T, String>> {
+    let mut decision_index = None;
+    let mut last_error_index = None;
+    for (index, outcome) in outcomes.iter().enumerate() {
+        match outcome {
+            Some(Ok(_)) => {
+                decision_index = Some(index);
+                break;
+            }
+            Some(Err(_)) => last_error_index = Some(index),
+            None => return None,
+        }
+    }
+    let index = decision_index.or(last_error_index)?;
+    outcomes[index].take()
+}
+
+async fn resolve_prioritized_queries<T: Send + 'static>(
+    mut queries: JoinSet<(usize, Result<T, String>)>,
+    query_count: usize,
+) -> Option<Result<T, String>> {
+    let mut outcomes = (0..query_count).map(|_| None).collect::<Vec<_>>();
+    while let Some(joined) = queries.join_next().await {
+        if let Ok((index, result)) = joined {
+            if let Some(outcome) = outcomes.get_mut(index) {
+                *outcome = Some(result);
+            }
+            if let Some(decision) = take_decidable_result(&mut outcomes) {
+                queries.abort_all();
+                return Some(decision);
+            }
+        }
+    }
+    for outcome in &mut outcomes {
+        if outcome.is_none() {
+            *outcome = Some(Err(QUOTA_TASK_FAILED_MESSAGE.to_string()));
+        }
+    }
+    take_decidable_result(&mut outcomes)
+}
+
+pub async fn query(tool: ToolKind, pool_path: Option<&Path>) -> AccountQuotaSnapshot {
+    let (mut credentials, has_api_key, pool_load_failed) = quota_credentials(tool, pool_path);
+    credentials.truncate(MAX_QUOTA_CREDENTIAL_ATTEMPTS);
+    let query_count = credentials.len();
+    let mut queries = JoinSet::new();
+    for (index, credential) in credentials.into_iter().enumerate() {
+        queries.spawn(async move {
+            let result = match (tool, credential.kind) {
+                (ToolKind::Claude, HostCredentialKind::ClaudeOAuth) => {
+                    query_claude(&credential).await
+                }
+                (ToolKind::Codex, HostCredentialKind::CodexChatGptOAuth) => {
+                    query_codex(&credential).await
+                }
+                _ => Err("本机 OAuth 账号类型与工具不匹配".to_string()),
+            };
+            (index, result)
+        });
+    }
+    if let Some(result) = resolve_prioritized_queries(queries, query_count).await {
+        return result.unwrap_or_else(|error| failed(tool, error));
+    }
+    if pool_load_failed {
+        return failed(tool, ACCOUNT_POOL_UNAVAILABLE_MESSAGE);
+    }
+    if has_api_key {
+        return match tool {
+            ToolKind::Claude => unsupported(
+                tool,
+                "Claude API Key 官方未提供订阅额度查询；成员限额仍按本车实际 Token 统计",
+            ),
+            ToolKind::Codex => unsupported(
+                tool,
+                "OpenAI API Key 官方未提供 ChatGPT 套餐额度查询；成员限额仍按本车实际 Token 统计",
+            ),
         };
     }
-
-    let credential = load_host_credential(tool);
-    let Some(credential) = credential else {
-        return match tool {
-            ToolKind::Claude => failed(
-                tool,
-                "未检测到 Claude 官方 OAuth 登录；自定义地址或本地代理账号无法查询官方套餐额度",
-            ),
-            ToolKind::Codex => failed(tool, "未检测到 Codex 的 ChatGPT OAuth 登录，请先登录 Codex"),
-        };
-    };
-    match (tool, credential.kind) {
-        (ToolKind::Claude, HostCredentialKind::ApiKey) => unsupported(
+    match tool {
+        ToolKind::Claude => failed(
             tool,
-            "Claude API Key 官方未提供订阅额度查询；成员限额仍按本车实际 Token 统计",
+            "未检测到 Claude 官方 OAuth 登录；API Key 无法查询官方套餐额度",
         ),
-        (ToolKind::Codex, HostCredentialKind::ApiKey) => unsupported(
-            tool,
-            "OpenAI API Key 官方未提供 ChatGPT 套餐额度查询；成员限额仍按本车实际 Token 统计",
-        ),
-        _ => failed(tool, "未找到可用于套餐额度查询的官方 OAuth 登录"),
+        ToolKind::Codex => failed(tool, "未检测到 Codex 的 ChatGPT OAuth 登录，请先导入账号"),
     }
 }
 
@@ -459,5 +581,50 @@ mod tests {
             parse_rfc3339_ms("2026-07-15T16:00:00+08:00")
         );
         assert!(parse_rfc3339_ms("not-a-time").is_none());
+    }
+
+    #[test]
+    fn prioritized_results_wait_for_unresolved_higher_priority_accounts() {
+        let mut outcomes: Vec<Option<Result<&'static str, String>>> =
+            vec![None, Some(Ok("backup")), Some(Ok("later"))];
+        assert!(take_decidable_result(&mut outcomes).is_none());
+
+        outcomes[0] = Some(Err("primary failed".to_string()));
+        assert_eq!(
+            take_decidable_result(&mut outcomes).expect("decidable backup"),
+            Ok("backup")
+        );
+    }
+
+    #[test]
+    fn prioritized_results_keep_the_last_error_when_every_account_fails() {
+        let mut outcomes = vec![
+            Some(Err::<&'static str, _>("primary failed".to_string())),
+            Some(Err("backup failed".to_string())),
+        ];
+        assert_eq!(
+            take_decidable_result(&mut outcomes).expect("decidable failure"),
+            Err("backup failed".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn prioritized_queries_do_not_wait_for_pending_lower_priority_accounts() {
+        let mut queries = JoinSet::new();
+        queries.spawn(async { (0, Ok::<_, String>("primary")) });
+        queries.spawn(async {
+            std::future::pending::<()>().await;
+            (1, Ok::<_, String>("backup"))
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            resolve_prioritized_queries(queries, 2),
+        )
+        .await
+        .expect("lower-priority pending query must be aborted")
+        .expect("query result")
+        .expect("successful primary");
+        assert_eq!(result, "primary");
     }
 }
