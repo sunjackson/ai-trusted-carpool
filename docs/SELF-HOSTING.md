@@ -82,12 +82,21 @@ carpool.example.org {
 | `TRUSTED_CARPOOL_TURN_URLS` | 逗号分隔的 `turn:`/`turns:` 地址列表，**域名必须与协调服务域名一致**（客户端会校验） | 空 |
 | `TRUSTED_CARPOOL_TURN_TTL_SECONDS` | 时效凭据有效期（上限 86400） | `3600` |
 
+公开协调器默认免登录，靠签名与配额控滥用：
+
+- 邀请注册 / 发信 / 轮询 / TURN：按 IP 与 peer 身份限速
+- 每个 `owner_peer_id` 最多 16 条未过期邀请
+- TURN 必须 `POST /api/v1/turn-credentials`，请求体携带设备身份签名（证明持有对应私钥）；裸 `GET ?peer_id=` 已拒绝
+
 验证：
 
 ```bash
 curl https://carpool.example.org/api/v1/health
-curl "https://carpool.example.org/api/v1/turn-credentials?peer_id=p2p-AAAAAAAAAAAAAAAAAAAAAA"
+# TURN 需客户端签名；下面仅演示旧式探测会失败（405）
+curl -i "https://carpool.example.org/api/v1/turn-credentials?peer_id=p2p-AAAAAAAAAAAAAAAAAAAAAA"
 ```
+
+客户端发车/上车时会自动签名申请 TURN，无需人工 curl。
 
 ## 2. 客户端：指向自建地址
 

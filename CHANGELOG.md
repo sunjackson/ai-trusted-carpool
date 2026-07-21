@@ -21,7 +21,8 @@
 - 开源基础设施：Apache-2.0 许可证、NOTICE、贡献指南、行为准则、安全政策、issue/PR 模板与 Dependabot 配置。
 - 使用须知与免责声明（`LEGAL.md`），应用首次启动时的一次性风险确认页。
 - Open Core 商业模式说明（`docs/BUSINESS-MODEL.md`）、自建部署指南（`docs/SELF-HOSTING.md`）与发布签名清单（`docs/RELEASE.md`）。
-- 协调服务参考实现新增 `/api/v1/turn-credentials` 接口（coturn REST API 时效凭据方案），自建 TURN 中继可用。
+- 协调服务参考实现新增 `/api/v1/turn-credentials` 接口（coturn REST API 时效凭据方案），自建 TURN 中继可用；凭据发放改为**签名 POST**（证明持有设备私钥），拒绝匿名 `GET ?peer_id=` 刷中继。
+- 公开协调器滥用防护：邀请注册、发信、轮询、TURN 按 IP/peer 限速；每个车主身份最多 16 条活跃邀请；免网站登录即可用，控成本靠配额而非账号墙。
 - 客户端的 TURN 域名校验与官方上车链接域名改为从已配置的协调服务地址派生，自建部署无需改代码（默认仍为 `p2p.cnaigc.ai`）。
 - 前端最小 i18n 骨架（默认 `zh-CN`，可选 `en`），首启确认页与欢迎页已迁移。
 - CI 安全加固：`cargo audit` 与 CodeQL（JavaScript/TypeScript + Rust）扫描；Vitest 覆盖率报告。

@@ -12,6 +12,11 @@ host can enable either or both, and each of four seats can run requests concurre
 - A twelve-character code (shown as 4-4-4) has about 60 bits of random entropy and resolves a
   signed public invite; it is not an API credential. The coordinator limits invite resolution to
   60 attempts per minute per client IP, and every code expires with the host's schedule.
+- Public coordinator abuse controls (no website login required): invite registration, messaging,
+  polling, and TURN credential minting are rate-limited per IP and per peer identity; each owner
+  may hold a bounded number of active invites. TURN credentials are issued only after a signed
+  proof of possession of the device identity (POST `/api/v1/turn-credentials`), so anonymous
+  scrapers cannot mint relay credentials from a guessed `peer_id`.
 - A passenger creates a local P-256/X25519 identity. The host encrypts the seat access grant to
   that identity after the passenger claims the invite.
 - Every accepted claim receives a separate 256-bit session secret bound to the passenger identity;

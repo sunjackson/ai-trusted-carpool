@@ -1,4 +1,5 @@
 import { execFile, spawn } from 'node:child_process';
+import { createHash, createSign, generateKeyPairSync } from 'node:crypto';
 import { lookup } from 'node:dns/promises';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { createServer } from 'node:net';
@@ -57,6 +58,70 @@ const waitFor = async (operation, timeoutMs, label) => {
   throw new Error(`${label}超时: ${lastError ?? 'unknown'}`);
 };
 
+const peerIdFromPublicKey = publicKeyBase64 => {
+  const bytes = Buffer.from(publicKeyBase64, 'base64');
+  const hash = createHash('sha256').update(bytes).digest().subarray(0, 16);
+  return `p2p-${hash.toString('base64url')}`;
+};
+
+const ephemeralPeerIdentity = () => {
+  const { publicKey, privateKey } = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+  const spki = publicKey.export({ format: 'der', type: 'spki' });
+  const raw = spki.subarray(spki.length - 65);
+  const publicKeyBase64 = raw.toString('base64');
+  return {
+    peerId: peerIdFromPublicKey(publicKeyBase64),
+    publicKey: publicKeyBase64,
+    sign(payload) {
+      const signer = createSign('SHA256');
+      signer.update(payload);
+      signer.end();
+      return signer.sign(privateKey).toString('base64');
+    },
+  };
+};
+
+const fetchOfficialTurnCredentials = async () => {
+  const peer = ephemeralPeerIdentity();
+  const body = {
+    peer_id: peer.peerId,
+    public_key: peer.publicKey,
+    timestamp_ms: Date.now(),
+  };
+  body.signature = peer.sign(JSON.stringify({
+    peer_id: body.peer_id,
+    public_key: body.public_key,
+    timestamp_ms: body.timestamp_ms,
+  }));
+  const credentialUrl = 'https://p2p.cnaigc.ai/api/v1/turn-credentials';
+  try {
+    const { stdout } = await execFileAsync('curl', [
+      '--fail',
+      '--silent',
+      '--show-error',
+      '-X', 'POST',
+      '-H', 'content-type: application/json',
+      '--data-binary', JSON.stringify(body),
+      credentialUrl,
+    ]);
+    return JSON.parse(stdout);
+  } catch (postError) {
+    // Transition: older coordinators only expose unsigned GET. Remove once
+    // the official relay requires signed POST everywhere.
+    try {
+      const { stdout } = await execFileAsync('curl', [
+        '--fail',
+        '--silent',
+        '--show-error',
+        `${credentialUrl}?peer_id=${encodeURIComponent(peer.peerId)}`,
+      ]);
+      return JSON.parse(stdout);
+    } catch {
+      throw postError;
+    }
+  }
+};
+
 const connectCdp = async webSocketUrl => {
   const socket = new WebSocket(webSocketUrl);
   await new Promise((resolveOpen, reject) => {
@@ -112,16 +177,7 @@ try {
     if (!response.ok) throw new Error(String(response.status));
   }, 20_000, 'Vite');
 
-  const peerId = `p2p-e2e-${Date.now()}`;
-  const credentialUrl =
-    `https://p2p.cnaigc.ai/api/v1/turn-credentials?peer_id=${encodeURIComponent(peerId)}`;
-  const { stdout: credentialJson } = await execFileAsync('curl', [
-    '--fail',
-    '--silent',
-    '--show-error',
-    credentialUrl,
-  ]);
-  const rawTurn = JSON.parse(credentialJson);
+  const rawTurn = await fetchOfficialTurnCredentials();
   const rawUrls = Array.isArray(rawTurn.urls) ? rawTurn.urls : [rawTurn.urls];
   const turn = {
     ...rawTurn,

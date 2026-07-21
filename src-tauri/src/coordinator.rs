@@ -7,6 +7,13 @@ use std::env;
 const DEFAULT_COORDINATOR_URL: &str = "https://p2p.cnaigc.ai";
 const MESSAGE_TTL_MS: i64 = 120_000;
 
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis() as i64
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublicInvitePayload {
     pub version: u8,
@@ -122,6 +129,21 @@ pub struct IceServer {
     pub urls: Vec<String>,
     pub username: Option<String>,
     pub credential: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct TurnCredentialsInput {
+    peer_id: String,
+    public_key: String,
+    timestamp_ms: i64,
+    signature: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SignableTurnCredentials<'a> {
+    peer_id: &'a str,
+    public_key: &'a str,
+    timestamp_ms: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -457,21 +479,59 @@ impl CoordinatorClient {
             .map_err(|error| format!("协调消息格式无效: {error}"))
     }
 
-    pub async fn ice_servers(&self, peer_id: &str) -> Result<Vec<IceServer>, String> {
+    pub async fn ice_servers(&self, identity: &DeviceIdentity) -> Result<Vec<IceServer>, String> {
+        let public = identity.public();
+        let timestamp_ms = now_ms();
+        let signable = SignableTurnCredentials {
+            peer_id: &public.peer_id,
+            public_key: &public.public_key,
+            timestamp_ms,
+        };
+        let signature = identity.sign(
+            &serde_json::to_vec(&signable)
+                .map_err(|error| format!("无法编码 TURN 凭据签名: {error}"))?,
+        )?;
+        let input = TurnCredentialsInput {
+            peer_id: public.peer_id.clone(),
+            public_key: public.public_key,
+            timestamp_ms,
+            signature,
+        };
         let response = self
             .client
-            .get(format!("{}/api/v1/turn-credentials", self.base_url))
-            .query(&[("peer_id", peer_id)])
+            .post(format!("{}/api/v1/turn-credentials", self.base_url))
+            .json(&input)
             .send()
             .await
             .map_err(|error| format!("无法获取 TURN 中继凭据: {error}"))?;
-        if !response.status().is_success() {
+        let credentials = if response.status().is_success() {
+            response
+                .json::<TurnCredentialsResponse>()
+                .await
+                .map_err(|error| format!("TURN 中继凭据格式无效: {error}"))?
+        } else if matches!(
+            response.status(),
+            reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
+        ) {
+            // Transition: older coordinators only accept unsigned GET.
+            drop(response);
+            let legacy = self
+                .client
+                .get(format!("{}/api/v1/turn-credentials", self.base_url))
+                .query(&[("peer_id", public.peer_id.as_str())])
+                .send()
+                .await
+                .map_err(|error| format!("无法获取 TURN 中继凭据: {error}"))?;
+            if !legacy.status().is_success() {
+                return Err(Self::response_error(legacy).await);
+            }
+            legacy
+                .json::<TurnCredentialsResponse>()
+                .await
+                .map_err(|error| format!("TURN 中继凭据格式无效: {error}"))?
+        } else {
             return Err(Self::response_error(response).await);
-        }
-        let credentials = response
-            .json::<TurnCredentialsResponse>()
-            .await
-            .map_err(|error| format!("TURN 中继凭据格式无效: {error}"))?;
+        };
         if credentials.urls.is_empty()
             || credentials
                 .urls
@@ -530,10 +590,7 @@ mod tests {
     use super::*;
 
     fn now_ms() -> i64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_millis() as i64
+        super::now_ms()
     }
 
     #[test]

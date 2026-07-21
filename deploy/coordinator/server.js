@@ -8,8 +8,14 @@ const DEFAULT_MAX_TTL_MS = 120_000;
 const DEFAULT_INVITE_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_BODY_BYTES = 96 * 1024;
 const MAX_INVITES = 20_000;
+const MAX_INVITES_PER_OWNER = 16;
 const MAX_MESSAGES_PER_PEER = 128;
 const DEFAULT_RESOLVE_RATE_LIMIT = 60;
+const DEFAULT_REGISTER_RATE_LIMIT = 30;
+const DEFAULT_MESSAGE_RATE_LIMIT = 120;
+const DEFAULT_MESSAGE_PEER_RATE_LIMIT = 60;
+const DEFAULT_POLL_RATE_LIMIT = 180;
+const DEFAULT_TURN_RATE_LIMIT = 30;
 const RATE_WINDOW_MS = 60_000;
 const DEFAULT_TURN_TTL_SECONDS = 3600;
 const MAX_TURN_TTL_SECONDS = 24 * 60 * 60;
@@ -192,6 +198,14 @@ function canonicalPoll(input) {
   });
 }
 
+function canonicalTurnCredentials(input) {
+  return JSON.stringify({
+    peer_id: input.peer_id,
+    public_key: input.public_key,
+    timestamp_ms: input.timestamp_ms,
+  });
+}
+
 function validateInvite(input, clock) {
   if (!validCode(input.code)) return 'invalid code';
   if (!validPeerId(input.owner_peer_id)) return 'invalid owner_peer_id';
@@ -223,6 +237,12 @@ function validatePoll(input, clock) {
   return verifyPeerSignature(input.peer_id, input.public_key, canonicalPoll(input), input.signature);
 }
 
+function validateTurnCredentials(input, clock) {
+  if (!validPeerId(input.peer_id)) return 'invalid peer_id';
+  if (!Number.isSafeInteger(input.timestamp_ms) || Math.abs(clock - input.timestamp_ms) > 300_000) return 'stale timestamp_ms';
+  return verifyPeerSignature(input.peer_id, input.public_key, canonicalTurnCredentials(input), input.signature);
+}
+
 function createCoordinator(options = {}) {
   const invites = new Map();
   const mailboxes = new Map();
@@ -231,6 +251,12 @@ function createCoordinator(options = {}) {
   const clock = options.clock || nowMs;
   const trustProxy = options.trustProxy ?? process.env.TRUSTED_CARPOOL_TRUST_PROXY === '1';
   const resolveRateLimit = options.resolveRateLimit ?? DEFAULT_RESOLVE_RATE_LIMIT;
+  const registerRateLimit = options.registerRateLimit ?? DEFAULT_REGISTER_RATE_LIMIT;
+  const messageRateLimit = options.messageRateLimit ?? DEFAULT_MESSAGE_RATE_LIMIT;
+  const messagePeerRateLimit = options.messagePeerRateLimit ?? DEFAULT_MESSAGE_PEER_RATE_LIMIT;
+  const pollRateLimit = options.pollRateLimit ?? DEFAULT_POLL_RATE_LIMIT;
+  const turnRateLimit = options.turnRateLimit ?? DEFAULT_TURN_RATE_LIMIT;
+  const maxInvitesPerOwner = options.maxInvitesPerOwner ?? MAX_INVITES_PER_OWNER;
   const turnSecret = options.turnSecret ?? process.env.TRUSTED_CARPOOL_TURN_SECRET ?? '';
   const turnUrls = options.turnUrls ?? parseTurnUrls(process.env.TRUSTED_CARPOOL_TURN_URLS);
   const configuredTurnTtl = Number(
@@ -260,6 +286,24 @@ function createCoordinator(options = {}) {
     return existing.count <= limit;
   }
 
+  function activeInviteCountForOwner(ownerPeerId) {
+    let count = 0;
+    for (const invite of invites.values()) {
+      if (invite.owner_peer_id === ownerPeerId) count += 1;
+    }
+    return count;
+  }
+
+  function issueTurnCredentials(peerId, res) {
+    const credentials = turnRestCredentials(turnSecret, peerId, turnTtlSeconds, clock());
+    return json(res, 200, {
+      urls: turnUrls,
+      username: credentials.username,
+      credential: credentials.credential,
+      ttl_seconds: turnTtlSeconds,
+    });
+  }
+
   function cleanup() {
     const now = clock();
     for (const [code, invite] of invites) if (invite.expires_at_ms <= now) invites.delete(code);
@@ -278,22 +322,28 @@ function createCoordinator(options = {}) {
       return json(res, 200, { ok: true, invites: invites.size, messages: [...mailboxes.values()].reduce((sum, list) => sum + list.length, 0), now_ms: clock() });
     }
 
+    // Unsigned GET is rejected: callers must prove possession of the peer
+    // identity with a signed POST so anonymous scrapers cannot mint TURN.
     if (req.method === 'GET' && url.pathname === '/api/v1/turn-credentials') {
+      return error(res, 405, 'turn credentials require a signed POST', { allow: 'POST' });
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/v1/turn-credentials') {
       if (!turnSecret || turnUrls.length === 0) {
         return error(res, 404, 'turn relay is not configured');
       }
-      if (!allowRate(`turn:${clientIp(req)}`, resolveRateLimit)) {
+      const ip = clientIp(req);
+      if (!allowRate(`turn:${ip}`, turnRateLimit)) {
         return error(res, 429, 'too many turn credential requests', { 'retry-after': '60' });
       }
-      const peerId = url.searchParams.get('peer_id');
-      if (!validPeerId(peerId)) return error(res, 400, 'invalid peer_id');
-      const credentials = turnRestCredentials(turnSecret, peerId, turnTtlSeconds, clock());
-      return json(res, 200, {
-        urls: turnUrls,
-        username: credentials.username,
-        credential: credentials.credential,
-        ttl_seconds: turnTtlSeconds,
-      });
+      let input;
+      try { input = await readJson(req); } catch (cause) { return error(res, cause.statusCode || 400, cause.message); }
+      const validation = validateTurnCredentials(input, clock());
+      if (validation) return error(res, 400, validation);
+      if (!allowRate(`turn-peer:${input.peer_id}`, turnRateLimit)) {
+        return error(res, 429, 'too many turn credential requests for peer', { 'retry-after': '60' });
+      }
+      return issueTurnCredentials(input.peer_id, res);
     }
 
     const joinMatch = url.pathname.match(/^(?:\/join|\/api\/v1\/carpool\/join)\/([A-HJ-NP-Z2-9]{12})$/);
@@ -306,13 +356,23 @@ function createCoordinator(options = {}) {
     }
 
     if (req.method === 'POST' && url.pathname === '/api/v1/carpool/invites') {
+      const ip = clientIp(req);
+      if (!allowRate(`register:${ip}`, registerRateLimit)) {
+        return error(res, 429, 'too many invite registrations', { 'retry-after': '60' });
+      }
       let input;
       try { input = await readJson(req); } catch (cause) { return error(res, cause.statusCode || 400, cause.message); }
       const validation = validateInvite(input, clock());
       if (validation) return error(res, 400, validation);
+      if (!allowRate(`register-peer:${input.owner_peer_id}`, registerRateLimit)) {
+        return error(res, 429, 'too many invite registrations for peer', { 'retry-after': '60' });
+      }
       const existing = invites.get(input.code);
       if (existing && existing.owner_peer_id !== input.owner_peer_id) return error(res, 409, 'code collision');
       if (!existing && invites.size >= MAX_INVITES) return error(res, 503, 'invite capacity reached');
+      if (!existing && activeInviteCountForOwner(input.owner_peer_id) >= maxInvitesPerOwner) {
+        return error(res, 429, 'owner invite quota reached');
+      }
       const record = { ...input, signature: input.signature, registered_at_ms: clock() };
       invites.set(input.code, record);
       return json(res, 200, { registered: true, invite: record });
@@ -329,10 +389,17 @@ function createCoordinator(options = {}) {
     }
 
     if (req.method === 'POST' && url.pathname === '/api/v1/carpool/messages') {
+      const ip = clientIp(req);
+      if (!allowRate(`message:${ip}`, messageRateLimit)) {
+        return error(res, 429, 'too many messages', { 'retry-after': '60' });
+      }
       let input;
       try { input = await readJson(req); } catch (cause) { return error(res, cause.statusCode || 400, cause.message); }
       const validation = validateMessage(input, clock());
       if (validation) return error(res, 400, validation);
+      if (!allowRate(`message-peer:${input.from_peer_id}`, messagePeerRateLimit)) {
+        return error(res, 429, 'too many messages from peer', { 'retry-after': '60' });
+      }
       const replayFingerprint = crypto.createHash('sha256')
         .update(`${input.from_peer_id}\n${input.signature}`)
         .digest('base64url');
@@ -360,6 +427,10 @@ function createCoordinator(options = {}) {
     }
 
     if (req.method === 'POST' && url.pathname === '/api/v1/carpool/messages/poll') {
+      const ip = clientIp(req);
+      if (!allowRate(`poll:${ip}`, pollRateLimit)) {
+        return error(res, 429, 'too many polls', { 'retry-after': '60' });
+      }
       let input;
       try { input = await readJson(req); } catch (cause) { return error(res, cause.statusCode || 400, cause.message); }
       const validation = validatePoll(input, clock());
@@ -392,6 +463,7 @@ module.exports = {
   canonicalInvite,
   canonicalMessage,
   canonicalPoll,
+  canonicalTurnCredentials,
   createCoordinator,
   joinPage,
   peerIdFromPublicKey,

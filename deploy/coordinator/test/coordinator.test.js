@@ -8,6 +8,7 @@ const {
   canonicalInvite,
   canonicalMessage,
   canonicalPoll,
+  canonicalTurnCredentials,
   createCoordinator,
   peerIdFromPublicKey,
 } = require('../server');
@@ -158,15 +159,19 @@ test('rate limits invite enumeration by source address', async () => {
   }, { resolveRateLimit: 2 });
 });
 
-test('issues verifiable time-limited turn credentials bound to a peer', async () => {
+test('issues verifiable time-limited turn credentials only with a peer proof', async () => {
   const secret = 'test-shared-turn-secret';
   const urls = ['turn:relay.example.com:3478?transport=udp', 'turns:relay.example.com:5349'];
   await withServer(async base => {
     const peer = identity();
     const before = Math.floor(Date.now() / 1000);
-    const response = await request(
-      `${base}/api/v1/turn-credentials?peer_id=${encodeURIComponent(peer.peerId)}`
-    );
+    const requestBody = {
+      peer_id: peer.peerId,
+      public_key: peer.publicKey,
+      timestamp_ms: Date.now(),
+    };
+    requestBody.signature = peer.sign(canonicalTurnCredentials(requestBody));
+    const response = await request(`${base}/api/v1/turn-credentials`, 'POST', requestBody);
     assert.equal(response.status, 200);
     assert.deepEqual(response.body.urls, urls);
     assert.equal(response.body.ttl_seconds, 120);
@@ -181,24 +186,43 @@ test('issues verifiable time-limited turn credentials bound to a peer', async ()
       .update(response.body.username)
       .digest('base64');
     assert.equal(response.body.credential, expected);
+
+    assert.equal((await request(`${base}/api/v1/turn-credentials?peer_id=${encodeURIComponent(peer.peerId)}`)).status, 405);
   }, { turnSecret: secret, turnUrls: urls, turnTtlSeconds: 120 });
 });
 
-test('rejects turn credential requests with an invalid peer id', async () => {
+test('rejects turn credential requests without a valid peer proof', async () => {
   await withServer(async base => {
-    const missing = await request(`${base}/api/v1/turn-credentials`);
+    const peer = identity();
+    const missing = await request(`${base}/api/v1/turn-credentials`, 'POST', {});
     assert.equal(missing.status, 400);
-    const malformed = await request(`${base}/api/v1/turn-credentials?peer_id=not-a-peer`);
+    const malformed = await request(`${base}/api/v1/turn-credentials`, 'POST', {
+      peer_id: 'not-a-peer',
+      public_key: peer.publicKey,
+      timestamp_ms: Date.now(),
+      signature: 'aa',
+    });
     assert.equal(malformed.status, 400);
+    const unsigned = {
+      peer_id: peer.peerId,
+      public_key: peer.publicKey,
+      timestamp_ms: Date.now(),
+      signature: 'not-a-signature',
+    };
+    assert.equal((await request(`${base}/api/v1/turn-credentials`, 'POST', unsigned)).status, 400);
   }, { turnSecret: 'test-shared-turn-secret', turnUrls: ['turn:relay.example.com:3478?transport=udp'] });
 });
 
 test('reports turn relay as unconfigured without a shared secret', async () => {
   await withServer(async base => {
     const peer = identity();
-    const response = await request(
-      `${base}/api/v1/turn-credentials?peer_id=${encodeURIComponent(peer.peerId)}`
-    );
+    const body = {
+      peer_id: peer.peerId,
+      public_key: peer.publicKey,
+      timestamp_ms: Date.now(),
+    };
+    body.signature = peer.sign(canonicalTurnCredentials(body));
+    const response = await request(`${base}/api/v1/turn-credentials`, 'POST', body);
     assert.equal(response.status, 404);
     assert.match(response.body.error, /not configured/);
   }, { turnSecret: '', turnUrls: [] });
@@ -207,15 +231,103 @@ test('reports turn relay as unconfigured without a shared secret', async () => {
 test('rate limits turn credential requests by source address', async () => {
   await withServer(async base => {
     const peer = identity();
-    const target = `${base}/api/v1/turn-credentials?peer_id=${encodeURIComponent(peer.peerId)}`;
-    assert.equal((await request(target)).status, 200);
-    assert.equal((await request(target)).status, 200);
-    const limited = await request(target);
+    async function signedTurn() {
+      const body = {
+        peer_id: peer.peerId,
+        public_key: peer.publicKey,
+        timestamp_ms: Date.now(),
+      };
+      body.signature = peer.sign(canonicalTurnCredentials(body));
+      return request(`${base}/api/v1/turn-credentials`, 'POST', body);
+    }
+    assert.equal((await signedTurn()).status, 200);
+    assert.equal((await signedTurn()).status, 200);
+    const limited = await signedTurn();
     assert.equal(limited.status, 429);
     assert.match(limited.body.error, /too many/);
   }, {
-    resolveRateLimit: 2,
+    turnRateLimit: 2,
     turnSecret: 'test-shared-turn-secret',
     turnUrls: ['turn:relay.example.com:3478?transport=udp'],
   });
+});
+
+test('rate limits invite registration and enforces per-owner quota', async () => {
+  await withServer(async base => {
+    const owner = identity();
+    const now = Date.now();
+    async function register(code, seatNo) {
+      const invite = {
+        code,
+        owner_peer_id: owner.peerId,
+        owner_public_key: owner.publicKey,
+        owner_encryption_public_key: owner.encryptionPublicKey,
+        car_id: crypto.randomUUID(),
+        seat_no: seatNo,
+        payload_base64: Buffer.from(JSON.stringify({ car_name: '配额测试' })).toString('base64'),
+        expires_at_ms: now + 60_000,
+        timestamp_ms: now,
+      };
+      invite.signature = owner.sign(canonicalInvite(invite));
+      return request(`${base}/api/v1/carpool/invites`, 'POST', invite);
+    }
+    assert.equal((await register('7G2K5LQ8M4TZ', 1)).status, 200);
+    assert.equal((await register('M9Q3TP7W6KXR', 2)).status, 200);
+    const limited = await register('ABCD2345EFGH', 3);
+    assert.equal(limited.status, 429);
+    assert.match(limited.body.error, /too many invite registrations/);
+  }, { registerRateLimit: 2, maxInvitesPerOwner: 16 });
+});
+
+test('rejects more than the configured active invites per owner', async () => {
+  await withServer(async base => {
+    const owner = identity();
+    const now = Date.now();
+    const codes = ['7G2K5LQ8M4TZ', 'M9Q3TP7W6KXR', 'ABCD2345EFGH'];
+    for (let index = 0; index < codes.length; index += 1) {
+      const invite = {
+        code: codes[index],
+        owner_peer_id: owner.peerId,
+        owner_public_key: owner.publicKey,
+        owner_encryption_public_key: owner.encryptionPublicKey,
+        car_id: crypto.randomUUID(),
+        seat_no: (index % 4) + 1,
+        payload_base64: Buffer.from(JSON.stringify({ car_name: '名额测试' })).toString('base64'),
+        expires_at_ms: now + 60_000,
+        timestamp_ms: now,
+      };
+      invite.signature = owner.sign(canonicalInvite(invite));
+      const response = await request(`${base}/api/v1/carpool/invites`, 'POST', invite);
+      if (index < 2) assert.equal(response.status, 200);
+      else {
+        assert.equal(response.status, 429);
+        assert.match(response.body.error, /owner invite quota/);
+      }
+    }
+  }, { maxInvitesPerOwner: 2, registerRateLimit: 100 });
+});
+
+test('rate limits outbound messages by source address', async () => {
+  await withServer(async base => {
+    const passenger = identity();
+    const owner = identity();
+    async function send(kindSuffix) {
+      const message = {
+        from_peer_id: passenger.peerId,
+        to_peer_id: owner.peerId,
+        public_key: passenger.publicKey,
+        kind: 'carpool_claim',
+        payload_json: JSON.stringify({ code: '7G2K5LQ8M4TZ', nickname: kindSuffix }),
+        ttl_ms: 60_000,
+        timestamp_ms: Date.now(),
+      };
+      message.signature = passenger.sign(canonicalMessage(message));
+      return request(`${base}/api/v1/carpool/messages`, 'POST', message);
+    }
+    assert.equal((await send('a')).status, 200);
+    assert.equal((await send('b')).status, 200);
+    const limited = await send('c');
+    assert.equal(limited.status, 429);
+    assert.match(limited.body.error, /too many messages/);
+  }, { messageRateLimit: 2, messagePeerRateLimit: 100 });
 });

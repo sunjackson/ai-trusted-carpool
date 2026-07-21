@@ -1331,7 +1331,7 @@ fn allowed_signal_kind(kind: &str) -> bool {
 pub async fn get_ice_servers(app: AppHandle) -> Result<Vec<IceServer>, String> {
     let identity = load_or_create(&app)?;
     CoordinatorClient::from_environment()?
-        .ice_servers(&identity.peer_id)
+        .ice_servers(&identity)
         .await
 }
 
