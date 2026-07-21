@@ -3,7 +3,18 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use url::Url;
 
 pub const JOIN_LINK_EVENT: &str = "trusted-carpool:join-link";
-const OFFICIAL_JOIN_HOST: &str = "p2p.cnaigc.ai";
+const DEFAULT_JOIN_HOST: &str = "p2p.cnaigc.ai";
+
+/// The one host allowed to mint HTTPS join links. It follows the configured
+/// coordinator (`TRUSTED_CARPOOL_COORDINATOR_URL`) so self-hosted deployments
+/// work without a code change, and falls back to the official host.
+fn configured_join_host() -> String {
+    std::env::var("TRUSTED_CARPOOL_COORDINATOR_URL")
+        .ok()
+        .and_then(|value| Url::parse(value.trim()).ok())
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .unwrap_or_else(|| DEFAULT_JOIN_HOST.to_string())
+}
 
 fn normalize_code(value: &str) -> Option<String> {
     let code = value.trim().to_ascii_uppercase();
@@ -15,6 +26,10 @@ fn normalize_code(value: &str) -> Option<String> {
 }
 
 pub fn parse_join_code(raw: &str) -> Option<String> {
+    parse_join_code_for_host(raw, &configured_join_host())
+}
+
+fn parse_join_code_for_host(raw: &str, official_host: &str) -> Option<String> {
     let url = Url::parse(raw).ok()?;
     if !url.username().is_empty()
         || url.password().is_some()
@@ -24,9 +39,8 @@ pub fn parse_join_code(raw: &str) -> Option<String> {
         return None;
     }
     let is_custom_link = url.scheme() == "trusted-carpool" && url.host_str() == Some("join");
-    let is_official_link = url.scheme() == "https"
-        && url.host_str() == Some(OFFICIAL_JOIN_HOST)
-        && url.port().is_none();
+    let is_official_link =
+        url.scheme() == "https" && url.host_str() == Some(official_host) && url.port().is_none();
     if !is_custom_link && !is_official_link {
         return None;
     }
@@ -139,5 +153,40 @@ mod tests {
         );
         assert_eq!(parse_join_code("trusted-carpool://evil/7G2K5LQ8M4TZ"), None);
         assert_eq!(parse_join_code("trusted-carpool://join/AAAAAAAAAAA1"), None);
+    }
+
+    #[test]
+    fn self_hosted_join_links_follow_the_configured_coordinator_host() {
+        let code = "7G2K5LQ8M4TZ";
+        let host = "carpool.example.org";
+        assert_eq!(
+            parse_join_code_for_host(
+                &format!("https://carpool.example.org/api/v1/carpool/join/{code}"),
+                host
+            ),
+            Some(code.to_string())
+        );
+        assert_eq!(
+            parse_join_code_for_host(&format!("https://carpool.example.org/join/{code}"), host),
+            Some(code.to_string())
+        );
+        // With a self-hosted coordinator configured, links from the official
+        // host are no longer accepted, and vice versa.
+        assert_eq!(
+            parse_join_code_for_host(&format!("https://p2p.cnaigc.ai/join/{code}"), host),
+            None
+        );
+        assert_eq!(
+            parse_join_code_for_host(
+                &format!("https://carpool.example.org/join/{code}"),
+                DEFAULT_JOIN_HOST
+            ),
+            None
+        );
+        // Custom-scheme deep links stay valid regardless of the host.
+        assert_eq!(
+            parse_join_code_for_host(&format!("trusted-carpool://join/{code}"), host),
+            Some(code.to_string())
+        );
     }
 }

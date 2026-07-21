@@ -1,10 +1,30 @@
 import '@testing-library/jest-dom/vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from './App';
 
+const RISK_ACK_KEY = 'trusted-carpool:risk-acknowledged';
+
 describe('Trusted Carpool simple flow', () => {
+  beforeEach(() => window.localStorage.setItem(RISK_ACK_KEY, '1'));
   afterEach(() => cleanup());
+
+  it('asks for a one-time risk acknowledgement on first launch', () => {
+    window.localStorage.removeItem(RISK_ACK_KEY);
+    render(<App />);
+    expect(screen.getByRole('heading', { name: /共享账号有被封禁的风险/ })).toBeInTheDocument();
+    expect(screen.getByText(/不允许把账号提供给他人使用/)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /我要发车/ })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: /我已知悉风险，继续/ }));
+    expect(screen.getByRole('button', { name: /我要发车/ })).toBeInTheDocument();
+    expect(window.localStorage.getItem(RISK_ACK_KEY)).toBe('1');
+
+    cleanup();
+    render(<App />);
+    expect(screen.queryByRole('button', { name: /我已知悉风险，继续/ })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /我要发车/ })).toBeInTheDocument();
+  });
 
   it('keeps the welcome screen focused on two actions', () => {
     render(<App />);

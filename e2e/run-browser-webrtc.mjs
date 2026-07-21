@@ -1,4 +1,5 @@
 import { execFile, spawn } from 'node:child_process';
+import { lookup } from 'node:dns/promises';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -10,10 +11,26 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const execFileAsync = promisify(execFile);
 const chromeCandidates = [
   process.env.CHROME_BIN,
+  '/usr/bin/google-chrome',
+  '/usr/bin/chromium-browser',
   '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
   '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
 ].filter(Boolean);
-const turnHostIp = process.env.TURN_HOST_IP || '192.220.24.20';
+// Pin the TURN host to a concrete address so Chrome's resolver mapping stays
+// stable for the whole run. Prefer live DNS; fall back to the last known
+// address when DNS fails or returns a proxy fake-IP (198.18.0.0/15), which
+// cannot carry TURN UDP traffic.
+const FALLBACK_TURN_IP = '192.220.24.20';
+const resolveTurnHostIp = async () => {
+  if (process.env.TURN_HOST_IP) return process.env.TURN_HOST_IP;
+  try {
+    const { address } = await lookup('p2p.cnaigc.ai', { family: 4 });
+    return /^198\.1[89]\./.test(address) ? FALLBACK_TURN_IP : address;
+  } catch {
+    return FALLBACK_TURN_IP;
+  }
+};
+const turnHostIp = await resolveTurnHostIp();
 
 const freePort = () =>
   new Promise((resolvePort, reject) => {

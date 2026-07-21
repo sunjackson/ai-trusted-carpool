@@ -1,0 +1,21 @@
+Trusted Carpool (可信拼车)
+Copyright 2026 CNAIGC and the Trusted Carpool contributors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product includes ideas and protocol references from the following
+independent projects. No source code from these projects is redistributed:
+
+- Sub2API (https://github.com/Wei-Shaw/sub2api)
+  The upstream shapes of the Claude OAuth usage endpoint and the
+  ChatGPT/Codex usage endpoint used for subscription quota visibility
+  follow the behavior documented by the Sub2API implementation.
+
+- CC Switch (https://github.com/farion1231/cc-switch)
+  The approach for safely switching official desktop client
+  configurations (backup before write, restore on exit) is inspired by
+  CC Switch.
+
+"Claude" and "Claude Code" are trademarks of Anthropic PBC.
+"ChatGPT" and "Codex" are trademarks of OpenAI. This project is not
+affiliated with, endorsed by, or sponsored by Anthropic or OpenAI.

@@ -1,0 +1,61 @@
+name: Bug 报告
+description: 报告一个可复现的问题（安全漏洞请走私密渠道，不要在这里提交）
+title: "[Bug] "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈！**安全漏洞请不要在此公开提交**，请使用仓库 Security 标签页的私密报告渠道（见 SECURITY.md）。
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 发生了什么
+      description: 清晰描述问题现象，以及你期望的正确行为。
+      placeholder: 例如：乘客上车成功，但打开 Claude 终端时提示……
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      placeholder: |
+        1. 车主选择 Claude Code 并开始发车
+        2. 乘客粘贴上车码……
+        3. ……
+    validations:
+      required: true
+  - type: dropdown
+    id: role
+    attributes:
+      label: 问题发生在哪一侧
+      options:
+        - 车主（发车端）
+        - 乘客（上车端）
+        - 两侧都有
+        - 不确定
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: 应用版本
+      placeholder: 例如 0.1.0（关于页或安装包文件名）
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: 操作系统
+      options:
+        - macOS（Apple Silicon）
+        - macOS（Intel）
+        - Windows
+        - Linux
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 相关日志或截图
+      description: 请先移除任何昵称、上车码等敏感信息。

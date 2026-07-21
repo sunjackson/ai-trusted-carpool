@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
+  AppUpdateInfo,
   CarSession,
   JoinPreview,
   MemberTokenLimits,
@@ -9,6 +10,7 @@ import type {
   Seat,
   SeatUsageSummary,
   ToolDetection,
+  ToolInstallProgress,
   ToolKind,
   LaunchMode,
 } from './types';
@@ -16,11 +18,30 @@ import type {
 const inTauri = (): boolean => '__TAURI_INTERNALS__' in window;
 const JOIN_LINK_EVENT = 'trusted-carpool:join-link';
 const JOIN_CODE_PATTERN = /^[A-HJ-NP-Z2-9]{12}$/;
+const DEFAULT_COORDINATOR_URL = 'https://p2p.cnaigc.ai';
+
+// Self-hosted builds point elsewhere via VITE_TRUSTED_CARPOOL_COORDINATOR_URL
+// (see docs/SELF-HOSTING.md); the Rust side follows TRUSTED_CARPOOL_COORDINATOR_URL.
+export function coordinatorBaseUrl(): string {
+  const configured = import.meta.env.VITE_TRUSTED_CARPOOL_COORDINATOR_URL;
+  if (typeof configured === 'string' && configured.trim()) {
+    return configured.trim().replace(/\/+$/, '');
+  }
+  return DEFAULT_COORDINATOR_URL;
+}
+
+export function coordinatorHost(): string {
+  try {
+    return new URL(coordinatorBaseUrl()).host;
+  } catch {
+    return new URL(DEFAULT_COORDINATOR_URL).host;
+  }
+}
 
 export function serverJoinUrl(code: string): string {
   const normalized = code.trim().toUpperCase();
   if (!JOIN_CODE_PATTERN.test(normalized)) throw new Error('上车码格式不正确');
-  return `https://p2p.cnaigc.ai/api/v1/carpool/join/${normalized}`;
+  return `${coordinatorBaseUrl()}/api/v1/carpool/join/${normalized}`;
 }
 
 export async function takePendingJoinCode(): Promise<string | null> {
@@ -45,6 +66,11 @@ const demoTools: ToolDetection[] = [
     executablePath: '/usr/local/bin/claude',
     configPath: '~/.claude',
     detail: '已就绪',
+    version: 'v2.1.178',
+    npmAvailable: true,
+    managedByApp: false,
+    latestVersion: null,
+    updateAvailable: false,
     desktopSupported: true,
     desktopInstalled: true,
     desktopPath: '/Applications/Claude.app',
@@ -58,6 +84,11 @@ const demoTools: ToolDetection[] = [
     executablePath: '/usr/local/bin/codex',
     configPath: '~/.codex/auth.json',
     detail: '已就绪',
+    version: 'v0.140.0',
+    npmAvailable: true,
+    managedByApp: false,
+    latestVersion: null,
+    updateAvailable: false,
     desktopSupported: true,
     desktopInstalled: true,
     desktopPath: '/Applications/ChatGPT.app',
@@ -234,6 +265,36 @@ let demoActiveCar: CarSession | null = null;
 
 export async function detectTools(): Promise<ToolDetection[]> {
   return inTauri() ? invoke<ToolDetection[]>('detect_tools') : demoTools;
+}
+
+export async function installTool(kind: ToolKind): Promise<ToolDetection> {
+  if (inTauri()) return invoke<ToolDetection>('install_tool', { kind });
+  const detection = demoTools.find(tool => tool.kind === kind);
+  if (!detection) throw new Error('未知工具');
+  return { ...detection, installed: true, detail: '已就绪' };
+}
+
+export async function cancelToolInstall(kind: ToolKind): Promise<boolean> {
+  return inTauri() ? invoke<boolean>('cancel_tool_install', { kind }) : false;
+}
+
+export async function checkAppUpdate(): Promise<AppUpdateInfo | null> {
+  return inTauri() ? invoke<AppUpdateInfo | null>('check_app_update') : null;
+}
+
+export async function openReleasesPage(): Promise<void> {
+  if (inTauri()) await invoke('open_releases_page');
+}
+
+const TOOL_INSTALL_PROGRESS_EVENT = 'trusted-carpool:tool-install-progress';
+
+export async function listenForToolInstallProgress(
+  onProgress: (progress: ToolInstallProgress) => void
+): Promise<UnlistenFn> {
+  if (!inTauri()) return () => undefined;
+  return listen<ToolInstallProgress>(TOOL_INSTALL_PROGRESS_EVENT, event =>
+    onProgress(event.payload)
+  );
 }
 
 export async function startCar(input: {
