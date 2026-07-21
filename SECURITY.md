@@ -24,7 +24,7 @@
 
 以下问题属于本政策范围：
 
-- 桌面客户端：凭据泄露、加密实现缺陷（`src-tauri/src/crypto.rs`、`identity.rs`）、本地代理越权（`local_proxy.rs`）、中继校验绕过（`relay.rs`，例如把请求转发到非官方地址）、深链/上车码解析绕过（`join_link.rs`）、桌面客户端配置备份恢复缺陷（`client_launcher.rs`）。
+- 桌面客户端：凭据泄露、加密实现缺陷（`src-tauri/src/crypto.rs`、`identity.rs`）、本地代理越权（`local_proxy.rs`）、中继校验绕过（`relay.rs`，例如把请求转发到非官方地址）、深链/上车码解析绕过（`join_link.rs`）、桌面客户端配置备份恢复缺陷（`client_launcher.rs`）、托管运行时下载/校验/完整性门禁绕过（`tool_provisioner.rs`，例如绕过 SHA-256 校验、诱导下载非官方地址、篡改后仍可启动）。
 - 协调服务参考实现（`deploy/coordinator/`）：签名校验绕过、限速绕过、邀请或信令伪造。
 - 构建与发布链路：CI 工作流投毒、安装包完整性。
 

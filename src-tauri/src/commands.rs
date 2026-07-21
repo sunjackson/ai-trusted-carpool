@@ -19,12 +19,13 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 use tokio::time::{sleep, Instant};
 use uuid::Uuid;
 
 const JOIN_TIMEOUT_SECONDS: u64 = 20;
 const SIGNAL_PAYLOAD_LIMIT: usize = 48 * 1024;
+const PENDING_SIGNAL_LIMIT: usize = 256;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -230,8 +231,30 @@ fn home_path(relative: &str) -> PathBuf {
         .join(relative)
 }
 
-fn detect_tool(kind: ToolKind) -> ToolDetection {
-    let executable = find_executable(kind.command());
+fn managed_tools_root(app: &AppHandle) -> Option<PathBuf> {
+    app.path().app_data_dir().ok().map(|dir| dir.join("tools"))
+}
+
+/// Resolves a launchable CLI. A user-managed system install always wins; the
+/// app-managed download is the zero-dependency fallback.
+fn resolve_tool_executable(kind: ToolKind, managed_root: Option<&Path>) -> Option<(PathBuf, bool)> {
+    if let Some(path) = find_executable(kind.command()) {
+        return Some((path, false));
+    }
+    managed_root
+        .and_then(|root| crate::tool_provisioner::managed_tool(root, kind))
+        .map(|tool| (tool.path, true))
+}
+
+fn detect_tool(kind: ToolKind, managed_root: Option<&Path>) -> ToolDetection {
+    let system_executable = find_executable(kind.command());
+    let managed = if system_executable.is_none() {
+        managed_root.and_then(|root| crate::tool_provisioner::managed_tool(root, kind))
+    } else {
+        None
+    };
+    let managed_by_app = managed.is_some();
+    let executable = system_executable.or_else(|| managed.as_ref().map(|tool| tool.path.clone()));
     let (name, config_candidates) = match kind {
         ToolKind::Claude => (
             "Claude Code",
@@ -255,13 +278,27 @@ fn detect_tool(kind: ToolKind) -> ToolDetection {
     let installed = executable.is_some();
     let authenticated = credential.is_some();
     let npm_available = find_executable("npm").is_some();
-    let version = executable
-        .as_deref()
-        .and_then(|path| crate::tool_installer::installed_version(kind, path));
+    let version = managed
+        .as_ref()
+        .map(|tool| format!("v{}", tool.version))
+        .or_else(|| {
+            executable
+                .as_deref()
+                .and_then(|path| crate::tool_installer::installed_version(kind, path))
+        });
+    let latest_version = managed_root
+        .and_then(|root| crate::tool_provisioner::latest_known_version(root, kind))
+        .map(|value| format!("v{value}"));
+    let update_available = match (&managed, &latest_version) {
+        (Some(current), Some(latest)) => crate::tool_provisioner::version_is_newer(
+            latest.trim_start_matches('v'),
+            &current.version,
+        ),
+        _ => false,
+    };
     let detail = match (installed, authenticated, local_config.is_some()) {
         (true, true, _) => "已就绪",
-        (false, _, _) if npm_available => "未安装",
-        (false, _, _) => "未安装，一键安装需要先装 Node.js",
+        (false, _, _) => "未安装",
         (true, false, true) => "已登录，但缺少官方 API Key",
         (true, false, false) => "缺少官方 API Key",
     };
@@ -278,6 +315,9 @@ fn detect_tool(kind: ToolKind) -> ToolDetection {
         detail: detail.to_string(),
         version,
         npm_available,
+        managed_by_app,
+        latest_version,
+        update_available,
         desktop_supported: desktop.supported,
         desktop_installed: desktop.installed,
         desktop_path: desktop.path,
@@ -459,7 +499,16 @@ fn handle_leave_message(
     message: &CoordinatorMessage,
 ) -> Result<(), String> {
     CoordinatorClient::verify_message(message, None, &identity.peer_id, now_ms())?;
-    let notice: LeaveNotice = serde_json::from_str(&message.payload_json)
+    // Leave notices arrive as sealed envelopes; the front-end's plain
+    // `hangup` ping (used to tear down the data channel) has no notice body
+    // and simply fails the parse below, which is fine.
+    let payload_json =
+        serde_json::from_str::<crate::crypto::EncryptedEnvelope>(&message.payload_json)
+            .map_err(|error| format!("离开消息缺少加密信封: {error}"))
+            .and_then(|envelope| {
+                crate::crypto::decrypt_signal(identity, &message.from_peer_id, &envelope)
+            })?;
+    let notice: LeaveNotice = serde_json::from_str(&payload_json)
         .map_err(|error| format!("离开消息格式无效: {error}"))?;
     if notice.version != PROTOCOL_VERSION
         || notice.passenger_peer_id != message.from_peer_id
@@ -498,11 +547,31 @@ fn handle_leave_message(
     Ok(())
 }
 
+/// Unwraps an end-to-end encrypted signaling payload and enforces the same
+/// size/shape rules on the decrypted plaintext.
+fn decrypt_signal_payload(
+    identity: &DeviceIdentity,
+    sender_peer_id: &str,
+    payload_json: &str,
+) -> Result<String, String> {
+    let envelope: crate::crypto::EncryptedEnvelope = serde_json::from_str(payload_json)
+        .map_err(|_| "WebRTC 信令缺少端到端加密信封".to_string())?;
+    let plaintext = crate::crypto::decrypt_signal(identity, sender_peer_id, &envelope)?;
+    if plaintext.len() > SIGNAL_PAYLOAD_LIMIT
+        || serde_json::from_str::<serde_json::Value>(&plaintext)
+            .map(|value| !value.is_object())
+            .unwrap_or(true)
+    {
+        return Err("WebRTC 信令格式无效或过大".to_string());
+    }
+    Ok(plaintext)
+}
+
 async fn handle_host_message(
     state: &RuntimeState,
     coordinator: &CoordinatorClient,
     identity: &DeviceIdentity,
-    message: CoordinatorMessage,
+    mut message: CoordinatorMessage,
 ) -> Result<(), String> {
     if message.kind == "hangup" {
         return handle_leave_message(state, identity, &message);
@@ -512,13 +581,8 @@ async fn handle_host_message(
         "webrtc_offer" | "webrtc_answer" | "ice_candidate"
     ) {
         CoordinatorClient::verify_message(&message, None, &identity.peer_id, now_ms())?;
-        if message.payload_json.len() > SIGNAL_PAYLOAD_LIMIT
-            || serde_json::from_str::<serde_json::Value>(&message.payload_json)
-                .map(|value| !value.is_object())
-                .unwrap_or(true)
-        {
-            return Err("WebRTC 信令格式无效或过大".to_string());
-        }
+        message.payload_json =
+            decrypt_signal_payload(identity, &message.from_peer_id, &message.payload_json)?;
         let mut runtime = state
             .inner
             .lock()
@@ -529,6 +593,10 @@ async fn handle_host_message(
             .any(|binding| binding.passenger_peer_id == message.from_peer_id)
         {
             return Err("WebRTC 信令发送者没有有效座位授权".to_string());
+        }
+        // Bound the queue so a stalled webview can never grow it unbounded.
+        if runtime.pending_signals.len() >= PENDING_SIGNAL_LIMIT {
+            runtime.pending_signals.remove(0);
         }
         runtime.pending_signals.push(message);
         return Ok(());
@@ -595,37 +663,95 @@ fn spawn_host_claim_loop(
 }
 
 #[tauri::command]
-pub async fn detect_tools() -> Result<Vec<ToolDetection>, String> {
+pub async fn detect_tools(app: AppHandle) -> Result<Vec<ToolDetection>, String> {
+    let root = managed_tools_root(&app);
+    if let Some(root) = root.clone() {
+        // Refresh update metadata in the background; detection stays instant.
+        tauri::async_runtime::spawn(crate::tool_provisioner::refresh_release_caches(root));
+    }
     Ok(vec![
-        detect_tool(ToolKind::Claude),
-        detect_tool(ToolKind::Codex),
+        detect_tool(ToolKind::Claude, root.as_deref()),
+        detect_tool(ToolKind::Codex, root.as_deref()),
     ])
 }
 
+/// Installs (or updates) a CLI with zero prerequisites: the official native
+/// binary is downloaded and verified first; npm is only a fallback when the
+/// official channel is unreachable and Node.js already exists.
 #[tauri::command]
-pub async fn install_tool(kind: ToolKind) -> Result<ToolDetection, String> {
+pub async fn install_tool(kind: ToolKind, app: AppHandle) -> Result<ToolDetection, String> {
     let guard = crate::tool_installer::InstallGuard::acquire(kind)?;
-    if find_executable(kind.command()).is_none() {
-        let npm = find_executable("npm").ok_or_else(|| {
-            format!(
-                "未找到 npm，无法一键安装。请先安装 Node.js（nodejs.org），或在终端手动执行：{}",
-                crate::tool_installer::manual_install_command(kind)
-            )
-        })?;
-        tauri::async_runtime::spawn_blocking(move || crate::tool_installer::install(kind, &npm))
-            .await
-            .map_err(|error| format!("安装任务意外中断: {error}"))??;
+    let root = managed_tools_root(&app).ok_or_else(|| "无法定位应用数据目录".to_string())?;
+    let system_install = find_executable(kind.command());
+    let managed = crate::tool_provisioner::managed_tool(&root, kind);
+    let should_provision = system_install.is_none()
+        && match &managed {
+            None => true,
+            Some(current) => crate::tool_provisioner::latest_known_version(&root, kind)
+                .is_some_and(|latest| {
+                    crate::tool_provisioner::version_is_newer(&latest, &current.version)
+                }),
+        };
+    if should_provision {
+        match crate::tool_provisioner::provision(&app, kind, &root).await {
+            Ok(_) => {}
+            Err(error) if error.contains("已取消") => return Err(error),
+            Err(native_error) if managed.is_some() => {
+                // The previous managed version stays active when an update fails.
+                return Err(format!("更新失败，已保留当前版本：{native_error}"));
+            }
+            Err(native_error) => match find_executable("npm") {
+                Some(npm) => {
+                    crate::tool_provisioner::emit_progress(&app, kind, "npm", 0, None, None);
+                    let fallback = tauri::async_runtime::spawn_blocking(move || {
+                        crate::tool_installer::install(kind, &npm)
+                    })
+                    .await
+                    .map_err(|error| format!("安装任务意外中断: {error}"))?;
+                    if let Err(npm_error) = fallback {
+                        return Err(format!(
+                            "官方直装失败：{native_error}\nnpm 备用安装也失败：{npm_error}"
+                        ));
+                    }
+                }
+                None => {
+                    return Err(format!(
+                        "{native_error}\n{}",
+                        crate::tool_provisioner::manual_install_hint(kind)
+                    ));
+                }
+            },
+        }
     }
     drop(guard);
-    let detection = detect_tool(kind);
+    let detection = detect_tool(kind, Some(&root));
     if !detection.installed {
         return Err(format!(
-            "安装已完成，但仍未检测到 {} 命令。请重启应用后重试，或在终端手动执行：{}",
+            "安装已完成，但仍未检测到 {} 命令。请重启应用后重试。{}",
             kind.command(),
-            crate::tool_installer::manual_install_command(kind)
+            crate::tool_provisioner::manual_install_hint(kind)
         ));
     }
     Ok(detection)
+}
+
+#[tauri::command]
+pub fn cancel_tool_install(kind: ToolKind) -> bool {
+    crate::tool_provisioner::request_cancel(kind)
+}
+
+#[tauri::command]
+pub async fn check_app_update(
+    app: AppHandle,
+) -> Result<Option<crate::tool_provisioner::AppUpdateInfo>, String> {
+    let root = managed_tools_root(&app).ok_or_else(|| "无法定位应用数据目录".to_string())?;
+    let current_version = app.package_info().version.to_string();
+    crate::tool_provisioner::check_app_update(&root, &current_version).await
+}
+
+#[tauri::command]
+pub fn open_releases_page() -> Result<(), String> {
+    crate::tool_provisioner::open_releases_page()
 }
 
 #[tauri::command]
@@ -639,8 +765,9 @@ pub async fn start_car(
     }
     let now = now_ms();
     validate_schedule(input.starts_at, input.ends_at, now)?;
+    let managed_root = managed_tools_root(&app);
     for kind in &input.enabled_tools {
-        let detection = detect_tool(*kind);
+        let detection = detect_tool(*kind, managed_root.as_deref());
         if !detection.installed || !detection.authenticated {
             return Err(format!("{} 尚未就绪，请先完成安装和登录", detection.name));
         }
@@ -1012,19 +1139,30 @@ pub async fn leave_car(
     crate::client_launcher::restore_access(&app, &access_id, true)?;
     let notice_json =
         serde_json::to_string(&notice).map_err(|error| format!("无法编码离开通知: {error}"))?;
-    let send_result = match CoordinatorClient::from_environment() {
-        Ok(coordinator) => {
+    // The leave notice carries the seat code and access id; seal it so the
+    // coordinator never sees that metadata in plaintext.
+    let sealed_notice = crate::crypto::encrypt_signal(
+        &identity,
+        &context.owner_peer_id,
+        &context.owner_encryption_public_key,
+        &notice_json,
+    )
+    .and_then(|envelope| {
+        serde_json::to_string(&envelope).map_err(|error| format!("无法编码离开信封: {error}"))
+    });
+    let send_result = match (CoordinatorClient::from_environment(), sealed_notice) {
+        (Ok(coordinator), Ok(sealed)) => {
             coordinator
                 .send_message(
                     &identity,
                     &context.owner_peer_id,
                     "hangup",
-                    notice_json,
+                    sealed,
                     now_ms(),
                 )
                 .await
         }
-        Err(error) => Err(error),
+        (Err(error), _) | (_, Err(error)) => Err(error),
     };
     {
         let mut runtime = state
@@ -1063,9 +1201,9 @@ fn spawn_tool(
     access: &RideAccess,
     session_secret: &str,
     work_dir: Option<&Path>,
+    executable: PathBuf,
+    managed_by_app: bool,
 ) -> Result<(), String> {
-    let executable =
-        find_executable(kind.command()).ok_or_else(|| format!("未找到 {} 命令", kind.command()))?;
     let base = format!(
         "http://127.0.0.1:{}/access/{}",
         access.local_proxy_port, access.access_id
@@ -1078,6 +1216,11 @@ fn spawn_tool(
             launch_env.insert("ANTHROPIC_API_KEY".to_string(), session_secret.to_string());
             launch_env.insert("ANTHROPIC_AUTH_TOKEN".to_string(), String::new());
             launch_env.insert("CLAUDE_CODE_OAUTH_TOKEN".to_string(), String::new());
+            if managed_by_app {
+                // The app owns updates for its managed binaries; keep the
+                // CLI's own auto-updater out of the way.
+                launch_env.insert("DISABLE_AUTOUPDATER".to_string(), "1".to_string());
+            }
             if Command::new(&executable)
                 .arg("--help")
                 .output()
@@ -1144,7 +1287,32 @@ pub async fn launch_tool(
     };
     match input.mode {
         LaunchMode::Terminal => {
-            spawn_tool(input.kind, &access, &session_secret, work_dir.as_deref())
+            let root = managed_tools_root(&app);
+            let (executable, managed_by_app) = resolve_tool_executable(input.kind, root.as_deref())
+                .ok_or_else(|| {
+                    format!("未找到 {} 命令，可先在工具页一键安装", input.kind.command())
+                })?;
+            if managed_by_app {
+                // Integrity gate: an app-managed binary must still match the
+                // checksum recorded at install time before it may run.
+                let verify_root = root
+                    .clone()
+                    .ok_or_else(|| "无法定位应用数据目录".to_string())?;
+                let kind = input.kind;
+                tauri::async_runtime::spawn_blocking(move || {
+                    crate::tool_provisioner::verify_managed_binary(&verify_root, kind)
+                })
+                .await
+                .map_err(|error| format!("完整性校验意外中断: {error}"))??;
+            }
+            spawn_tool(
+                input.kind,
+                &access,
+                &session_secret,
+                work_dir.as_deref(),
+                executable,
+                managed_by_app,
+            )
         }
         LaunchMode::Desktop => {
             crate::client_launcher::launch(&app, input.kind, &access, &session_secret)
@@ -1182,7 +1350,9 @@ pub async fn send_webrtc_signal(
         return Err("WebRTC 信令类型、格式或大小无效".to_string());
     }
     let identity = load_or_create(&app)?;
-    let authorized = {
+    // The recipient's encryption key doubles as the authorization check: only
+    // bound seats (host side) or the granting owner (passenger side) have one.
+    let recipient_encryption_key = {
         let runtime = state
             .inner
             .lock()
@@ -1190,23 +1360,31 @@ pub async fn send_webrtc_signal(
         runtime
             .host_bindings
             .values()
-            .any(|binding| binding.passenger_peer_id == input.to_peer_id)
-            || runtime
-                .passenger_contexts
-                .values()
-                .any(|context| context.owner_peer_id == input.to_peer_id)
+            .find(|binding| binding.passenger_peer_id == input.to_peer_id)
+            .map(|binding| binding.passenger_encryption_public_key.clone())
+            .or_else(|| {
+                runtime
+                    .passenger_contexts
+                    .values()
+                    .find(|context| context.owner_peer_id == input.to_peer_id)
+                    .map(|context| context.owner_encryption_public_key.clone())
+            })
     };
-    if !authorized {
+    let Some(recipient_encryption_key) = recipient_encryption_key else {
         return Err("信令目标不属于当前有效车队".to_string());
-    }
+    };
+    // SDP and ICE candidates reveal local/public IP addresses; seal them so
+    // the coordinator only relays opaque envelopes.
+    let envelope = crate::crypto::encrypt_signal(
+        &identity,
+        &input.to_peer_id,
+        &recipient_encryption_key,
+        &input.payload_json,
+    )?;
+    let sealed = serde_json::to_string(&envelope)
+        .map_err(|error| format!("无法编码信令加密信封: {error}"))?;
     CoordinatorClient::from_environment()?
-        .send_message(
-            &identity,
-            &input.to_peer_id,
-            &input.kind,
-            input.payload_json,
-            now_ms(),
-        )
+        .send_message(&identity, &input.to_peer_id, &input.kind, sealed, now_ms())
         .await
 }
 
@@ -1244,15 +1422,42 @@ pub async fn poll_webrtc_signals(
     let messages = CoordinatorClient::from_environment()?
         .poll_messages(&identity, None, now_ms())
         .await?;
+    Ok(sanitize_passenger_signals(
+        messages,
+        &identity,
+        &owner,
+        now_ms(),
+    ))
+}
+
+/// Keeps only verifiable, decryptable signals from the expected owner. The
+/// coordinator mailbox is drain-on-read, so one bad message (a stranger's
+/// spam, a stale car, a malformed envelope) must never discard the valid
+/// signals fetched in the same batch.
+fn sanitize_passenger_signals(
+    messages: Vec<CoordinatorMessage>,
+    identity: &DeviceIdentity,
+    owner: &PublicIdentity,
+    now: i64,
+) -> Vec<CoordinatorMessage> {
     let mut verified = Vec::new();
-    for message in messages {
+    for mut message in messages {
         if !allowed_signal_kind(&message.kind) {
             continue;
         }
-        CoordinatorClient::verify_message(&message, Some(&owner), &identity.peer_id, now_ms())?;
+        if CoordinatorClient::verify_message(&message, Some(owner), &identity.peer_id, now).is_err()
+        {
+            continue;
+        }
+        let Ok(plaintext) =
+            decrypt_signal_payload(identity, &message.from_peer_id, &message.payload_json)
+        else {
+            continue;
+        };
+        message.payload_json = plaintext;
         verified.push(message);
     }
-    Ok(verified)
+    verified
 }
 
 #[tauri::command]
@@ -1295,6 +1500,109 @@ mod tests {
 
     fn identity(path: &Path) -> DeviceIdentity {
         crate::identity::load_or_create_at(path).expect("identity")
+    }
+
+    fn sealed_signal(
+        sender: &DeviceIdentity,
+        recipient: &PublicIdentity,
+        kind: &str,
+        payload: &str,
+        now: i64,
+    ) -> CoordinatorMessage {
+        let envelope = crate::crypto::encrypt_signal(
+            sender,
+            &recipient.peer_id,
+            &recipient.encryption_public_key,
+            payload,
+        )
+        .expect("seal signal");
+        crate::coordinator::signed_test_message(
+            sender,
+            &recipient.peer_id,
+            kind,
+            serde_json::to_string(&envelope).expect("envelope json"),
+            now,
+        )
+    }
+
+    #[test]
+    fn one_bad_signal_never_discards_the_valid_batch() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let owner = identity(&directory.path().join("owner.json"));
+        let passenger = identity(&directory.path().join("passenger.json"));
+        let stranger = identity(&directory.path().join("stranger.json"));
+        let passenger_public = passenger.public();
+        let now = now_ms();
+
+        let valid_answer = sealed_signal(
+            &owner,
+            &passenger_public,
+            "webrtc_answer",
+            r#"{"sdp":{"type":"answer","sdp":"v=0"}}"#,
+            now,
+        );
+        // A stranger with a perfectly valid signature is still not the owner.
+        let stranger_spam = sealed_signal(
+            &stranger,
+            &passenger_public,
+            "ice_candidate",
+            r#"{"candidate":{"candidate":"spam"}}"#,
+            now,
+        );
+        // Legacy/plaintext payloads without an envelope must be dropped too.
+        let plaintext_signal = crate::coordinator::signed_test_message(
+            &owner,
+            &passenger_public.peer_id,
+            "ice_candidate",
+            r#"{"candidate":{"candidate":"plain"}}"#.to_string(),
+            now,
+        );
+        let wrong_kind = crate::coordinator::signed_test_message(
+            &owner,
+            &passenger_public.peer_id,
+            "carpool_access",
+            "{}".to_string(),
+            now,
+        );
+
+        let survivors = sanitize_passenger_signals(
+            vec![stranger_spam, plaintext_signal, wrong_kind, valid_answer],
+            &passenger,
+            &owner.public(),
+            now,
+        );
+        assert_eq!(survivors.len(), 1);
+        assert_eq!(survivors[0].kind, "webrtc_answer");
+        // Delivered payloads are already decrypted for the webview.
+        assert!(survivors[0].payload_json.contains("\"type\":\"answer\""));
+    }
+
+    #[test]
+    fn signal_payloads_are_sealed_before_reaching_the_coordinator() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let owner = identity(&directory.path().join("owner.json"));
+        let passenger = identity(&directory.path().join("passenger.json"));
+        let payload =
+            r#"{"candidate":{"candidate":"candidate:1 1 udp 2113937151 10.0.0.8 51000 typ host"}}"#;
+        let message = sealed_signal(
+            &passenger,
+            &owner.public(),
+            "ice_candidate",
+            payload,
+            now_ms(),
+        );
+        assert!(
+            !message.payload_json.contains("10.0.0.8"),
+            "coordinator-visible payload must not contain candidate IPs"
+        );
+        let plaintext = decrypt_signal_payload(&owner, &passenger.peer_id, &message.payload_json)
+            .expect("decrypt");
+        assert_eq!(plaintext, payload);
+        // The wrong recipient cannot open it.
+        let stranger = identity(&directory.path().join("stranger.json"));
+        assert!(
+            decrypt_signal_payload(&stranger, &passenger.peer_id, &message.payload_json).is_err()
+        );
     }
 
     #[test]

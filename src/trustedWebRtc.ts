@@ -17,6 +17,7 @@ import {
 } from './webrtcWire';
 
 type Role = 'host' | 'passenger';
+export type P2pConnectionState = 'connecting' | 'connected' | 'reconnecting' | 'down';
 type SignalPayload = {
   sdp?: RTCSessionDescriptionInit;
   candidate?: RTCIceCandidateInit;
@@ -33,6 +34,14 @@ type Connection = {
 
 const inTauri = (): boolean => '__TAURI_INTERNALS__' in window;
 const MAX_BUFFERED_AMOUNT = 1024 * 1024;
+const POLL_INTERVAL_MS = 700;
+const POLL_MAX_BACKOFF_MS = 5_000;
+// The host broadcasts a status snapshot every 2s; missing six in a row means
+// the link is effectively dead even if ICE has not noticed yet.
+const HEARTBEAT_TIMEOUT_MS = 12_000;
+const FAST_RECONNECT_ATTEMPTS = 6;
+const RECONNECT_MAX_BACKOFF_MS = 15_000;
+const RECONNECT_IDLE_BACKOFF_MS = 30_000;
 
 const errorMessage = (error: unknown): string => {
   if (error instanceof Error) return error.message;
@@ -51,13 +60,19 @@ class TrustedWebRtcRuntime {
   private connections = new Map<string, Connection>();
   private iceServers: RTCIceServer[] = [];
   private pollTimer: number | null = null;
+  private pollGeneration = 0;
   private statusTimer: number | null = null;
-  private pollBusy = false;
   private unlisten: UnlistenFn[] = [];
   private pendingBridge = new Map<string, RelayBridgeRequestEvent>();
   private hostRequests = new Map<string, Connection>();
   private statusListeners = new Set<(status: SharedCarStatus) => void>();
   private lastStatus: SharedCarStatus | null = null;
+  private connectionStateListeners = new Set<(state: P2pConnectionState) => void>();
+  private p2pState: P2pConnectionState = 'connected';
+  private lastSnapshotAt = 0;
+  private healthTimer: number | null = null;
+  private reconnecting = false;
+  private stopping = false;
 
   subscribeCarStatus(listener: (status: SharedCarStatus) => void): () => void {
     this.statusListeners.add(listener);
@@ -65,15 +80,27 @@ class TrustedWebRtcRuntime {
     return () => this.statusListeners.delete(listener);
   }
 
+  subscribeConnectionState(listener: (state: P2pConnectionState) => void): () => void {
+    this.connectionStateListeners.add(listener);
+    listener(this.p2pState);
+    return () => this.connectionStateListeners.delete(listener);
+  }
+
+  private setP2pState(next: P2pConnectionState): void {
+    if (this.p2pState === next) return;
+    this.p2pState = next;
+    for (const listener of this.connectionStateListeners) listener(next);
+  }
+
   async initialize(): Promise<void> {
     if (!inTauri() || this.unlisten.length > 0) return;
     const requestUnlisten = await listen<RelayBridgeRequestEvent>(
       'trusted-carpool:relay-request',
-      event => void this.handleBridgeRequest(event.payload)
+      event => void this.handleBridgeRequest(event.payload).catch(() => undefined)
     );
     const streamUnlisten = await listen<RelayStreamEvent>(
       'trusted-carpool:relay-stream-event',
-      event => void this.handleHostStreamEvent(event.payload)
+      event => void this.handleHostStreamEvent(event.payload).catch(() => undefined)
     );
     this.unlisten = [requestUnlisten, streamUnlisten];
   }
@@ -82,9 +109,11 @@ class TrustedWebRtcRuntime {
     if (!inTauri()) return;
     await this.initialize();
     this.closeConnections();
+    this.stopping = false;
     this.role = 'host';
     this.accessId = null;
     this.ownerPeerId = null;
+    this.setP2pState('connected');
     await this.loadIceServers();
     this.startPolling();
     this.startStatusBroadcast();
@@ -97,18 +126,34 @@ class TrustedWebRtcRuntime {
     }
     await this.initialize();
     this.closeConnections();
+    this.stopping = false;
     this.role = 'passenger';
     this.accessId = access.accessId;
     this.ownerPeerId = access.ownerPeerId;
     this.lastStatus = null;
+    this.setP2pState('connecting');
     await this.loadIceServers();
     this.startPolling();
-    const connection = this.createConnection(access.ownerPeerId);
+    try {
+      await this.dialOwner(access.ownerPeerId);
+    } catch (error) {
+      this.setP2pState('down');
+      throw error;
+    }
+    this.setP2pState('connected');
+    this.startHealthWatch();
+  }
+
+  /// Creates a fresh connection to the owner, sends an offer, and waits for
+  /// the data channel to open. Shared by the first join and reconnects.
+  private async dialOwner(ownerPeerId: string): Promise<void> {
+    this.removeConnection(ownerPeerId);
+    const connection = this.createConnection(ownerPeerId);
     const channel = connection.pc.createDataChannel('trusted-carpool-v1', { ordered: true });
     this.bindChannel(connection, channel);
     const offer = await connection.pc.createOffer();
     await connection.pc.setLocalDescription(offer);
-    await this.sendSignal(access.ownerPeerId, 'webrtc_offer', {
+    await this.sendSignal(ownerPeerId, 'webrtc_offer', {
       sdp: connection.pc.localDescription ?? offer,
     });
     await this.waitForOpen(connection, 20_000);
@@ -116,6 +161,7 @@ class TrustedWebRtcRuntime {
 
   async stop(): Promise<void> {
     if (!inTauri()) return;
+    this.stopping = true;
     const peers = [...this.connections.keys()];
     await Promise.allSettled(
       peers.map(peerId => this.sendSignal(peerId, 'hangup', {}))
@@ -124,6 +170,7 @@ class TrustedWebRtcRuntime {
     this.role = null;
     this.accessId = null;
     this.ownerPeerId = null;
+    this.setP2pState('connected');
   }
 
   private async loadIceServers(): Promise<void> {
@@ -136,10 +183,13 @@ class TrustedWebRtcRuntime {
   }
 
   private closeConnections(): void {
-    if (this.pollTimer !== null) window.clearInterval(this.pollTimer);
+    if (this.pollTimer !== null) window.clearTimeout(this.pollTimer);
     if (this.statusTimer !== null) window.clearInterval(this.statusTimer);
+    if (this.healthTimer !== null) window.clearInterval(this.healthTimer);
     this.pollTimer = null;
+    this.pollGeneration += 1;
     this.statusTimer = null;
+    this.healthTimer = null;
     for (const connection of this.connections.values()) {
       connection.channel?.close();
       connection.pc.close();
@@ -148,6 +198,21 @@ class TrustedWebRtcRuntime {
     this.pendingBridge.clear();
     this.hostRequests.clear();
     this.lastStatus = null;
+    this.lastSnapshotAt = 0;
+    this.reconnecting = false;
+  }
+
+  /// Closes and forgets a peer, dropping any in-flight relay bookkeeping
+  /// that pointed at the dead connection.
+  private removeConnection(peerId: string): void {
+    const connection = this.connections.get(peerId);
+    if (!connection) return;
+    connection.channel?.close();
+    connection.pc.close();
+    this.connections.delete(peerId);
+    for (const [requestId, owner] of this.hostRequests) {
+      if (owner === connection) this.hostRequests.delete(requestId);
+    }
   }
 
   private createConnection(peerId: string): Connection {
@@ -179,10 +244,79 @@ class TrustedWebRtcRuntime {
     pc.onconnectionstatechange = () => {
       if (['failed', 'closed'].includes(pc.connectionState)) {
         connection.channel?.close();
-        this.connections.delete(peerId);
+        // Only forget the peer when this pc is still the active one; a
+        // reconnect may already have replaced it.
+        if (this.connections.get(peerId)?.pc === pc) {
+          this.removeConnection(peerId);
+        }
+        this.scheduleReconnect(peerId);
+      } else if (pc.connectionState === 'disconnected') {
+        // Give ICE a moment to self-heal before tearing down.
+        window.setTimeout(() => {
+          if (
+            this.connections.get(peerId)?.pc === pc &&
+            pc.connectionState === 'disconnected'
+          ) {
+            this.removeConnection(peerId);
+            this.scheduleReconnect(peerId);
+          }
+        }, 3_000);
       }
     };
     return connection;
+  }
+
+  /// Passenger-side automatic recovery: fast retries with exponential
+  /// backoff, then slow persistent retries until the user leaves the car.
+  private scheduleReconnect(peerId: string): void {
+    if (
+      this.role !== 'passenger' ||
+      this.stopping ||
+      this.reconnecting ||
+      peerId !== this.ownerPeerId
+    ) {
+      return;
+    }
+    this.reconnecting = true;
+    this.setP2pState('reconnecting');
+    void (async () => {
+      for (let attempt = 0; !this.stopping && this.role === 'passenger'; attempt += 1) {
+        if (attempt >= FAST_RECONNECT_ATTEMPTS) this.setP2pState('down');
+        const backoff =
+          attempt >= FAST_RECONNECT_ATTEMPTS
+            ? RECONNECT_IDLE_BACKOFF_MS
+            : Math.min(1_000 * 2 ** attempt, RECONNECT_MAX_BACKOFF_MS);
+        await new Promise(resolve => window.setTimeout(resolve, backoff));
+        if (this.stopping || this.role !== 'passenger' || !this.ownerPeerId) break;
+        try {
+          // TURN credentials are time-limited; always fetch fresh ones.
+          await this.loadIceServers();
+          await this.dialOwner(this.ownerPeerId);
+          this.lastSnapshotAt = Date.now();
+          this.setP2pState('connected');
+          break;
+        } catch {
+          // Keep retrying; the host may simply be offline for a while.
+        }
+      }
+      this.reconnecting = false;
+    })();
+  }
+
+  /// Uses the host's 2-second status broadcast as an application-level
+  /// heartbeat, catching silent link death that ICE reports too late.
+  private startHealthWatch(): void {
+    if (this.healthTimer !== null) window.clearInterval(this.healthTimer);
+    this.lastSnapshotAt = Date.now();
+    this.healthTimer = window.setInterval(() => {
+      if (this.role !== 'passenger' || this.stopping || this.reconnecting) return;
+      if (this.p2pState !== 'connected') return;
+      if (Date.now() - this.lastSnapshotAt <= HEARTBEAT_TIMEOUT_MS) return;
+      const ownerPeerId = this.ownerPeerId;
+      if (!ownerPeerId) return;
+      this.removeConnection(ownerPeerId);
+      this.scheduleReconnect(ownerPeerId);
+    }, 2_000);
   }
 
   private bindChannel(connection: Connection, channel: RTCDataChannel): void {
@@ -314,6 +448,7 @@ class TrustedWebRtcRuntime {
       if (!status.carId || !status.member || !Array.isArray(status.accountQuotas)) {
         throw new Error('车队状态格式无效');
       }
+      this.lastSnapshotAt = Date.now();
       this.lastStatus = status;
       for (const listener of this.statusListeners) listener(status);
       return;
@@ -395,14 +530,19 @@ class TrustedWebRtcRuntime {
       return;
     }
     if (message.kind === 'hangup') {
-      const connection = this.connections.get(message.fromPeerId);
-      connection?.channel?.close();
-      connection?.pc.close();
-      this.connections.delete(message.fromPeerId);
+      if (this.role === 'passenger' && message.fromPeerId === this.ownerPeerId) {
+        // The owner ended the car; reconnecting would be futile.
+        this.stopping = true;
+        this.setP2pState('down');
+      }
+      this.removeConnection(message.fromPeerId);
       return;
     }
     if (this.role === 'host' && message.kind === 'webrtc_offer' && payload.sdp) {
-      if (!this.connections.has(message.fromPeerId) && this.connections.size >= 4) {
+      // A fresh offer supersedes any previous session with this passenger
+      // (for example after their app crashed and they rejoined quickly).
+      this.removeConnection(message.fromPeerId);
+      if (this.connections.size >= 4) {
         await this.sendSignal(message.fromPeerId, 'hangup', {});
         return;
       }
@@ -440,26 +580,30 @@ class TrustedWebRtcRuntime {
     }
   }
 
+  // Self-scheduling loop: polls never overlap, and coordinator outages back
+  // off exponentially (700ms up to 5s) instead of hammering at full rate.
   private startPolling(): void {
-    if (this.pollTimer !== null) window.clearInterval(this.pollTimer);
-    const poll = async () => {
-      if (this.pollBusy || !this.role) return;
-      this.pollBusy = true;
+    if (this.pollTimer !== null) window.clearTimeout(this.pollTimer);
+    const generation = (this.pollGeneration += 1);
+    let delay = POLL_INTERVAL_MS;
+    const loop = async () => {
+      if (!this.role || generation !== this.pollGeneration) return;
       try {
         const messages = await invoke<CoordinatorMessage[]>('poll_webrtc_signals', {
           accessId: this.role === 'passenger' ? this.accessId : null,
         });
+        delay = POLL_INTERVAL_MS;
         for (const message of messages) {
           await this.handleSignal(message).catch(() => undefined);
         }
       } catch {
         // Polling keeps retrying; passenger connection setup has its own visible timeout.
-      } finally {
-        this.pollBusy = false;
+        delay = Math.min(delay * 2, POLL_MAX_BACKOFF_MS);
       }
+      if (!this.role || generation !== this.pollGeneration) return;
+      this.pollTimer = window.setTimeout(() => void loop(), delay);
     };
-    void poll();
-    this.pollTimer = window.setInterval(() => void poll(), 700);
+    void loop();
   }
 
   private async handleBridgeRequest(event: RelayBridgeRequestEvent): Promise<void> {

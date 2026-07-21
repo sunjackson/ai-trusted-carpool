@@ -488,6 +488,43 @@ impl CoordinatorClient {
     }
 }
 
+/// Builds a correctly signed coordinator message for tests in other modules.
+#[cfg(test)]
+pub(crate) fn signed_test_message(
+    sender: &DeviceIdentity,
+    to_peer_id: &str,
+    kind: &str,
+    payload_json: String,
+    timestamp_ms: i64,
+) -> CoordinatorMessage {
+    let public = sender.public();
+    let signable = SignableMessage {
+        from_peer_id: &public.peer_id,
+        to_peer_id,
+        public_key: &public.public_key,
+        kind,
+        payload_json: &payload_json,
+        ttl_ms: MESSAGE_TTL_MS,
+        timestamp_ms,
+    };
+    let signature = sender
+        .sign(&serde_json::to_vec(&signable).expect("signable message"))
+        .expect("signature");
+    CoordinatorMessage {
+        id: uuid::Uuid::new_v4().to_string(),
+        from_peer_id: public.peer_id,
+        to_peer_id: to_peer_id.to_string(),
+        public_key: public.public_key,
+        kind: kind.to_string(),
+        payload_json,
+        ttl_ms: MESSAGE_TTL_MS,
+        signature,
+        timestamp_ms,
+        created_at_ms: timestamp_ms,
+        expires_at_ms: timestamp_ms + MESSAGE_TTL_MS,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

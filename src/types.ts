@@ -11,10 +11,29 @@ export type ToolDetection = {
   detail: string;
   version: string | null;
   npmAvailable: boolean;
+  managedByApp: boolean;
+  latestVersion: string | null;
+  updateAvailable: boolean;
   desktopSupported: boolean;
   desktopInstalled: boolean;
   desktopPath: string | null;
   desktopDetail: string;
+};
+
+export type AppUpdateInfo = {
+  currentVersion: string;
+  latestVersion: string;
+  releaseUrl: string;
+};
+
+export type ToolInstallPhase = 'resolving' | 'downloading' | 'verifying' | 'installing' | 'npm';
+
+export type ToolInstallProgress = {
+  kind: ToolKind;
+  phase: ToolInstallPhase;
+  receivedBytes: number;
+  totalBytes: number | null;
+  version: string | null;
 };
 
 export type ModelUsageSummary = {

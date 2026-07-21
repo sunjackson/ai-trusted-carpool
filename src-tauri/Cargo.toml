@@ -30,11 +30,15 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
+flate2 = "1.1.9"
+tar = "0.4.46"
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 [target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
 tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 
 [dev-dependencies]
+tauri = { version = "2", features = ["test"] }
 tempfile = "3"
 
 [features]

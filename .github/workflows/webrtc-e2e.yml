@@ -1,0 +1,31 @@
+name: WebRTC E2E
+
+# Exercises the real browser WebRTC path against the official coordinator and
+# TURN relay. It depends on external network services, so it runs on a
+# schedule and on demand instead of blocking every pull request.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 4 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  browser-webrtc:
+    name: Browser WebRTC against official TURN
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          # The harness uses --use-system-ca, which requires Node 22+.
+          node-version: 22
+          cache: npm
+      - name: Install frontend dependencies
+        run: npm ci
+      - name: Run browser WebRTC E2E
+        run: npm run test:webrtc:e2e
+        env:
+          CHROME_BIN: /usr/bin/google-chrome

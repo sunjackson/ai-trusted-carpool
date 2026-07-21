@@ -24,6 +24,8 @@ import {
 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  cancelToolInstall,
+  checkAppUpdate,
   coordinatorHost,
   detectTools,
   getActiveCar,
@@ -32,6 +34,8 @@ import {
   launchTool,
   leaveCar,
   listenForJoinLinks,
+  listenForToolInstallProgress,
+  openReleasesPage,
   previewInvite,
   refreshAccountQuotas,
   serverJoinUrl,
@@ -42,6 +46,7 @@ import {
 } from './api';
 import type {
   AccountQuotaSnapshot,
+  AppUpdateInfo,
   CarSession,
   JoinPreview,
   MemberTokenLimitStatus,
@@ -50,11 +55,12 @@ import type {
   SeatUsageSummary,
   SharedCarStatus,
   ToolDetection,
+  ToolInstallProgress,
   ToolKind,
   LaunchMode,
 } from './types';
 import { t } from './i18n';
-import { trustedWebRtc } from './trustedWebRtc';
+import { trustedWebRtc, type P2pConnectionState } from './trustedWebRtc';
 
 type Screen = 'welcome' | 'host-setup' | 'host-live' | 'join' | 'ready' | 'ride';
 type PendingServerJoin = { code: string; requestId: number };
@@ -154,7 +160,15 @@ function Brand() {
   );
 }
 
-function WindowShell({ children, onHome }: { children: React.ReactNode; onHome: () => void }) {
+function WindowShell({
+  children,
+  onHome,
+  appUpdate,
+}: {
+  children: React.ReactNode;
+  onHome: () => void;
+  appUpdate: AppUpdateInfo | null;
+}) {
   return (
     <main className="app-shell">
       <div className="ambient ambient--one" />
@@ -164,6 +178,15 @@ function WindowShell({ children, onHome }: { children: React.ReactNode; onHome: 
           <Brand />
         </button>
         <div className="titlebar__right">
+          {appUpdate && (
+            <button
+              className="update-pill"
+              onClick={() => void openReleasesPage().catch(() => undefined)}
+              title={`当前 v${appUpdate.currentVersion}，点击打开官方发布页`}
+            >
+              <Download size={13} /> 新版本 {appUpdate.latestVersion}
+            </button>
+          )}
           <span className="official-pill">
             <ShieldCheck size={14} /> {t('titlebar.officialOnly')}
           </span>
@@ -242,22 +265,47 @@ function Welcome({ onHost, onJoin }: { onHost: () => void; onJoin: () => void })
   );
 }
 
+const formatMegabytes = (bytes: number): string => `${Math.round(bytes / 1_000_000)} MB`;
+
+function installPhaseLabel(progress: ToolInstallProgress | null, elapsed?: number): string {
+  if (progress) {
+    if (progress.phase === 'resolving') return '获取官方版本...';
+    if (progress.phase === 'downloading') {
+      if (progress.totalBytes) {
+        const percent = Math.min(
+          100,
+          Math.floor((progress.receivedBytes / progress.totalBytes) * 100)
+        );
+        return `下载中 ${formatMegabytes(progress.receivedBytes)} / ${formatMegabytes(progress.totalBytes)} · ${percent}%`;
+      }
+      return `下载中 ${formatMegabytes(progress.receivedBytes)}`;
+    }
+    if (progress.phase === 'verifying') return '校验中...';
+    if (progress.phase === 'installing') return '安装中...';
+    if (progress.phase === 'npm') return `npm 安装中${elapsed ? ` ${elapsed}s` : '...'}`;
+  }
+  return elapsed ? `正在安装 ${elapsed}s` : '正在安装...';
+}
+
 function InstallToolButton({
   kind,
   installingTool,
-  npmAvailable,
+  progress,
   onInstall,
+  onCancel,
   label,
   className = 'install-button',
 }: {
   kind: ToolKind;
   installingTool: ToolKind | null;
-  npmAvailable: boolean;
+  progress: ToolInstallProgress | null;
   onInstall: (kind: ToolKind) => void;
+  onCancel?: (kind: ToolKind) => void;
   label?: string;
   className?: string;
 }) {
   const busy = installingTool === kind;
+  const activeProgress = busy && progress?.kind === kind ? progress : null;
   const [elapsed, setElapsed] = useState(0);
   useEffect(() => {
     if (!busy) {
@@ -267,24 +315,40 @@ function InstallToolButton({
     const timer = window.setInterval(() => setElapsed(seconds => seconds + 1), 1000);
     return () => window.clearInterval(timer);
   }, [busy]);
+  const cancellable =
+    busy &&
+    onCancel !== undefined &&
+    (!activeProgress || activeProgress.phase === 'resolving' || activeProgress.phase === 'downloading');
   return (
-    <button
-      className={className}
-      onClick={() => onInstall(kind)}
-      disabled={installingTool !== null || !npmAvailable}
-      aria-label={label ?? `一键安装 ${TOOL_LABEL[kind]}`}
-      title={npmAvailable ? '调用官方 npm 包安装，通常需要 1-3 分钟' : '需要先安装 Node.js（nodejs.org）'}
-    >
-      {busy ? (
-        <>
-          <RefreshCw className="spin" size={15} /> 正在安装 {elapsed}s
-        </>
-      ) : (
-        <>
-          <Download size={15} /> {label ?? '一键安装'}
-        </>
+    <span className="install-action">
+      <button
+        className={className}
+        onClick={() => onInstall(kind)}
+        disabled={installingTool !== null}
+        aria-label={label ?? `一键安装 ${TOOL_LABEL[kind]}`}
+        title="从官方渠道下载原生程序，无需 Node.js"
+      >
+        {busy ? (
+          <>
+            <RefreshCw className="spin" size={15} /> {installPhaseLabel(activeProgress, elapsed)}
+          </>
+        ) : (
+          <>
+            <Download size={15} /> {label ?? '一键安装'}
+          </>
+        )}
+      </button>
+      {cancellable && (
+        <button
+          className="install-cancel"
+          onClick={() => onCancel(kind)}
+          aria-label={`取消安装 ${TOOL_LABEL[kind]}`}
+          title="取消下载"
+        >
+          <X size={14} />
+        </button>
       )}
-    </button>
+    </span>
   );
 }
 
@@ -292,7 +356,9 @@ function HostSetup({
   tools,
   loadingTools,
   installingTool,
+  installProgress,
   onInstall,
+  onCancelInstall,
   onRefresh,
   onBack,
   onStarted,
@@ -301,7 +367,9 @@ function HostSetup({
   tools: ToolDetection[];
   loadingTools: boolean;
   installingTool: ToolKind | null;
+  installProgress: ToolInstallProgress | null;
   onInstall: (kind: ToolKind) => void;
+  onCancelInstall: (kind: ToolKind) => void;
   onRefresh: () => void;
   onBack: () => void;
   onStarted: (car: CarSession) => void;
@@ -428,43 +496,53 @@ function HostSetup({
         {tools.map(tool => {
           const enabled = tool.installed && tool.authenticated;
           const checked = selected.includes(tool.kind);
-          if (!tool.installed) {
-            return (
-              <div className="tool-card tool-card--missing" key={tool.kind}>
+          const readyLabel = `已就绪${tool.version ? ` · ${tool.version}` : ''}${tool.managedByApp ? ' · 应用托管' : ''}`;
+          return (
+            <div
+              className={`tool-card ${checked ? 'tool-card--selected' : ''} ${tool.installed ? '' : 'tool-card--missing'}`}
+              key={tool.kind}
+            >
+              <button
+                className="tool-card__select"
+                onClick={() => toggleTool(tool.kind, enabled)}
+                disabled={!enabled}
+                aria-pressed={checked}
+                aria-label={`选择 ${tool.name}`}
+              >
                 <ToolMark kind={tool.kind} />
                 <span className="tool-card__body">
                   <strong>{tool.name}</strong>
-                  <small className="status-off">
-                    <span /> {tool.detail}
+                  <small className={enabled ? 'status-ok' : 'status-off'}>
+                    <span /> {enabled ? readyLabel : tool.detail}
                   </small>
                 </span>
+                {tool.installed && (
+                  <span className={`check-box ${checked ? 'check-box--on' : ''}`}>
+                    {checked && <Check size={15} />}
+                  </span>
+                )}
+              </button>
+              {!tool.installed && (
                 <InstallToolButton
                   kind={tool.kind}
                   installingTool={installingTool}
-                  npmAvailable={tool.npmAvailable}
+                  progress={installProgress}
                   onInstall={onInstall}
+                  onCancel={onCancelInstall}
                 />
-              </div>
-            );
-          }
-          return (
-            <button
-              className={`tool-card ${checked ? 'tool-card--selected' : ''}`}
-              key={tool.kind}
-              onClick={() => toggleTool(tool.kind, enabled)}
-              disabled={!enabled}
-            >
-              <ToolMark kind={tool.kind} />
-              <span className="tool-card__body">
-                <strong>{tool.name}</strong>
-                <small className={enabled ? 'status-ok' : 'status-off'}>
-                  <span /> {enabled ? `已就绪${tool.version ? ` · ${tool.version}` : ''}` : tool.detail}
-                </small>
-              </span>
-              <span className={`check-box ${checked ? 'check-box--on' : ''}`}>
-                {checked && <Check size={15} />}
-              </span>
-            </button>
+              )}
+              {tool.installed && tool.managedByApp && tool.updateAvailable && tool.latestVersion && (
+                <InstallToolButton
+                  kind={tool.kind}
+                  installingTool={installingTool}
+                  progress={installProgress}
+                  onInstall={onInstall}
+                  onCancel={onCancelInstall}
+                  label={`更新到 ${tool.latestVersion}`}
+                  className="install-button install-button--compact"
+                />
+              )}
+            </div>
           );
         })}
       </div>
@@ -1140,7 +1218,7 @@ function JoinPage({
   );
 }
 
-function ToolChooser({ access, tools, installingTool, onInstall, onOpened, onError }: { access: RideAccess; tools: ToolDetection[]; installingTool: ToolKind | null; onInstall: (kind: ToolKind) => void; onOpened: (target: LaunchTarget) => void; onError: (message: string) => void }) {
+function ToolChooser({ access, tools, installingTool, installProgress, onInstall, onCancelInstall, onOpened, onError }: { access: RideAccess; tools: ToolDetection[]; installingTool: ToolKind | null; installProgress: ToolInstallProgress | null; onInstall: (kind: ToolKind) => Promise<ToolDetection | null>; onCancelInstall: (kind: ToolKind) => void; onOpened: (target: LaunchTarget) => void; onError: (message: string) => void }) {
   const [selected, setSelected] = useState<ToolKind>(access.enabledTools[0] ?? 'claude');
   const initialDetection = tools.find(tool => tool.kind === (access.enabledTools[0] ?? 'claude'));
   const [mode, setMode] = useState<LaunchMode>(initialDetection?.desktopInstalled ? 'desktop' : 'terminal');
@@ -1150,7 +1228,9 @@ function ToolChooser({ access, tools, installingTool, onInstall, onOpened, onErr
   const detection = tools.find(tool => tool.kind === selected);
   const terminalAvailable = detection?.installed ?? false;
   const desktopAvailable = detection?.desktopSupported === true && detection.desktopInstalled;
-  const selectedAvailable = mode === 'desktop' ? desktopAvailable : terminalAvailable;
+  const needsDownload = mode === 'terminal' && !terminalAvailable;
+  const selectedAvailable = mode === 'desktop' ? desktopAvailable : true;
+  const installingSelected = installingTool === selected;
 
   const selectTool = (kind: ToolKind) => {
     setSelected(kind);
@@ -1158,9 +1238,15 @@ function ToolChooser({ access, tools, installingTool, onInstall, onOpened, onErr
     setMode(next?.desktopInstalled ? 'desktop' : 'terminal');
   };
 
+  // One action for passengers: a missing CLI is fetched from the official
+  // channel first, then the tool opens automatically.
   const open = async () => {
     setBusy(true);
     try {
+      if (needsDownload) {
+        const updated = await onInstall(selected);
+        if (!updated?.installed) return;
+      }
       await launchTool({
         kind: selected,
         mode,
@@ -1199,20 +1285,18 @@ function ToolChooser({ access, tools, installingTool, onInstall, onOpened, onErr
           <SquareTerminal size={19} /><span><strong>终端</strong><small>{terminalAvailable ? `已安装${detection?.version ? ` ${detection.version}` : ''}，可直接打开` : '未找到命令行工具'}</small></span>
         </button>
       </div>
-      {!terminalAvailable && (
+      {needsDownload && (
         <div className="install-inline page-enter">
           <span>
-            {detection?.npmAvailable === false
-              ? `一键安装 ${TOOL_LABEL[selected]} 需要 Node.js，请先从 nodejs.org 安装`
-              : `这台电脑还没有 ${TOOL_LABEL[selected]} 命令行工具`}
+            {installingSelected
+              ? installPhaseLabel(installProgress?.kind === selected ? installProgress : null)
+              : `首次使用会从官方渠道自动下载 ${TOOL_LABEL[selected]}（Claude 约 240 MB、Codex 约 110 MB），无需安装 Node.js。`}
           </span>
-          <InstallToolButton
-            kind={selected}
-            installingTool={installingTool}
-            npmAvailable={detection?.npmAvailable ?? false}
-            onInstall={onInstall}
-            label={`一键安装 ${TOOL_LABEL[selected]} 命令行`}
-          />
+          {installingSelected && (
+            <button className="install-cancel-text" onClick={() => onCancelInstall(selected)}>
+              取消下载
+            </button>
+          )}
         </div>
       )}
       {mode === 'terminal' && <>
@@ -1221,22 +1305,34 @@ function ToolChooser({ access, tools, installingTool, onInstall, onOpened, onErr
         </button>
         {showDir && <input className="directory-input page-enter" value={workDir} onChange={event => setWorkDir(event.target.value)} placeholder="留空使用默认目录" />}
       </>}
-      <button className="primary-button" onClick={open} disabled={busy || !selectedAvailable}>
-        {busy ? <><RefreshCw className="spin" size={19} /> 正在打开...</> : mode === 'desktop' ? <><MonitorUp size={20} /> 打开 {TOOL_LABEL[selected]} 客户端</> : <><SquareTerminal size={20} /> 打开 {TOOL_LABEL[selected]} 终端</>}
+      <button className="primary-button" onClick={open} disabled={busy || installingTool !== null || !selectedAvailable}>
+        {busy && installingSelected ? (
+          <><RefreshCw className="spin" size={19} /> {installPhaseLabel(installProgress?.kind === selected ? installProgress : null)}</>
+        ) : busy ? (
+          <><RefreshCw className="spin" size={19} /> 正在打开...</>
+        ) : mode === 'desktop' ? (
+          <><MonitorUp size={20} /> 打开 {TOOL_LABEL[selected]} 客户端</>
+        ) : needsDownload ? (
+          <><Download size={20} /> 下载并打开 {TOOL_LABEL[selected]} 终端</>
+        ) : (
+          <><SquareTerminal size={20} /> 打开 {TOOL_LABEL[selected]} 终端</>
+        )}
       </button>
       <p className="quiet-note">客户端会临时使用本车路由，离车后自动恢复原配置</p>
     </section>
   );
 }
 
-function RidePage({ access, tools, initiallyOpened, installingTool, onInstall, onLeave, onError }: { access: RideAccess; tools: ToolDetection[]; initiallyOpened: LaunchTarget; installingTool: ToolKind | null; onInstall: (kind: ToolKind) => void; onLeave: () => void; onError: (message: string) => void }) {
+function RidePage({ access, tools, initiallyOpened, installingTool, installProgress, onInstall, onCancelInstall, onLeave, onError }: { access: RideAccess; tools: ToolDetection[]; initiallyOpened: LaunchTarget; installingTool: ToolKind | null; installProgress: ToolInstallProgress | null; onInstall: (kind: ToolKind) => void; onCancelInstall: (kind: ToolKind) => void; onLeave: () => void; onError: (message: string) => void }) {
   const [opened, setOpened] = useState<LaunchTarget[]>([initiallyOpened]);
   const [busy, setBusy] = useState<string | null>(null);
   const [leaving, setLeaving] = useState(false);
   const [sharedStatus, setSharedStatus] = useState<SharedCarStatus | null>(null);
   const [showMemberDetails, setShowMemberDetails] = useState(false);
+  const [p2pState, setP2pState] = useState<P2pConnectionState>('connected');
 
   useEffect(() => trustedWebRtc.subscribeCarStatus(setSharedStatus), []);
+  useEffect(() => trustedWebRtc.subscribeConnectionState(setP2pState), []);
 
   const open = async (kind: ToolKind, mode: LaunchMode) => {
     const key = `${kind}-${mode}`;
@@ -1266,10 +1362,17 @@ function RidePage({ access, tools, initiallyOpened, installingTool, onInstall, o
     }
   };
 
+  const connectionMeta: Record<P2pConnectionState, { label: string; className: string }> = {
+    connected: { label: '已连接', className: '' },
+    connecting: { label: '正在连接...', className: 'connection-bar--warn' },
+    reconnecting: { label: '连接中断，正在自动重连...', className: 'connection-bar--warn' },
+    down: { label: '连接中断，仍在后台重试，可稍后再试或离开车队', className: 'connection-bar--down' },
+  };
+
   return (
     <section className="ride-page page-enter">
-      <div className="connection-bar">
-        <span><i /> 已连接</span><strong>{access.carName}</strong><span><ShieldCheck size={17} /> 当前设备已绑定</span>
+      <div className={`connection-bar ${connectionMeta[p2pState].className}`}>
+        <span><i /> {connectionMeta[p2pState].label}</span><strong>{access.carName}</strong><span><ShieldCheck size={17} /> 当前设备已绑定</span>
       </div>
       {sharedStatus && <AccountQuotaPanel quotas={sharedStatus.accountQuotas} />}
       <div className="ride-heading">
@@ -1311,8 +1414,9 @@ function RidePage({ access, tools, initiallyOpened, installingTool, onInstall, o
                   <InstallToolButton
                     kind={kind}
                     installingTool={installingTool}
-                    npmAvailable={detection.npmAvailable}
+                    progress={installProgress}
                     onInstall={onInstall}
+                    onCancel={onCancelInstall}
                     label="安装命令行"
                     className="install-button install-button--compact"
                   />
@@ -1344,6 +1448,8 @@ export default function App() {
   const [tools, setTools] = useState<ToolDetection[]>([]);
   const [loadingTools, setLoadingTools] = useState(true);
   const [installingTool, setInstallingTool] = useState<ToolKind | null>(null);
+  const [installProgress, setInstallProgress] = useState<ToolInstallProgress | null>(null);
+  const [appUpdate, setAppUpdate] = useState<AppUpdateInfo | null>(null);
   const [car, setCar] = useState<CarSession | null>(null);
   const [access, setAccess] = useState<RideAccess | null>(null);
   const [pendingServerJoin, setPendingServerJoin] = useState<PendingServerJoin | null>(null);
@@ -1368,21 +1474,56 @@ export default function App() {
     }
   };
 
-  const installMissingTool = async (kind: ToolKind) => {
+  const installMissingTool = async (kind: ToolKind): Promise<ToolDetection | null> => {
     setInstallingTool(kind);
     setError(null);
     try {
       const updated = await installTool(kind);
       toolsRequestId.current += 1;
       setTools(current => current.map(tool => (tool.kind === kind ? updated : tool)));
+      return updated;
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      const message = reason instanceof Error ? reason.message : String(reason);
+      // A user-initiated cancel is not an error worth a banner.
+      if (!message.includes('已取消')) setError(message);
+      return null;
     } finally {
       setInstallingTool(null);
+      setInstallProgress(null);
     }
   };
 
+  const cancelInstall = (kind: ToolKind) => {
+    void cancelToolInstall(kind).catch(() => undefined);
+  };
+
   useEffect(() => { void loadTools(); }, []);
+  useEffect(() => {
+    let disposed = false;
+    // Best-effort awareness of newer app releases; failures stay silent.
+    void checkAppUpdate()
+      .then(update => {
+        if (!disposed) setAppUpdate(update);
+      })
+      .catch(() => undefined);
+    return () => {
+      disposed = true;
+    };
+  }, []);
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listenForToolInstallProgress(progress => {
+      if (!disposed) setInstallProgress(progress);
+    }).then(fn => {
+      if (disposed) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
   useEffect(() => {
     void trustedWebRtc.initialize().catch(reason =>
       setError(reason instanceof Error ? reason.message : String(reason))
@@ -1434,16 +1575,16 @@ export default function App() {
   };
 
   const page = useMemo(() => {
-    if (screen === 'host-setup') return <HostSetup tools={tools} loadingTools={loadingTools} installingTool={installingTool} onInstall={installMissingTool} onRefresh={loadTools} onBack={goHome} onStarted={next => { setCar(next); setScreen('host-live'); }} onError={setError} />;
+    if (screen === 'host-setup') return <HostSetup tools={tools} loadingTools={loadingTools} installingTool={installingTool} installProgress={installProgress} onInstall={installMissingTool} onCancelInstall={cancelInstall} onRefresh={loadTools} onBack={goHome} onStarted={next => { setCar(next); setScreen('host-live'); }} onError={setError} />;
     if (screen === 'host-live' && car) return <HostLive car={car} onStopped={() => { setCar(null); goHome(); }} onError={setError} />;
     if (screen === 'join') return <JoinPage key={pendingServerJoin?.requestId ?? 'manual'} initialCode={pendingServerJoin?.code} fromServerLink={pendingServerJoin !== null} onBack={goHome} onJoined={next => { setPendingServerJoin(null); setAccess(next); setScreen('ready'); }} onError={setError} />;
-    if (screen === 'ready' && access) return <ToolChooser access={access} tools={tools} installingTool={installingTool} onInstall={installMissingTool} onOpened={target => { setOpenedTarget(target); setScreen('ride'); }} onError={setError} />;
-    if (screen === 'ride' && access) return <RidePage access={access} tools={tools} initiallyOpened={openedTarget} installingTool={installingTool} onInstall={installMissingTool} onLeave={() => { setAccess(null); goHome(); }} onError={setError} />;
+    if (screen === 'ready' && access) return <ToolChooser access={access} tools={tools} installingTool={installingTool} installProgress={installProgress} onInstall={installMissingTool} onCancelInstall={cancelInstall} onOpened={target => { setOpenedTarget(target); setScreen('ride'); }} onError={setError} />;
+    if (screen === 'ride' && access) return <RidePage access={access} tools={tools} initiallyOpened={openedTarget} installingTool={installingTool} installProgress={installProgress} onInstall={installMissingTool} onCancelInstall={cancelInstall} onLeave={() => { setAccess(null); goHome(); }} onError={setError} />;
     return <Welcome onHost={() => setScreen('host-setup')} onJoin={() => { setPendingServerJoin(null); setScreen('join'); }} />;
-  }, [screen, tools, loadingTools, installingTool, car, access, pendingServerJoin, openedTarget]);
+  }, [screen, tools, loadingTools, installingTool, installProgress, car, access, pendingServerJoin, openedTarget]);
 
   return (
-    <WindowShell onHome={goHome}>
+    <WindowShell onHome={goHome} appUpdate={appUpdate}>
       {error && <ErrorBanner message={error} onClose={() => setError(null)} />}
       {riskAcknowledged ? page : <FirstRunNotice onConfirm={confirmRisk} />}
     </WindowShell>

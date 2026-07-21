@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
+  AppUpdateInfo,
   CarSession,
   JoinPreview,
   MemberTokenLimits,
@@ -9,6 +10,7 @@ import type {
   Seat,
   SeatUsageSummary,
   ToolDetection,
+  ToolInstallProgress,
   ToolKind,
   LaunchMode,
 } from './types';
@@ -66,6 +68,9 @@ const demoTools: ToolDetection[] = [
     detail: '已就绪',
     version: 'v2.1.178',
     npmAvailable: true,
+    managedByApp: false,
+    latestVersion: null,
+    updateAvailable: false,
     desktopSupported: true,
     desktopInstalled: true,
     desktopPath: '/Applications/Claude.app',
@@ -81,6 +86,9 @@ const demoTools: ToolDetection[] = [
     detail: '已就绪',
     version: 'v0.140.0',
     npmAvailable: true,
+    managedByApp: false,
+    latestVersion: null,
+    updateAvailable: false,
     desktopSupported: true,
     desktopInstalled: true,
     desktopPath: '/Applications/ChatGPT.app',
@@ -264,6 +272,29 @@ export async function installTool(kind: ToolKind): Promise<ToolDetection> {
   const detection = demoTools.find(tool => tool.kind === kind);
   if (!detection) throw new Error('未知工具');
   return { ...detection, installed: true, detail: '已就绪' };
+}
+
+export async function cancelToolInstall(kind: ToolKind): Promise<boolean> {
+  return inTauri() ? invoke<boolean>('cancel_tool_install', { kind }) : false;
+}
+
+export async function checkAppUpdate(): Promise<AppUpdateInfo | null> {
+  return inTauri() ? invoke<AppUpdateInfo | null>('check_app_update') : null;
+}
+
+export async function openReleasesPage(): Promise<void> {
+  if (inTauri()) await invoke('open_releases_page');
+}
+
+const TOOL_INSTALL_PROGRESS_EVENT = 'trusted-carpool:tool-install-progress';
+
+export async function listenForToolInstallProgress(
+  onProgress: (progress: ToolInstallProgress) => void
+): Promise<UnlistenFn> {
+  if (!inTauri()) return () => undefined;
+  return listen<ToolInstallProgress>(TOOL_INSTALL_PROGRESS_EVENT, event =>
+    onProgress(event.payload)
+  );
 }
 
 export async function startCar(input: {

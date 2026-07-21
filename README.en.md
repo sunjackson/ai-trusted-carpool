@@ -29,11 +29,13 @@ A desktop app for sharing a locally signed-in Claude Code / Codex account among 
 ## Highlights
 
 - Claude Code and Codex are supported as equals; host either or both.
-- Auto-detects the local Claude Code / Codex CLIs and official desktop clients; a missing CLI can be installed in-app with one click (via the official npm packages `@anthropic-ai/claude-code` and `@openai/codex`, CC Switch style).
+- Zero-setup passengers: installing this app is enough. A missing CLI is fetched as the official standalone binary (Claude Code via the `downloads.claude.ai` manifest, Codex via the GitHub `openai/codex` releases), SHA-256-verified before activation, with live progress and cancel — **no Node.js, no admin rights, and no personal AI account required**. npm install remains a fallback when the official channel is unreachable and Node.js exists.
+- App-managed CLIs get one-click updates (official release metadata cached in the background, older versions pruned); a user's own system install always wins.
 - The host copies an official `https://p2p.cnaigc.ai/api/v1/carpool/join/<code>` link; a friend clicks it, the client launches with the seat pre-filled, and a saved nickname makes joining one click.
 - After joining, passengers open the Claude/Codex terminal or the official desktop client with one click; the desktop client is preferred when installed.
 - Up to four concurrent passengers per car; every seat is bound to one device.
-- WebRTC direct connection first, automatic TURN fallback; application payloads stay end-to-end encrypted either way.
+- WebRTC direct connection first, automatic TURN fallback; both application payloads and connection signaling are end-to-end encrypted (the coordinator never sees SDP or candidate IPs).
+- Automatic drop recovery: passenger-side heartbeat detection plus exponential-backoff reconnects (with fresh TURN credentials), and the ride page shows the real link state.
 - Credentials never leave the host machine; only official Anthropic and OpenAI/ChatGPT endpoints are allowed.
 - Real-time per-member → per-tool → per-model stats: requests, input, output, cache read/write, and official USD list-price estimates.
 - The member list stays concise (totals, requests, price, key limits); click a member for the per-model breakdown.

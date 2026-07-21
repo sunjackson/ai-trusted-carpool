@@ -15,14 +15,16 @@ mod runtime;
 mod status_tray;
 mod terminal_launcher;
 mod tool_installer;
+mod tool_provisioner;
 mod usage;
 mod usage_history;
 
 use commands::{
-    detect_tools, execute_relay_request, get_active_car, get_ice_servers, get_shared_car_status,
-    install_tool, join_car, launch_tool, leave_car, poll_webrtc_signals, preview_invite,
-    refresh_account_quotas, send_webrtc_signal, start_car, start_relay_request, stop_car,
-    submit_relay_response, submit_relay_stream_event, update_member_token_limits,
+    cancel_tool_install, check_app_update, detect_tools, execute_relay_request, get_active_car,
+    get_ice_servers, get_shared_car_status, install_tool, join_car, launch_tool, leave_car,
+    open_releases_page, poll_webrtc_signals, preview_invite, refresh_account_quotas,
+    send_webrtc_signal, start_car, start_relay_request, stop_car, submit_relay_response,
+    submit_relay_stream_event, update_member_token_limits,
 };
 use relay::RelayBridge;
 use runtime::RuntimeState;
@@ -99,6 +101,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             detect_tools,
             install_tool,
+            cancel_tool_install,
+            check_app_update,
+            open_releases_page,
             start_car,
             stop_car,
             get_active_car,
