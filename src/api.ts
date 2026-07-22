@@ -21,6 +21,7 @@ import type {
   MemberTokenLimits,
   ModelUsageSummary,
   RideAccess,
+  RideHistorySummary,
   Seat,
   SeatUsageSummary,
   ToolDetection,
@@ -251,13 +252,15 @@ const demoCar = (
   enabledTools: ToolKind[],
   carName: string,
   startsAt: number,
-  endsAt: number
+  endsAt: number,
+  alwaysOn = false
 ): CarSession => ({
   carId: crypto.randomUUID(),
   carName,
   ownerPeerId: 'p2p-demo-owner',
   startedAt: startsAt,
-  expiresAt: endsAt,
+  expiresAt: alwaysOn ? Number.MAX_SAFE_INTEGER : endsAt,
+  alwaysOn,
   enabledTools,
   seats: Array.from({ length: 4 }, (_, index) => ({
     seatNo: index + 1,
@@ -293,6 +296,8 @@ const demoCar = (
 });
 
 let demoActiveCar: CarSession | null = null;
+let demoRideHistory: RideHistorySummary[] = [];
+const demoRideCodes = new Map<string, string>();
 let demoAccounts: LocalAccountSummary[] = [];
 const demoImportPreviews = new Map<string, LocalAccountSummary[]>();
 
@@ -707,15 +712,67 @@ export async function startCar(input: {
   enabledTools: ToolKind[];
   startsAt: number;
   endsAt: number;
+  alwaysOn?: boolean;
 }): Promise<CarSession> {
   if (inTauri()) return invoke<CarSession>('start_car', { input });
-  demoActiveCar = demoCar(input.enabledTools, input.carName, input.startsAt, input.endsAt);
+  demoActiveCar = demoCar(
+    input.enabledTools,
+    input.carName,
+    input.startsAt,
+    input.endsAt,
+    input.alwaysOn
+  );
+  const now = Date.now();
+  demoRideHistory = demoRideHistory.map(record =>
+    record.role === 'host' && record.endedAt === null
+      ? { ...record, canResume: false, availability: 'stopped', endedAt: now }
+      : record
+  );
+  demoRideHistory.unshift({
+    recordId: crypto.randomUUID(),
+    role: 'host',
+    carId: demoActiveCar.carId,
+    carName: demoActiveCar.carName,
+    startedAt: demoActiveCar.startedAt,
+    expiresAt: demoActiveCar.expiresAt,
+    alwaysOn: demoActiveCar.alwaysOn,
+    enabledTools: demoActiveCar.enabledTools,
+    seatNo: null,
+    nickname: null,
+    createdAt: now,
+    lastActiveAt: now,
+    endedAt: null,
+    canResume: false,
+    availability: 'online',
+  });
   return demoActiveCar;
 }
 
 export async function stopCar(): Promise<void> {
   if (inTauri()) await invoke('stop_car');
-  else demoActiveCar = null;
+  else {
+    const carId = demoActiveCar?.carId;
+    const now = Date.now();
+    demoRideHistory = demoRideHistory.map(record =>
+      record.role === 'host' && record.carId === carId
+        ? { ...record, canResume: false, availability: 'stopped', endedAt: now }
+        : record
+    );
+    demoActiveCar = null;
+  }
+}
+
+export async function suspendCar(): Promise<void> {
+  if (inTauri()) await invoke('suspend_car');
+  else {
+    const carId = demoActiveCar?.carId;
+    demoRideHistory = demoRideHistory.map(record =>
+      record.role === 'host' && record.carId === carId
+        ? { ...record, canResume: true, availability: 'offline' }
+        : record
+    );
+    demoActiveCar = null;
+  }
 }
 
 export async function getActiveCar(): Promise<CarSession | null> {
@@ -769,18 +826,82 @@ export async function previewInvite(code: string): Promise<JoinPreview> {
     enabledTools: ['claude', 'codex'],
     startsAt: Date.now() - 60_000,
     expiresAt: Date.now() + 60 * 60 * 1000,
+    alwaysOn: false,
   };
 }
 
 export async function joinCar(code: string, nickname: string): Promise<RideAccess> {
   if (inTauri()) return invoke<RideAccess>('join_car', { code, nickname });
-  return {
+  const access = {
     ...(await previewInvite(code)),
     accessId: crypto.randomUUID(),
     ownerPeerId: 'p2p-demo-owner',
     localProxyPort: 25342,
-    connectionState: 'connected',
+    connectionState: 'connected' as const,
   };
+  const now = Date.now();
+  const existing = demoRideHistory.find(
+    record => record.role === 'passenger' && record.carId === access.carId && record.seatNo === access.seatNo
+  );
+  const recordId = existing?.recordId ?? crypto.randomUUID();
+  demoRideCodes.set(recordId, code.trim().toUpperCase());
+  demoRideHistory = [
+    {
+      recordId,
+      role: 'passenger',
+      carId: access.carId,
+      carName: access.carName,
+      startedAt: access.startsAt,
+      expiresAt: access.expiresAt,
+      alwaysOn: access.alwaysOn,
+      enabledTools: access.enabledTools,
+      seatNo: access.seatNo,
+      nickname,
+      createdAt: existing?.createdAt ?? now,
+      lastActiveAt: now,
+      endedAt: null,
+      canResume: true,
+      availability: access.startsAt > now ? 'scheduled' : 'online',
+    },
+    ...demoRideHistory.filter(record => record.recordId !== recordId),
+  ];
+  return access;
+}
+
+export async function listRideHistory(): Promise<RideHistorySummary[]> {
+  return inTauri()
+    ? invoke<RideHistorySummary[]>('list_ride_history')
+    : structuredClone(demoRideHistory);
+}
+
+export async function resumeHostCar(recordId: string): Promise<CarSession> {
+  if (inTauri()) return invoke<CarSession>('resume_host_car', { recordId });
+  const record = demoRideHistory.find(item => item.recordId === recordId && item.role === 'host');
+  if (!record || !record.canResume) throw new Error('这条发车记录当前无法恢复');
+  demoActiveCar = demoCar(
+    record.enabledTools,
+    record.carName,
+    record.startedAt,
+    record.expiresAt,
+    record.alwaysOn
+  );
+  demoActiveCar.carId = record.carId;
+  demoRideHistory = demoRideHistory.map(item =>
+    item.recordId === recordId
+      ? { ...item, availability: 'online', canResume: false, lastActiveAt: Date.now() }
+      : item
+  );
+  return demoActiveCar;
+}
+
+export async function resumePassengerRide(recordId: string): Promise<RideAccess> {
+  if (inTauri()) return invoke<RideAccess>('resume_passenger_ride', { recordId });
+  const record = demoRideHistory.find(
+    item => item.recordId === recordId && item.role === 'passenger'
+  );
+  const code = demoRideCodes.get(recordId);
+  if (!record?.canResume || !code) throw new Error('这辆车当前无法重新上车');
+  return joinCar(code, record.nickname ?? '乘客');
 }
 
 export async function launchTool(input: {

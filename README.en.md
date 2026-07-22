@@ -10,7 +10,7 @@
 > [!WARNING]
 > **Before you use this**: sharing one official Claude/Codex subscription account among several people directly conflicts with Anthropic's Consumer Terms and OpenAI's Terms of Use, which prohibit sharing account credentials or making your account available to anyone else. Your account may be rate-limited or permanently banned without a refund. Use it only with people you personally trust; the account owner bears all risk. See [LEGAL.md](LEGAL.md).
 
-A desktop app for sharing a locally signed-in Claude Code / Codex account among people who already know and trust each other. The host picks an explicit open window, starts a "car" with one click, and gets four seat codes; a passenger enters a seat code and can open either tool — both can run at the same time. **The code and self-hosting are free and open source forever** — see the [business model](docs/BUSINESS-MODEL.md).
+A desktop app for sharing a locally signed-in Claude Code / Codex account among people who already know and trust each other. The host can choose a fixed window or all-day hosting and gets four seat codes; a passenger enters one code and can open either tool — both can run at the same time. After a reboot, the host can restore the original channel and codes or discard it and start a new car. **The code and self-hosting are free and open source forever** — see the [business model](docs/BUSINESS-MODEL.md).
 
 ![UI design board](design/ui-design-board-v4.png)
 
@@ -35,6 +35,9 @@ A desktop app for sharing a locally signed-in Claude Code / Codex account among 
 - The host copies an official `https://p2p.cnaigc.ai/api/v1/carpool/join/<code>` link; a friend clicks it, the client launches with the seat pre-filled, and a saved nickname makes joining one click.
 - After joining, passengers open the Claude/Codex terminal or the official desktop client with one click; the desktop client is preferred when installed.
 - Up to four concurrent passengers per car; every seat is bound to one device.
+- Fixed-window and all-day hosting are both supported. All-day invites remain discoverable only while the host is online: the app renews short coordinator leases, so shutdowns and network loss naturally make the car offline.
+- After a restart, the host chooses between restoring the original channel or starting a new car. A restore keeps the car ID and four codes, but passengers must claim again and receive fresh session authorization.
+- The home page keeps separate host and passenger history. Passenger entries show online, scheduled, offline, or expired status and enable rejoin only while the car is available.
 - WebRTC direct connection first, automatic TURN fallback; both application payloads and connection signaling are end-to-end encrypted (the coordinator never sees SDP or candidate IPs).
 - Automatic drop recovery: passenger-side heartbeat detection plus exponential-backoff reconnects (with fresh TURN credentials), and the ride page shows the real link state.
 - Credentials never leave the host machine; only official Anthropic and OpenAI/ChatGPT endpoints are allowed.
@@ -42,12 +45,12 @@ A desktop app for sharing a locally signed-in Claude Code / Codex account among 
 - The member list stays concise (totals, requests, price, key limits); click a member for the per-model breakdown.
 - The host can set independent rolling 5-hour / 24-hour / 7-day token limits per member.
 - Host and online members see the same official Claude/Codex subscription quota; API-key auth shows "unsupported" instead of invented numbers.
-- The local append-only history stores usage metadata only — never prompts, response bodies, credentials, session secrets, or seat codes.
+- The append-only `usage-history.jsonl` stores usage metadata only — never prompts, response bodies, credentials, session secrets, or seat codes. A separate private `ride-history.json` stores only the car summary and seat codes required for history/recovery, never access/session secrets, device private keys, WebRTC signaling, or request bodies; writes are atomic, corrupt files are quarantined, and Unix permissions are `0600`.
 - The macOS menu bar, Windows tray, and Linux status area mirror idle/hosting/riding state; closing the main window keeps the app resident.
 
 ## Install
 
-Download the installer for your platform from [GitHub Releases](https://github.com/sunjackson/ai-trusted-carpool/releases) (macOS universal DMG, Windows x64 NSIS, Linux x64 DEB/AppImage), then compare its SHA-256 digest with `SHA256SUMS.txt` from the same release. See the [v0.0.5 release notes](docs/releases/v0.0.5.md) for the current release. During testing, explicitly marked **Pre-release** entries may also provide unsigned packages for manual download.
+Download the installer for your platform from [GitHub Releases](https://github.com/sunjackson/ai-trusted-carpool/releases) (macOS universal DMG, Windows x64 NSIS, Linux x64 DEB/AppImage), then compare its SHA-256 digest with `SHA256SUMS.txt` from the same release. See the [v0.0.5 release notes](docs/releases/v0.0.5.md) for the current stable release, or use the unsigned [v0.0.6-test.1 prerelease](docs/releases/v0.0.6-test.1.md) to test all-day hosting and ride history.
 
 ## Update and release trust
 
@@ -62,7 +65,7 @@ Download the installer for your platform from [GitHub Releases](https://github.c
 - A `vX.Y.Z-test.N` tag publishes an unsigned test prerelease only: it contains installers and `SHA256SUMS.txt` for manual download, but no `.sig` files or `latest.json`, so the in-app updater never discovers it. Windows SmartScreen and macOS Gatekeeper may warn about an unknown publisher.
 - Windows and Linux AppImage updater packages are signature-verified before installation. An active hosted or joined ride may download an update, but the Rust backend refuses installation and restart until the ride ends.
 - Signature, download, or installation failure leaves the current version untouched. For a manual download, calculate the digest with `shasum -a 256 <file>` (macOS/Linux) or `certutil -hashfile <file> SHA256` (Windows), then compare it with the matching filename in `SHA256SUMS.txt`.
-- See the [release guide](docs/RELEASE.md) for signing keys, platform status, CI gates, and the complete checklist. See the [v0.0.5 release notes](docs/releases/v0.0.5.md) for this release.
+- See the [release guide](docs/RELEASE.md) for signing keys, platform status, CI gates, and the complete checklist. See the [v0.0.5 release notes](docs/releases/v0.0.5.md) for the current stable release and [v0.0.6-test.1](docs/releases/v0.0.6-test.1.md) for the latest unsigned prerelease.
 
 ## Local development
 
@@ -87,7 +90,7 @@ GitHub Actions runs frontend, release-manifest, backend, and coordinator tests f
 
 ## Security boundary
 
-A twelve-character seat code has about 60 bits of random entropy, is rate-limited server-side, and expires with the host's schedule; it only resolves a signed public invite. Every accepted claim gets a separate 256-bit session secret bound to the passenger's device identity. Early trusted sharing has no deposits, points, or billing.
+A twelve-character seat code has about 60 bits of random entropy, is rate-limited server-side, and only resolves a signed public invite. Every car uses a three-minute coordinator lease renewed every 60 seconds; fixed-window cars also enforce their business end time, while all-day cars remain discoverable only while the host is online. Every accepted claim gets a separate 256-bit session secret bound to the passenger's device identity. Restoring after a host reboot never restores an old session: passengers claim again. Early trusted sharing has no deposits, points, or billing.
 
 The one-click join page is generated only by the configured official origin. The client accepts only `https://p2p.cnaigc.ai/api/v1/carpool/join/...` (and the short `/join/...` path) plus the statically registered `trusted-carpool://join/...` scheme. Links never carry credentials or session secrets; unknown hosts, extra ports, and unsafe characters are rejected before parsing.
 

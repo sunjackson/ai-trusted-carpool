@@ -27,6 +27,8 @@ pub struct PublicInvitePayload {
     pub enabled_tools: Vec<ToolKind>,
     pub starts_at_ms: i64,
     pub expires_at_ms: i64,
+    #[serde(default)]
+    pub always_on: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -229,11 +231,12 @@ impl CoordinatorClient {
         format!("协调服务请求失败 ({status}): {detail}")
     }
 
-    pub fn build_invite(
+    pub fn build_invite_with_lease(
         &self,
         identity: &DeviceIdentity,
         payload: &PublicInvitePayload,
         timestamp_ms: i64,
+        lease_expires_at_ms: i64,
     ) -> Result<InviteRegistration, String> {
         let public = identity.public();
         let payload_base64 = general_purpose::STANDARD.encode(
@@ -247,7 +250,7 @@ impl CoordinatorClient {
             car_id: &payload.car_id,
             seat_no: payload.seat_no,
             payload_base64: &payload_base64,
-            expires_at_ms: payload.expires_at_ms,
+            expires_at_ms: lease_expires_at_ms,
             timestamp_ms,
         };
         let bytes = serde_json::to_vec(&signable)
@@ -260,7 +263,7 @@ impl CoordinatorClient {
             car_id: payload.car_id.clone(),
             seat_no: payload.seat_no,
             payload_base64,
-            expires_at_ms: payload.expires_at_ms,
+            expires_at_ms: lease_expires_at_ms,
             timestamp_ms,
             signature: identity.sign(&bytes)?,
         })
@@ -657,9 +660,15 @@ mod tests {
             enabled_tools: vec![ToolKind::Claude, ToolKind::Codex],
             starts_at_ms: 1_700_000_000_000,
             expires_at_ms: 1_800_000_000_000,
+            always_on: false,
         };
         let registration = client
-            .build_invite(&identity, &payload, 1_700_000_000_000)
+            .build_invite_with_lease(
+                &identity,
+                &payload,
+                1_700_000_000_000,
+                payload.expires_at_ms,
+            )
             .expect("registration");
         let signable = SignableInvite {
             code: &registration.code,
@@ -678,6 +687,39 @@ mod tests {
             &registration.signature,
         )
         .expect("verify"));
+    }
+
+    #[test]
+    fn always_on_payload_is_registered_with_a_short_independent_lease() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let identity = crate::identity::load_or_create_at(&directory.path().join("identity.json"))
+            .expect("identity");
+        let client = CoordinatorClient::new("http://127.0.0.1:1").expect("client");
+        let payload = PublicInvitePayload {
+            version: 1,
+            code: "7G2K5LQ8M4TZ".to_string(),
+            car_id: uuid::Uuid::new_v4().to_string(),
+            car_name: "全天车队".to_string(),
+            owner_label: "可信车主".to_string(),
+            owner_peer_id: identity.peer_id.clone(),
+            owner_encryption_public_key: identity.encryption_public_key.clone(),
+            seat_no: 1,
+            enabled_tools: vec![ToolKind::Claude],
+            starts_at_ms: 1_700_000_000_000,
+            expires_at_ms: i64::MAX,
+            always_on: true,
+        };
+        let lease_expires_at = 1_700_000_180_000;
+        let registration = client
+            .build_invite_with_lease(&identity, &payload, 1_700_000_000_000, lease_expires_at)
+            .expect("registration");
+        assert_eq!(registration.expires_at_ms, lease_expires_at);
+        let decoded = general_purpose::STANDARD
+            .decode(registration.payload_base64)
+            .expect("payload");
+        let decoded: PublicInvitePayload = serde_json::from_slice(&decoded).expect("json");
+        assert!(decoded.always_on);
+        assert_eq!(decoded.expires_at_ms, i64::MAX);
     }
 
     #[test]
@@ -800,11 +842,17 @@ mod tests {
             enabled_tools: vec![ToolKind::Claude, ToolKind::Codex],
             starts_at_ms: now_ms(),
             expires_at_ms,
+            always_on: false,
         };
         client
             .register_invite(
                 &client
-                    .build_invite(&owner, &invite_payload, now_ms())
+                    .build_invite_with_lease(
+                        &owner,
+                        &invite_payload,
+                        now_ms(),
+                        invite_payload.expires_at_ms,
+                    )
                     .expect("signed invite"),
             )
             .await

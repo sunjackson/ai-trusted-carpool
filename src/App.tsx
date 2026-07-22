@@ -10,10 +10,12 @@ import {
   Copy,
   Download,
   Gauge,
+  History,
   KeyRound,
   LogOut,
   MonitorUp,
   RefreshCw,
+  RotateCcw,
   ShieldCheck,
   SlidersHorizontal,
   Sparkles,
@@ -31,6 +33,7 @@ import {
   getActiveCar,
   installTool,
   joinCar,
+  listRideHistory,
   launchTool,
   leaveCar,
   listenForJoinLinks,
@@ -38,9 +41,12 @@ import {
   listenForToolInstallProgress,
   previewInvite,
   refreshAccountQuotas,
+  resumeHostCar,
+  resumePassengerRide,
   serverJoinUrl,
   startCar,
   stopCar,
+  suspendCar,
   takePendingJoinCode,
   updateMemberTokenLimits,
 } from './api';
@@ -50,6 +56,7 @@ import type {
   JoinPreview,
   MemberTokenLimitStatus,
   RideAccess,
+  RideHistorySummary,
   Seat,
   SeatUsageSummary,
   SharedCarStatus,
@@ -267,7 +274,92 @@ function ErrorBanner({ message, onClose }: { message: string; onClose: () => voi
   );
 }
 
-function Welcome({ onHost, onJoin }: { onHost: () => void; onJoin: () => void }) {
+const availabilityLabel: Record<RideHistorySummary['availability'], string> = {
+  online: '在线，可上车',
+  scheduled: '等待开放',
+  offline: '当前离线',
+  expired: '已过期',
+  stopped: '已结束',
+};
+
+function RideHistoryList({
+  title,
+  records,
+  busyRecord,
+  onResumeHost,
+  onResumePassenger,
+}: {
+  title: string;
+  records: RideHistorySummary[];
+  busyRecord: string | null;
+  onResumeHost: (recordId: string) => void;
+  onResumePassenger: (recordId: string) => void;
+}) {
+  return (
+    <div className="ride-history__group">
+      <h3>{title}<span>{records.length}</span></h3>
+      {records.length === 0 ? (
+        <p className="ride-history__empty">还没有记录</p>
+      ) : (
+        <div className="ride-history__list">
+          {records.map(record => (
+            <article className="ride-history__item" key={record.recordId}>
+              <div className="ride-history__main">
+                <strong>{record.carName}</strong>
+                <span>
+                  {record.alwaysOn ? '全天' : `${formatDateTime(record.startedAt)}—${formatDateTime(record.expiresAt)}`}
+                  {' · '}{record.enabledTools.map(kind => TOOL_LABEL[kind]).join(' / ')}
+                </span>
+              </div>
+              <span className={`ride-availability ride-availability--${record.availability}`}>
+                <i /> {availabilityLabel[record.availability]}
+              </span>
+              {record.role === 'host' ? (
+                record.canResume && (
+                  <button onClick={() => onResumeHost(record.recordId)} disabled={busyRecord !== null}>
+                    <RotateCcw size={15} />
+                    {busyRecord === record.recordId ? '恢复中' : '恢复通道'}
+                  </button>
+                )
+              ) : (
+                <button
+                  onClick={() => onResumePassenger(record.recordId)}
+                  disabled={!record.canResume || busyRecord !== null}
+                >
+                  <Users size={15} />
+                  {busyRecord === record.recordId ? '上车中' : '重新上车'}
+                </button>
+              )}
+            </article>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Welcome({
+  onHost,
+  onJoin,
+  history,
+  historyLoading,
+  busyRecord,
+  onRefreshHistory,
+  onResumeHost,
+  onResumePassenger,
+}: {
+  onHost: () => void;
+  onJoin: () => void;
+  history: RideHistorySummary[];
+  historyLoading: boolean;
+  busyRecord: string | null;
+  onRefreshHistory: () => void;
+  onResumeHost: (recordId: string) => void;
+  onResumePassenger: (recordId: string) => void;
+}) {
+  const hostRecords = history.filter(record => record.role === 'host');
+  const passengerRecords = history.filter(record => record.role === 'passenger');
+  const recoverableHost = hostRecords.find(record => record.canResume);
   return (
     <section className="welcome page-enter">
       <div className="welcome__hero">
@@ -310,6 +402,53 @@ function Welcome({ onHost, onJoin }: { onHost: () => void; onJoin: () => void })
         <span><Wifi size={16} /> {t('welcome.trustAuto')}</span>
         <span><LogOut size={16} /> {t('welcome.trustLeave')}</span>
       </div>
+
+      {recoverableHost && (
+        <div className="ride-recovery" role="status">
+          <span className="ride-recovery__icon"><RotateCcw size={21} /></span>
+          <div>
+            <strong>上次通道可以恢复</strong>
+            <small>{recoverableHost.carName} · 原车队和上车码将继续使用</small>
+          </div>
+          <button onClick={() => onResumeHost(recoverableHost.recordId)} disabled={busyRecord !== null}>
+            {busyRecord === recoverableHost.recordId ? '正在恢复' : '恢复原通道'}
+          </button>
+          <button className="ride-recovery__new" onClick={onHost} disabled={busyRecord !== null}>
+            开新车
+          </button>
+        </div>
+      )}
+
+      {(historyLoading || history.length > 0) && (
+        <section className="ride-history" aria-label="拼车记录">
+          <div className="ride-history__heading">
+            <div><History size={18} /><strong>我的拼车记录</strong></div>
+            <button onClick={onRefreshHistory} disabled={historyLoading} aria-label="刷新拼车记录" title="刷新拼车记录">
+              <RefreshCw size={16} className={historyLoading ? 'spin' : ''} />
+            </button>
+          </div>
+          {historyLoading && history.length === 0 ? (
+            <div className="ride-history__loading">正在检查历史车队状态...</div>
+          ) : (
+            <div className="ride-history__columns">
+              <RideHistoryList
+                title="发车记录"
+                records={hostRecords}
+                busyRecord={busyRecord}
+                onResumeHost={onResumeHost}
+                onResumePassenger={onResumePassenger}
+              />
+              <RideHistoryList
+                title="上车记录"
+                records={passengerRecords}
+                busyRecord={busyRecord}
+                onResumeHost={onResumeHost}
+                onResumePassenger={onResumePassenger}
+              />
+            </div>
+          )}
+        </section>
+      )}
     </section>
   );
 }
@@ -432,7 +571,7 @@ function HostSetup({
   const [scheduledAt, setScheduledAt] = useState(() =>
     toDateTimeInput(roundUpToHalfHour(Date.now() + 15 * 60_000))
   );
-  const [durationHours, setDurationHours] = useState<DurationHours | 'custom'>(2);
+  const [durationHours, setDurationHours] = useState<DurationHours | 'custom' | 'always'>(2);
   const [customEndsAt, setCustomEndsAt] = useState(() =>
     toDateTimeInput(roundUpToHalfHour(Date.now() + 15 * 60_000) + 2 * 60 * 60_000)
   );
@@ -456,13 +595,15 @@ function HostSetup({
   const previewStart =
     startMode === 'now' ? Date.now() : new Date(scheduledAt).getTime();
   const previewEnd =
-    durationHours === 'custom'
+    durationHours === 'always'
+      ? previewStart + 24 * 60 * 60_000
+      : durationHours === 'custom'
       ? new Date(customEndsAt).getTime()
       : previewStart + durationHours * 60 * 60_000;
   const hasValidPreview =
     Number.isFinite(previewStart) && Number.isFinite(previewEnd) && previewEnd > previewStart;
 
-  const chooseDuration = (duration: DurationHours | 'custom') => {
+  const chooseDuration = (duration: DurationHours | 'custom' | 'always') => {
     setDurationHours(duration);
     if (duration !== 'custom') return;
     const currentEnd = new Date(customEndsAt).getTime();
@@ -489,7 +630,9 @@ function HostSetup({
     const startTimestamp =
       startMode === 'now' ? Date.now() : new Date(scheduledAt).getTime();
     const endTimestamp =
-      durationHours === 'custom'
+      durationHours === 'always'
+        ? startTimestamp + 24 * 60 * 60_000
+        : durationHours === 'custom'
         ? new Date(customEndsAt).getTime()
         : startTimestamp + durationHours * 60 * 60_000;
     if (!Number.isFinite(startTimestamp) || !Number.isFinite(endTimestamp) || endTimestamp <= startTimestamp) {
@@ -503,6 +646,7 @@ function HostSetup({
         enabledTools: selected,
         startsAt: startTimestamp,
         endsAt: endTimestamp,
+        alwaysOn: durationHours === 'always',
       });
       try {
         await trustedWebRtc.startHost();
@@ -663,6 +807,15 @@ function HostSetup({
               ))}
               <button
                 type="button"
+                className={durationHours === 'always' ? 'is-active' : ''}
+                aria-pressed={durationHours === 'always'}
+                onClick={() => chooseDuration('always')}
+              >
+                全天发车
+                <small>保持在线</small>
+              </button>
+              <button
+                type="button"
                 className={durationHours === 'custom' ? 'is-active' : ''}
                 aria-pressed={durationHours === 'custom'}
                 onClick={() => chooseDuration('custom')}
@@ -694,7 +847,9 @@ function HostSetup({
               </strong>
               <small>
                 {hasValidPreview
-                  ? `${formatDateTime(previewEnd)} 自动结束${durationHours === 'custom' ? '' : ` · 共 ${durationHours} 小时`}`
+                  ? durationHours === 'always'
+                    ? '只要电脑在线就持续开放，重启后可恢复原通道'
+                    : `${formatDateTime(previewEnd)} 自动结束${durationHours === 'custom' ? '' : ` · 共 ${durationHours} 小时`}`
                   : '请补充正确的时间范围'}
               </small>
             </div>
@@ -1026,7 +1181,10 @@ function HostLive({ car, onStopped, onError }: { car: CarSession; onStopped: () 
       <div className="live-header">
         <div>
           <div className="live-title"><span className="pulse-dot" /> {scheduled ? '等待发车' : '正在发车'}</div>
-          <p>{liveCar.carName} · {formatDateTime(liveCar.startedAt)}—{formatDateTime(liveCar.expiresAt)}</p>
+          <p>
+            {liveCar.carName} · {formatDateTime(liveCar.startedAt)}—
+            {liveCar.alwaysOn ? '全天持续发车' : formatDateTime(liveCar.expiresAt)}
+          </p>
         </div>
         <div className="live-header__actions">
           <span className="timer"><Clock3 size={17} /> {scheduled ? `距开始 ${elapsed}` : elapsed}</span>
@@ -1245,7 +1403,10 @@ function JoinPage({
             <small>车主 {preview.ownerLabel}</small>
             <strong>{preview.carName}</strong>
             <span>{preview.enabledTools.map(kind => TOOL_LABEL[kind]).join(' · ')}</span>
-            <span>{formatDateTime(preview.startsAt)}—{formatDateTime(preview.expiresAt)}</span>
+            <span>
+              {formatDateTime(preview.startsAt)}—
+              {preview.alwaysOn ? '全天持续发车' : formatDateTime(preview.expiresAt)}
+            </span>
           </div>
           <div className="car-preview__seat"><small>你的座位</small><strong>{preview.seatNo} / 4</strong></div>
         </div>
@@ -1504,6 +1665,9 @@ export default function App() {
   const [installProgress, setInstallProgress] = useState<ToolInstallProgress | null>(null);
   const [car, setCar] = useState<CarSession | null>(null);
   const [access, setAccess] = useState<RideAccess | null>(null);
+  const [rideHistory, setRideHistory] = useState<RideHistorySummary[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(true);
+  const [busyHistoryRecord, setBusyHistoryRecord] = useState<string | null>(null);
   const [pendingServerJoin, setPendingServerJoin] = useState<PendingServerJoin | null>(null);
   const [openedTarget, setOpenedTarget] = useState<LaunchTarget>({ kind: 'claude', mode: 'terminal' });
   const [error, setError] = useState<string | null>(null);
@@ -1514,6 +1678,17 @@ export default function App() {
     debugLog('error', 'UI', message);
     setError(message);
   }, []);
+
+  const refreshRideHistory = useCallback(async () => {
+    setHistoryLoading(true);
+    try {
+      setRideHistory(await listRideHistory());
+    } catch (reason) {
+      showError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setHistoryLoading(false);
+    }
+  }, [showError]);
 
   const loadTools = useCallback(async () => {
     const requestId = ++toolsRequestId.current;
@@ -1555,6 +1730,7 @@ export default function App() {
   };
 
   useEffect(() => { void loadTools(); }, [loadTools]);
+  useEffect(() => { void refreshRideHistory(); }, [refreshRideHistory]);
   useEffect(() => {
     let disposed = false;
     let unlisten: (() => void) | undefined;
@@ -1633,13 +1809,50 @@ export default function App() {
     setRiskAcknowledged(true);
   };
 
+  const resumeHostFromHistory = async (recordId: string) => {
+    setBusyHistoryRecord(recordId);
+    setError(null);
+    let activated = false;
+    try {
+      const nextCar = await resumeHostCar(recordId);
+      activated = true;
+      await trustedWebRtc.startHost();
+      setCar(nextCar);
+      setScreen('host-live');
+    } catch (reason) {
+      if (activated) await suspendCar().catch(() => undefined);
+      showError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusyHistoryRecord(null);
+      void refreshRideHistory();
+    }
+  };
+
+  const resumePassengerFromHistory = async (recordId: string) => {
+    setBusyHistoryRecord(recordId);
+    setError(null);
+    let nextAccess: RideAccess | null = null;
+    try {
+      nextAccess = await resumePassengerRide(recordId);
+      await trustedWebRtc.startPassenger(nextAccess);
+      setAccess(nextAccess);
+      setScreen('ready');
+    } catch (reason) {
+      if (nextAccess) await leaveCar(nextAccess.accessId).catch(() => undefined);
+      showError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusyHistoryRecord(null);
+      void refreshRideHistory();
+    }
+  };
+
   const page = (() => {
-    if (screen === 'host-setup') return <HostSetup tools={tools} loadingTools={loadingTools} installingTool={installingTool} installProgress={installProgress} onInstall={installMissingTool} onCancelInstall={cancelInstall} onRefresh={loadTools} onBack={goHome} onStarted={next => { setCar(next); setScreen('host-live'); }} onError={showError} />;
-    if (screen === 'host-live' && car) return <HostLive car={car} onStopped={() => { setCar(null); goHome(); }} onError={showError} />;
-    if (screen === 'join') return <JoinPage key={pendingServerJoin?.requestId ?? 'manual'} initialCode={pendingServerJoin?.code} fromServerLink={pendingServerJoin !== null} onBack={goHome} onJoined={next => { setPendingServerJoin(null); setAccess(next); setScreen('ready'); }} onError={showError} />;
+    if (screen === 'host-setup') return <HostSetup tools={tools} loadingTools={loadingTools} installingTool={installingTool} installProgress={installProgress} onInstall={installMissingTool} onCancelInstall={cancelInstall} onRefresh={loadTools} onBack={goHome} onStarted={next => { setCar(next); setScreen('host-live'); void refreshRideHistory(); }} onError={showError} />;
+    if (screen === 'host-live' && car) return <HostLive car={car} onStopped={() => { setCar(null); goHome(); void refreshRideHistory(); }} onError={showError} />;
+    if (screen === 'join') return <JoinPage key={pendingServerJoin?.requestId ?? 'manual'} initialCode={pendingServerJoin?.code} fromServerLink={pendingServerJoin !== null} onBack={goHome} onJoined={next => { setPendingServerJoin(null); setAccess(next); setScreen('ready'); void refreshRideHistory(); }} onError={showError} />;
     if (screen === 'ready' && access) return <ToolChooser access={access} tools={tools} installingTool={installingTool} installProgress={installProgress} onInstall={installMissingTool} onCancelInstall={cancelInstall} onOpened={target => { setOpenedTarget(target); setScreen('ride'); }} onError={showError} />;
-    if (screen === 'ride' && access) return <RidePage access={access} tools={tools} initiallyOpened={openedTarget} installingTool={installingTool} installProgress={installProgress} onInstall={installMissingTool} onCancelInstall={cancelInstall} onLeave={() => { setAccess(null); goHome(); }} onError={showError} />;
-    return <Welcome onHost={() => setScreen('host-setup')} onJoin={() => { setPendingServerJoin(null); setScreen('join'); }} />;
+    if (screen === 'ride' && access) return <RidePage access={access} tools={tools} initiallyOpened={openedTarget} installingTool={installingTool} installProgress={installProgress} onInstall={installMissingTool} onCancelInstall={cancelInstall} onLeave={() => { setAccess(null); goHome(); void refreshRideHistory(); }} onError={showError} />;
+    return <Welcome onHost={() => setScreen('host-setup')} onJoin={() => { setPendingServerJoin(null); setScreen('join'); }} history={rideHistory} historyLoading={historyLoading} busyRecord={busyHistoryRecord} onRefreshHistory={() => { void refreshRideHistory(); }} onResumeHost={recordId => { void resumeHostFromHistory(recordId); }} onResumePassenger={recordId => { void resumePassengerFromHistory(recordId); }} />;
   })();
 
   return (

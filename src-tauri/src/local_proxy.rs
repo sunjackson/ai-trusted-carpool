@@ -689,6 +689,7 @@ mod tests {
                 owner_peer_id: "owner-peer".to_string(),
                 started_at: now - 1_000,
                 expires_at: now + 60_000,
+                always_on: false,
                 enabled_tools: vec![ToolKind::Claude, ToolKind::Codex],
                 seats: vec![Seat {
                     seat_no: 1,

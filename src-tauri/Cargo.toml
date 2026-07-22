@@ -1,6 +1,6 @@
 [package]
 name = "trusted-carpool-desktop"
-version = "0.0.5"
+version = "0.0.6"
 description = "One-click trusted carpool for Claude Code and Codex"
 authors = ["CNAIGC"]
 edition = "2021"

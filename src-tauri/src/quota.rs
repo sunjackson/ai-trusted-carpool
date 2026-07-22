@@ -138,6 +138,7 @@ mod tests {
             owner_peer_id: "owner".to_string(),
             started_at: 0,
             expires_at: i64::MAX,
+            always_on: true,
             enabled_tools: vec![ToolKind::Claude],
             seats: vec![seat],
             account_quotas: Vec::<AccountQuotaSnapshot>::new(),

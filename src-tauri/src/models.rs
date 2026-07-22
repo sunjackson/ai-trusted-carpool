@@ -146,6 +146,7 @@ pub struct CarSession {
     pub owner_peer_id: String,
     pub started_at: i64,
     pub expires_at: i64,
+    pub always_on: bool,
     pub enabled_tools: Vec<ToolKind>,
     pub seats: Vec<Seat>,
     pub account_quotas: Vec<AccountQuotaSnapshot>,
@@ -188,6 +189,7 @@ pub struct SharedCarStatus {
     pub car_name: String,
     pub started_at: i64,
     pub expires_at: i64,
+    pub always_on: bool,
     pub enabled_tools: Vec<ToolKind>,
     pub account_quotas: Vec<AccountQuotaSnapshot>,
     pub member: SharedMemberStatus,
@@ -212,6 +214,8 @@ pub struct StartCarInput {
     pub enabled_tools: Vec<ToolKind>,
     pub starts_at: i64,
     pub ends_at: i64,
+    #[serde(default)]
+    pub always_on: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -233,6 +237,44 @@ pub struct JoinPreview {
     pub enabled_tools: Vec<ToolKind>,
     pub starts_at: i64,
     pub expires_at: i64,
+    pub always_on: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RideHistoryRole {
+    Host,
+    Passenger,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RideAvailability {
+    Online,
+    Scheduled,
+    Offline,
+    Expired,
+    Stopped,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RideHistorySummary {
+    pub record_id: String,
+    pub role: RideHistoryRole,
+    pub car_id: String,
+    pub car_name: String,
+    pub started_at: i64,
+    pub expires_at: i64,
+    pub always_on: bool,
+    pub enabled_tools: Vec<ToolKind>,
+    pub seat_no: Option<u8>,
+    pub nickname: Option<String>,
+    pub created_at: i64,
+    pub last_active_at: i64,
+    pub ended_at: Option<i64>,
+    pub can_resume: bool,
+    pub availability: RideAvailability,
 }
 
 #[derive(Debug, Clone, Serialize)]

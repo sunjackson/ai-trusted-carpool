@@ -55,6 +55,7 @@ pub struct AppRuntime {
     pub relay_request_seen_at: HashMap<String, i64>,
     pub usage_history_path: Option<PathBuf>,
     pub account_pool_path: Option<PathBuf>,
+    pub ride_history_path: Option<PathBuf>,
     pub account_router: AccountRouterState,
     pub pending_join_code: Option<String>,
 }

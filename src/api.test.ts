@@ -19,13 +19,18 @@ import {
   importLocalAccounts,
   installAppUpdate,
   launchTool,
+  listRideHistory,
   listAccounts,
   listClientInstances,
   previewAccountImport,
   previewAccountRestore,
   retryAccountRoute,
+  resumeHostCar,
+  resumePassengerRide,
   restartAfterAppUpdate,
   serverJoinUrl,
+  startCar,
+  suspendCar,
   updateAccount,
 } from './api';
 
@@ -97,6 +102,70 @@ describe('managed desktop client commands', () => {
     expect(invokeMock).toHaveBeenNthCalledWith(4, 'close_client_instance', {
       instanceId: 'instance-1',
     });
+  });
+});
+
+describe('ride history and recovery commands', () => {
+  it('forwards all-day hosting and opaque history record identifiers to Rust', async () => {
+    Object.defineProperty(window, '__TAURI_INTERNALS__', { configurable: true, value: {} });
+    const car = {
+      carId: 'car-1',
+      carName: '全天车队',
+      ownerPeerId: 'owner-1',
+      startedAt: 100,
+      expiresAt: Number.MAX_SAFE_INTEGER,
+      alwaysOn: true,
+      enabledTools: ['claude'],
+      seats: [],
+      accountQuotas: [],
+    };
+    const history = [{ recordId: 'record-1', role: 'host', carId: 'car-1' }];
+    const access = {
+      carId: 'car-2',
+      carName: '好友车队',
+      ownerLabel: '好友',
+      seatNo: 1,
+      enabledTools: ['codex'],
+      startsAt: 100,
+      expiresAt: Number.MAX_SAFE_INTEGER,
+      alwaysOn: true,
+      accessId: 'access-1',
+      ownerPeerId: 'owner-2',
+      localProxyPort: 25342,
+      connectionState: 'connected',
+    };
+    invokeMock
+      .mockResolvedValueOnce(car)
+      .mockResolvedValueOnce(history)
+      .mockResolvedValueOnce(car)
+      .mockResolvedValueOnce(access)
+      .mockResolvedValueOnce(undefined);
+
+    await expect(startCar({
+      carName: '全天车队',
+      enabledTools: ['claude'],
+      startsAt: 100,
+      endsAt: 200,
+      alwaysOn: true,
+    })).resolves.toEqual(car);
+    await expect(listRideHistory()).resolves.toEqual(history);
+    await expect(resumeHostCar('record-1')).resolves.toEqual(car);
+    await expect(resumePassengerRide('record-2')).resolves.toEqual(access);
+    await expect(suspendCar()).resolves.toBeUndefined();
+
+    expect(invokeMock).toHaveBeenNthCalledWith(1, 'start_car', {
+      input: {
+        carName: '全天车队',
+        enabledTools: ['claude'],
+        startsAt: 100,
+        endsAt: 200,
+        alwaysOn: true,
+      },
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(2, 'list_ride_history');
+    expect(invokeMock).toHaveBeenNthCalledWith(3, 'resume_host_car', { recordId: 'record-1' });
+    expect(invokeMock).toHaveBeenNthCalledWith(4, 'resume_passenger_ride', { recordId: 'record-2' });
+    expect(invokeMock).toHaveBeenNthCalledWith(5, 'suspend_car');
   });
 });
 

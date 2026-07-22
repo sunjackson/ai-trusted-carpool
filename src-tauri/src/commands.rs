@@ -18,6 +18,7 @@ use crate::relay::{
     execute_host_request, start_host_request_stream, RelayBridge, RelayRequest, RelayResponse,
     RelayStreamEvent,
 };
+use crate::ride_history::{RideHistoryStore, RideRole, StoredRideRecord};
 use crate::runtime::{HostSeatBinding, PassengerAccessContext, RuntimeState};
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
@@ -32,6 +33,8 @@ use tokio::time::{sleep, Instant};
 use uuid::Uuid;
 
 const JOIN_TIMEOUT_SECONDS: u64 = 20;
+const INVITE_LEASE_MS: i64 = 3 * 60_000;
+const INVITE_RENEW_INTERVAL_SECONDS: u64 = 60;
 const SIGNAL_PAYLOAD_LIMIT: usize = 48 * 1024;
 const PENDING_SIGNAL_LIMIT: usize = 256;
 const LOCAL_ACCOUNT_REFRESH_EVENT: &str = "trusted-carpool:local-account-refresh";
@@ -549,7 +552,7 @@ fn preview_from_payload(payload: &PublicInvitePayload) -> Result<JoinPreview, St
     if payload.version != PROTOCOL_VERSION {
         return Err("上车码协议版本不受支持".to_string());
     }
-    if payload.expires_at_ms <= now_ms() {
+    if !payload.always_on && payload.expires_at_ms <= now_ms() {
         return Err("上车码已过期".to_string());
     }
     if payload.seat_no == 0 || payload.seat_no > 4 || payload.enabled_tools.is_empty() {
@@ -563,14 +566,23 @@ fn preview_from_payload(payload: &PublicInvitePayload) -> Result<JoinPreview, St
         enabled_tools: payload.enabled_tools.clone(),
         starts_at: payload.starts_at_ms,
         expires_at: payload.expires_at_ms,
+        always_on: payload.always_on,
     })
 }
 
-fn validate_schedule(starts_at: i64, ends_at: i64, now: i64) -> Result<(), String> {
+fn validate_schedule(
+    starts_at: i64,
+    ends_at: i64,
+    always_on: bool,
+    now: i64,
+) -> Result<(), String> {
     if starts_at < now.saturating_sub(300_000)
         || starts_at > now.saturating_add(30 * 24 * 60 * 60 * 1_000)
     {
         return Err("开始时间应为现在起 30 天内".to_string());
+    }
+    if always_on {
+        return Ok(());
     }
     let duration_ms = ends_at.saturating_sub(starts_at);
     if !(15 * 60_000..=24 * 60 * 60_000).contains(&duration_ms) {
@@ -584,8 +596,32 @@ fn active_host_car(state: &RuntimeState, car_id: &str) -> bool {
         .inner
         .lock()
         .ok()
-        .and_then(|runtime| runtime.active_car.as_ref().map(|car| car.car_id == car_id))
+        .and_then(|runtime| {
+            runtime
+                .active_car
+                .as_ref()
+                .map(|car| car.car_id == car_id && (car.always_on || car.expires_at > now_ms()))
+        })
         .unwrap_or(false)
+}
+
+fn ride_history_store(state: &RuntimeState) -> Result<RideHistoryStore, String> {
+    let path = state
+        .inner
+        .lock()
+        .map_err(|_| "运行状态暂时不可用".to_string())?
+        .ride_history_path
+        .clone()
+        .ok_or_else(|| "行程记录尚未初始化".to_string())?;
+    let mut store = RideHistoryStore::new(path);
+    if store.prepare()? {
+        crate::diagnostics::record(
+            "warn",
+            "ride-history",
+            "damaged ride history was quarantined and reset",
+        );
+    }
+    Ok(store)
 }
 
 fn access_grant_for_claim(
@@ -600,7 +636,9 @@ fn access_grant_for_claim(
         .map_err(|_| "运行状态暂时不可用".to_string())?;
     let car = match runtime.active_car.as_ref() {
         Some(car)
-            if car.car_id == claim.car_id && car.started_at <= now && car.expires_at > now =>
+            if car.car_id == claim.car_id
+                && car.started_at <= now
+                && (car.always_on || car.expires_at > now) =>
         {
             car.clone()
         }
@@ -659,6 +697,72 @@ fn access_grant_for_claim(
         issued_at_ms: binding.issued_at_ms,
         expires_at_ms: car.expires_at,
     }))
+}
+
+fn invite_payload_for(
+    car: &CarSession,
+    seat: &Seat,
+    identity: &DeviceIdentity,
+) -> PublicInvitePayload {
+    PublicInvitePayload {
+        version: PROTOCOL_VERSION,
+        code: seat.code.clone(),
+        car_id: car.car_id.clone(),
+        car_name: car.car_name.clone(),
+        owner_label: "可信车主".to_string(),
+        owner_peer_id: identity.peer_id.clone(),
+        owner_encryption_public_key: identity.encryption_public_key.clone(),
+        seat_no: seat.seat_no,
+        enabled_tools: car.enabled_tools.clone(),
+        starts_at_ms: car.started_at,
+        expires_at_ms: car.expires_at,
+        always_on: car.always_on,
+    }
+}
+
+async fn register_car_invites(
+    coordinator: &CoordinatorClient,
+    identity: &DeviceIdentity,
+    car: &CarSession,
+) -> Result<(), String> {
+    let timestamp = now_ms();
+    let lease_expires_at = timestamp.saturating_add(INVITE_LEASE_MS);
+    for seat in &car.seats {
+        let payload = invite_payload_for(car, seat, identity);
+        let invite =
+            coordinator.build_invite_with_lease(identity, &payload, timestamp, lease_expires_at)?;
+        coordinator.register_invite(&invite).await?;
+    }
+    Ok(())
+}
+
+fn spawn_host_invite_renewal_loop(
+    state: RuntimeState,
+    coordinator: CoordinatorClient,
+    identity: DeviceIdentity,
+    car_id: String,
+) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            sleep(Duration::from_secs(INVITE_RENEW_INTERVAL_SECONDS)).await;
+            let car = state
+                .inner
+                .lock()
+                .ok()
+                .and_then(|runtime| runtime.active_car.clone())
+                .filter(|car| car.car_id == car_id && (car.always_on || car.expires_at > now_ms()));
+            let Some(car) = car else {
+                break;
+            };
+            if let Err(error) = register_car_invites(&coordinator, &identity, &car).await {
+                crate::diagnostics::record(
+                    "warn",
+                    "coordinator",
+                    format!("carpool invite lease renewal failed: {error}"),
+                );
+            }
+        }
+    });
 }
 
 fn mark_seat_joining(state: &RuntimeState, grant: &AccessGrant, nickname: &str) {
@@ -1305,7 +1409,7 @@ pub async fn start_car(
         );
     }
     let now = now_ms();
-    validate_schedule(input.starts_at, input.ends_at, now)?;
+    validate_schedule(input.starts_at, input.ends_at, input.always_on, now)?;
     let managed_root = managed_tools_root(&app);
     let account_pool_path = state
         .inner
@@ -1324,7 +1428,11 @@ pub async fn start_car(
     let coordinator = CoordinatorClient::from_environment()?;
     let car_id = Uuid::new_v4().to_string();
     let started_at = input.starts_at;
-    let expires_at = input.ends_at;
+    let expires_at = if input.always_on {
+        i64::MAX
+    } else {
+        input.ends_at
+    };
     let car_name = input.car_name.trim().chars().take(32).collect::<String>();
     let car_name = if car_name.is_empty() {
         "我的可信车队".to_string()
@@ -1352,28 +1460,14 @@ pub async fn start_car(
         car_name: car_name.clone(),
         started_at,
         expires_at,
+        always_on: input.always_on,
         enabled_tools: input.enabled_tools,
         seats,
         account_quotas,
     };
 
-    for seat in &car.seats {
-        let payload = PublicInvitePayload {
-            version: PROTOCOL_VERSION,
-            code: seat.code.clone(),
-            car_id: car.car_id.clone(),
-            car_name: car.car_name.clone(),
-            owner_label: "可信车主".to_string(),
-            owner_peer_id: identity.peer_id.clone(),
-            owner_encryption_public_key: identity.encryption_public_key.clone(),
-            seat_no: seat.seat_no,
-            enabled_tools: car.enabled_tools.clone(),
-            starts_at_ms: car.started_at,
-            expires_at_ms: car.expires_at,
-        };
-        let invite = coordinator.build_invite(&identity, &payload, now_ms())?;
-        coordinator.register_invite(&invite).await?;
-    }
+    register_car_invites(&coordinator, &identity, &car).await?;
+    ride_history_store(state.inner())?.record_host_started(&car, now_ms())?;
 
     {
         let mut runtime = state
@@ -1385,13 +1479,47 @@ pub async fn start_car(
         runtime.pending_signals.clear();
         runtime.relay_request_seen_at.clear();
     }
-    spawn_host_claim_loop(state.inner().clone(), coordinator, identity, car_id);
+    spawn_host_claim_loop(
+        state.inner().clone(),
+        coordinator.clone(),
+        identity.clone(),
+        car_id.clone(),
+    );
+    spawn_host_invite_renewal_loop(state.inner().clone(), coordinator, identity, car_id);
     spawn_account_quota_loop(state.inner().clone(), car.car_id.clone());
     Ok(car)
 }
 
 #[tauri::command]
 pub async fn stop_car(state: State<'_, RuntimeState>) -> Result<(), String> {
+    let car_id = {
+        let mut runtime = state
+            .inner
+            .lock()
+            .map_err(|_| "运行状态暂时不可用".to_string())?;
+        let car_id = runtime.active_car.as_ref().map(|car| car.car_id.clone());
+        runtime.active_car = None;
+        runtime.host_bindings.clear();
+        runtime.pending_signals.clear();
+        runtime.relay_request_seen_at.clear();
+        car_id
+    };
+    if let Some(car_id) = car_id {
+        if let Err(error) = ride_history_store(state.inner())
+            .and_then(|mut history| history.record_host_stopped(&car_id, now_ms()).map(|_| ()))
+        {
+            crate::diagnostics::record(
+                "warn",
+                "ride-history",
+                format!("failed to mark host ride stopped: {error}"),
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn suspend_car(state: State<'_, RuntimeState>) -> Result<(), String> {
     let mut runtime = state
         .inner
         .lock()
@@ -1413,6 +1541,244 @@ pub async fn get_active_car(state: State<'_, RuntimeState>) -> Result<Option<Car
         crate::quota::refresh_car(car, now_ms());
     }
     Ok(runtime.active_car.clone())
+}
+
+#[tauri::command]
+pub async fn list_ride_history(
+    state: State<'_, RuntimeState>,
+) -> Result<Vec<RideHistorySummary>, String> {
+    let records = ride_history_store(state.inner())?.list();
+    let active_car_id = state
+        .inner
+        .lock()
+        .map_err(|_| "运行状态暂时不可用".to_string())?
+        .active_car
+        .as_ref()
+        .map(|car| car.car_id.clone());
+    let now = now_ms();
+    let coordinator = CoordinatorClient::from_environment().ok();
+    let mut availability = BTreeMap::new();
+    let mut checks = tokio::task::JoinSet::new();
+    if let Some(coordinator) = coordinator {
+        for record in records
+            .iter()
+            .filter(|record| {
+                record.role == RideRole::Passenger
+                    && record.can_resume_at(now)
+                    && record.code.is_some()
+            })
+            .take(50)
+        {
+            let coordinator = coordinator.clone();
+            let record_id = record.record_id.clone();
+            let code = record.code.clone().unwrap_or_default();
+            checks.spawn(async move {
+                let resolved =
+                    tokio::time::timeout(Duration::from_secs(3), coordinator.resolve_invite(&code))
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .map(|(payload, _)| payload);
+                (record_id, resolved)
+            });
+        }
+    }
+    while let Some(result) = checks.join_next().await {
+        if let Ok((record_id, resolved)) = result {
+            availability.insert(record_id, resolved);
+        }
+    }
+
+    Ok(records
+        .into_iter()
+        .map(|record| {
+            let (status, can_resume) = match record.role {
+                RideRole::Host if record.stopped || record.ended_at.is_some() => {
+                    (RideAvailability::Stopped, false)
+                }
+                RideRole::Host if !record.always_on && record.expires_at <= now => {
+                    (RideAvailability::Expired, false)
+                }
+                RideRole::Host if active_car_id.as_deref() == Some(record.car_id.as_str()) => {
+                    let status = if record.started_at > now {
+                        RideAvailability::Scheduled
+                    } else {
+                        RideAvailability::Online
+                    };
+                    (status, false)
+                }
+                RideRole::Host => (RideAvailability::Offline, record.can_resume_at(now)),
+                RideRole::Passenger if !record.always_on && record.expires_at <= now => {
+                    (RideAvailability::Expired, false)
+                }
+                RideRole::Passenger => match availability.remove(&record.record_id).flatten() {
+                    Some(payload)
+                        if payload.car_id == record.car_id
+                            && payload.seat_no == record.seat_no.unwrap_or_default() =>
+                    {
+                        if payload.starts_at_ms > now {
+                            (RideAvailability::Scheduled, false)
+                        } else {
+                            (RideAvailability::Online, true)
+                        }
+                    }
+                    _ => (RideAvailability::Offline, false),
+                },
+            };
+            RideHistorySummary {
+                record_id: record.record_id,
+                role: match record.role {
+                    RideRole::Host => RideHistoryRole::Host,
+                    RideRole::Passenger => RideHistoryRole::Passenger,
+                },
+                car_id: record.car_id,
+                car_name: record.car_name,
+                started_at: record.started_at,
+                expires_at: record.expires_at,
+                always_on: record.always_on,
+                enabled_tools: record.enabled_tools,
+                seat_no: record.seat_no,
+                nickname: record.nickname,
+                created_at: record.created_at,
+                last_active_at: record.last_active_at,
+                ended_at: record.ended_at,
+                can_resume,
+                availability: status,
+            }
+        })
+        .collect())
+}
+
+fn car_from_history(
+    record: &StoredRideRecord,
+    identity: &DeviceIdentity,
+) -> Result<CarSession, String> {
+    if record.role != RideRole::Host || record.owner_peer_id != identity.peer_id {
+        return Err("这条发车记录不属于当前设备".to_string());
+    }
+    if record.seats.len() != 4 {
+        return Err("发车记录中的座位信息不完整".to_string());
+    }
+    let mut seen_codes = HashSet::new();
+    let mut seen_seats = HashSet::new();
+    let mut seats = Vec::with_capacity(4);
+    for stored in &record.seats {
+        let code = normalize_code(&stored.code)?;
+        if !(1..=4).contains(&stored.seat_no)
+            || !seen_codes.insert(code.clone())
+            || !seen_seats.insert(stored.seat_no)
+        {
+            return Err("发车记录中的座位信息无效".to_string());
+        }
+        seats.push(Seat {
+            seat_no: stored.seat_no,
+            code,
+            nickname: None,
+            state: SeatState::Waiting,
+            tool: None,
+            usage: SeatUsageSummary::default(),
+            token_limits: stored.token_limits.clone(),
+            token_limit_status: MemberTokenLimitStatus::default(),
+            token_usage_events: Vec::new(),
+        });
+    }
+    seats.sort_by_key(|seat| seat.seat_no);
+    Ok(CarSession {
+        car_id: record.car_id.clone(),
+        car_name: record.car_name.clone(),
+        owner_peer_id: identity.peer_id.clone(),
+        started_at: record.started_at,
+        expires_at: record.expires_at,
+        always_on: record.always_on,
+        enabled_tools: record.enabled_tools.clone(),
+        seats,
+        account_quotas: crate::account_quota::pending_for(&record.enabled_tools),
+    })
+}
+
+#[tauri::command]
+pub async fn resume_host_car(
+    record_id: String,
+    app: AppHandle,
+    state: State<'_, RuntimeState>,
+) -> Result<CarSession, String> {
+    let _ride_transition = state.begin_ride_transition()?;
+    let now = now_ms();
+    let mut history = ride_history_store(state.inner())?;
+    let record = history
+        .get(&record_id)
+        .filter(|record| record.can_resume_at(now))
+        .ok_or_else(|| "这条发车记录当前无法恢复".to_string())?;
+    {
+        let runtime = state
+            .inner
+            .lock()
+            .map_err(|_| "运行状态暂时不可用".to_string())?;
+        if runtime.active_car.is_some() {
+            return Err("当前已有正在运行的发车通道".to_string());
+        }
+    }
+    let identity = load_or_create(&app)?;
+    let car = car_from_history(&record, &identity)?;
+    let managed_root = managed_tools_root(&app);
+    let account_pool_path = state
+        .inner
+        .lock()
+        .map_err(|_| "运行状态暂时不可用".to_string())?
+        .account_pool_path
+        .clone();
+    for kind in &car.enabled_tools {
+        let detection = detect_tool(*kind, managed_root.as_deref(), account_pool_path.as_deref());
+        if !detection.installed || !detection.authenticated {
+            return Err(format!("{} 尚未就绪，无法恢复通道", detection.name));
+        }
+    }
+    let coordinator = CoordinatorClient::from_environment()?;
+    register_car_invites(&coordinator, &identity, &car).await?;
+    history
+        .record_host_resumed(&record_id, now)?
+        .ok_or_else(|| "发车记录状态已经变化".to_string())?;
+    {
+        let mut runtime = state
+            .inner
+            .lock()
+            .map_err(|_| "运行状态暂时不可用".to_string())?;
+        runtime.active_car = Some(car.clone());
+        runtime.host_bindings.clear();
+        runtime.pending_signals.clear();
+        runtime.relay_request_seen_at.clear();
+    }
+    spawn_host_claim_loop(
+        state.inner().clone(),
+        coordinator.clone(),
+        identity.clone(),
+        car.car_id.clone(),
+    );
+    spawn_host_invite_renewal_loop(
+        state.inner().clone(),
+        coordinator,
+        identity,
+        car.car_id.clone(),
+    );
+    spawn_account_quota_loop(state.inner().clone(), car.car_id.clone());
+    Ok(car)
+}
+
+#[tauri::command]
+pub async fn resume_passenger_ride(
+    record_id: String,
+    app: AppHandle,
+    state: State<'_, RuntimeState>,
+) -> Result<RideAccess, String> {
+    let record = ride_history_store(state.inner())?
+        .get(&record_id)
+        .filter(|record| record.role == RideRole::Passenger && record.can_resume_at(now_ms()))
+        .ok_or_else(|| "这条上车记录当前无法恢复".to_string())?;
+    let code = record
+        .code
+        .ok_or_else(|| "上车记录缺少恢复信息".to_string())?;
+    let nickname = record.nickname.unwrap_or_else(|| "乘客".to_string());
+    join_car(code, nickname, app, state).await
 }
 
 #[tauri::command]
@@ -1507,6 +1873,7 @@ pub fn get_shared_car_status(
         car_name: car.car_name.clone(),
         started_at: car.started_at,
         expires_at: car.expires_at,
+        always_on: car.always_on,
         enabled_tools: car.enabled_tools.clone(),
         account_quotas: car.account_quotas.clone(),
         member: SharedMemberStatus {
@@ -1651,6 +2018,24 @@ pub async fn join_car(
                             owner_encryption_public_key: owner.encryption_public_key.clone(),
                         },
                     );
+                    drop(runtime);
+                    if let Err(error) = ride_history_store(state.inner()).and_then(|mut history| {
+                        history
+                            .record_passenger_joined(
+                                &preview,
+                                &owner.peer_id,
+                                &claim.code,
+                                nickname,
+                                now_ms(),
+                            )
+                            .map(|_| ())
+                    }) {
+                        crate::diagnostics::record(
+                            "warn",
+                            "ride-history",
+                            format!("failed to persist passenger ride history: {error}"),
+                        );
+                    }
                     return Ok(access);
                 }
                 Ok(None) => {}
@@ -2263,21 +2648,46 @@ mod tests {
     #[test]
     fn schedule_accepts_immediate_or_future_ranges_and_rejects_invalid_windows() {
         let now = 1_700_000_000_000;
-        assert!(validate_schedule(now, now + 2 * 60 * 60_000, now).is_ok());
+        assert!(validate_schedule(now, now + 2 * 60 * 60_000, false, now).is_ok());
         assert!(validate_schedule(
             now + 7 * 24 * 60 * 60_000,
             now + 7 * 24 * 60 * 60_000 + 60 * 60_000,
+            false,
             now
         )
         .is_ok());
-        assert!(validate_schedule(now, now + 10 * 60_000, now).is_err());
-        assert!(validate_schedule(now, now + 25 * 60 * 60_000, now).is_err());
+        assert!(validate_schedule(now, now + 10 * 60_000, false, now).is_err());
+        assert!(validate_schedule(now, now + 25 * 60 * 60_000, false, now).is_err());
         assert!(validate_schedule(
             now + 31 * 24 * 60 * 60_000,
             now + 31 * 24 * 60 * 60_000 + 60 * 60_000,
+            false,
             now
         )
         .is_err());
+        assert!(validate_schedule(now, now, true, now).is_ok());
+        assert!(validate_schedule(now + 31 * 24 * 60 * 60_000, now, true, now).is_err());
+    }
+
+    #[test]
+    fn always_on_preview_uses_business_lifetime_not_the_coordinator_lease() {
+        let payload = PublicInvitePayload {
+            version: PROTOCOL_VERSION,
+            code: "7G2K5LQ8M4TZ".to_string(),
+            car_id: Uuid::new_v4().to_string(),
+            car_name: "全天车队".to_string(),
+            owner_label: "可信车主".to_string(),
+            owner_peer_id: "owner".to_string(),
+            owner_encryption_public_key: "key".to_string(),
+            seat_no: 1,
+            enabled_tools: vec![ToolKind::Claude],
+            starts_at_ms: now_ms() - 1_000,
+            expires_at_ms: i64::MAX,
+            always_on: true,
+        };
+        let preview = preview_from_payload(&payload).expect("always-on preview");
+        assert!(preview.always_on);
+        assert_eq!(preview.expires_at, i64::MAX);
     }
 
     #[test]
@@ -2296,6 +2706,7 @@ mod tests {
             owner_peer_id: owner.peer_id.clone(),
             started_at: now,
             expires_at: now + 60_000,
+            always_on: false,
             enabled_tools: vec![ToolKind::Claude, ToolKind::Codex],
             seats: vec![Seat {
                 seat_no: 1,

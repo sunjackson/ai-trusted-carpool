@@ -266,6 +266,7 @@ export type CarSession = {
   ownerPeerId: string;
   startedAt: number;
   expiresAt: number;
+  alwaysOn: boolean;
   enabledTools: ToolKind[];
   seats: Seat[];
   accountQuotas: AccountQuotaSnapshot[];
@@ -278,6 +279,7 @@ export type SharedCarStatus = {
   carName: string;
   startedAt: number;
   expiresAt: number;
+  alwaysOn: boolean;
   enabledTools: ToolKind[];
   accountQuotas: AccountQuotaSnapshot[];
   member: SharedMemberStatus;
@@ -291,6 +293,28 @@ export type JoinPreview = {
   enabledTools: ToolKind[];
   startsAt: number;
   expiresAt: number;
+  alwaysOn: boolean;
+};
+
+export type RideHistoryRole = 'host' | 'passenger';
+export type RideAvailability = 'online' | 'scheduled' | 'offline' | 'expired' | 'stopped';
+
+export type RideHistorySummary = {
+  recordId: string;
+  role: RideHistoryRole;
+  carId: string;
+  carName: string;
+  startedAt: number;
+  expiresAt: number;
+  alwaysOn: boolean;
+  enabledTools: ToolKind[];
+  seatNo: number | null;
+  nickname: string | null;
+  createdAt: number;
+  lastActiveAt: number;
+  endedAt: number | null;
+  canResume: boolean;
+  availability: RideAvailability;
 };
 
 export type RideAccess = JoinPreview & {

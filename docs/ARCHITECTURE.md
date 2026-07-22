@@ -11,7 +11,10 @@ host can enable either or both, and each of four seats can run requests concurre
 - The coordinator stores only signed discovery metadata and expiring mailbox messages.
 - A twelve-character code (shown as 4-4-4) has about 60 bits of random entropy and resolves a
   signed public invite; it is not an API credential. The coordinator limits invite resolution to
-  60 attempts per minute per client IP, and every code expires with the host's schedule.
+  60 attempts per minute per client IP. The signed payload carries the business lifetime, while
+  the coordinator envelope uses a three-minute presence lease renewed every 60 seconds. Fixed
+  windows still expire at their configured end; all-day codes remain discoverable only while the
+  host is online.
 - Public coordinator abuse controls (no website login required): invite registration, messaging,
   polling, and TURN credential minting are rate-limited per IP and per peer identity; each owner
   may hold a bounded number of active invites. TURN credentials are issued only after a signed
@@ -43,6 +46,10 @@ host can enable either or both, and each of four seats can run requests concurre
 - Each completed request appends a local `usage-history.jsonl` event under the app-data directory.
   It stores the car, passenger, tool, model, token categories, and price estimate, but never the
   prompt, response body, credential, session secret, or invite code.
+- Ride recovery uses a separate atomically replaced `ride-history.json` with private permissions.
+  It stores car metadata and the seat codes required to re-register the same channel, but never an
+  access id, session secret, device private key, host binding, signal, prompt, or response body.
+  Corrupt files are quarantined, and only the latest 100 host/passenger records are retained.
 - Official response headers and body chunks are forwarded continuously over the ordered WebRTC
   data channel instead of being buffered. The passenger verifies the final SHA-256 digest before
   accepting a clean stream end; provider-reported usage is applied after the final usage event.
@@ -52,8 +59,9 @@ host can enable either or both, and each of four seats can run requests concurre
 1. Host detects local Claude Code/Codex installations and login files without exposing secrets.
    Detection includes GUI-safe npm, Homebrew, NVM, FNM, Volta, pnpm, and Windows npm locations,
    so launching the desktop app outside a shell does not depend on an inherited `PATH`.
-2. Host sets a start/end window, creates four signed public invites, and registers them with the
-   coordinator.
+2. Host sets a fixed window or all-day mode, creates four signed public invites, and registers
+   short presence leases with the coordinator. The app renews those leases while the host runtime
+   is active.
 3. The coordinator exposes a fixed-origin `/api/v1/carpool/join/<code>` launch page. It contains only the short
    code and redirects to the statically registered `trusted-carpool://join/<code>` scheme. The
    desktop app rejects every non-official HTTPS origin, custom-scheme host, port, and malformed code.
@@ -71,6 +79,20 @@ host can enable either or both, and each of four seats can run requests concurre
    encrypted data channel without waiting for a complete model response.
 8. The host validates the official endpoint, calls the provider locally, extracts provider usage,
    and updates that seat's model-specific counters and official list-price estimate.
+
+## Restart Recovery and Ride History
+
+- Starting a car records its car ID, schedule/mode, enabled tools, and four seat codes locally.
+  Explicit “stop hosting” closes the record; a normal process/OS shutdown leaves it resumable.
+- On the next launch the app does not silently restart sharing. The host explicitly chooses to
+  restore the prior channel or start a new car. Restoring re-registers fresh presence leases and
+  restarts claim/quota loops with the persistent device identity.
+- Volatile host bindings, access ids, session secrets, signaling queues, and WebRTC connections are
+  never restored. Previous passengers rejoin through the same history entry and receive a fresh
+  claim/grant pair.
+- Passenger history stores the original code only in the private Rust state file. Listing history
+  resolves that code through the coordinator with a bounded timeout; the UI exposes only an opaque
+  record ID and an availability enum, never the code itself.
 
 ## Managed Tool Runtime (zero-setup passengers)
 

@@ -92,6 +92,37 @@ test('registers and resolves an owner-signed public invite', async () => {
   });
 });
 
+test('renewed short invite leases stay online and expire after the host stops renewing', async () => {
+  let now = 1_800_000_000_000;
+  await withServer(async base => {
+    const owner = identity();
+    const invite = {
+      code: 'M9Q3TP7W6KXR',
+      owner_peer_id: owner.peerId,
+      owner_public_key: owner.publicKey,
+      owner_encryption_public_key: owner.encryptionPublicKey,
+      car_id: crypto.randomUUID(),
+      seat_no: 1,
+      payload_base64: Buffer.from(JSON.stringify({ always_on: true, expires_at_ms: Number.MAX_SAFE_INTEGER })).toString('base64'),
+      expires_at_ms: now + 180_000,
+      timestamp_ms: now,
+    };
+    invite.signature = owner.sign(canonicalInvite(invite));
+    assert.equal((await request(`${base}/api/v1/carpool/invites`, 'POST', invite)).status, 200);
+
+    now += 60_000;
+    invite.expires_at_ms = now + 180_000;
+    invite.timestamp_ms = now;
+    invite.signature = owner.sign(canonicalInvite(invite));
+    assert.equal((await request(`${base}/api/v1/carpool/invites`, 'POST', invite)).status, 200);
+
+    now += 179_000;
+    assert.equal((await request(`${base}/api/v1/carpool/invites/${invite.code}`)).status, 200);
+    now += 2_000;
+    assert.equal((await request(`${base}/api/v1/carpool/invites/${invite.code}`)).status, 404);
+  }, { clock: () => now });
+});
+
 test('does not create launch pages for unknown or malformed invite codes', async () => {
   await withServer(async base => {
     assert.equal((await request(`${base}/api/v1/carpool/join/7G2K5LQ8M4TZ`)).status, 404);

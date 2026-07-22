@@ -837,7 +837,7 @@ fn binding_for_request(
         .active_car
         .as_mut()
         .ok_or_else(|| "车主已经停止发车".to_string())?;
-    if car.started_at > current_ms || car.expires_at <= current_ms {
+    if car.started_at > current_ms || (!car.always_on && car.expires_at <= current_ms) {
         return Err("当前不在发车开放时间内".to_string());
     }
     if !car.enabled_tools.contains(&request.tool) {
@@ -1553,6 +1553,7 @@ mod tests {
             owner_peer_id: "owner".to_string(),
             started_at: now - 1_000,
             expires_at: now + 60_000,
+            always_on: false,
             enabled_tools: vec![ToolKind::Codex],
             seats: vec![Seat {
                 seat_no: 1,
@@ -2373,6 +2374,7 @@ mod tests {
                 owner_peer_id: "owner".to_string(),
                 started_at: now - 1_000,
                 expires_at: now + 60_000,
+                always_on: false,
                 enabled_tools: vec![ToolKind::Codex],
                 seats,
                 account_quotas: Vec::new(),

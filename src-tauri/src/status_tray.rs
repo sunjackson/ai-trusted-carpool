@@ -152,6 +152,7 @@ mod tests {
             owner_peer_id: "owner".to_string(),
             started_at: 1,
             expires_at: 2,
+            always_on: false,
             enabled_tools: vec![ToolKind::Claude],
             seats: (0_usize..4)
                 .map(|index| Seat {
@@ -202,6 +203,7 @@ mod tests {
                     enabled_tools: vec![ToolKind::Codex],
                     starts_at: 1,
                     expires_at: 2,
+                    always_on: false,
                 },
                 access_id: "access-id".to_string(),
                 owner_peer_id: "other-owner".to_string(),

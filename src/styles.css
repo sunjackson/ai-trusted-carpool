@@ -139,6 +139,39 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .role-card:hover .role-card__arrow { color: var(--gold); transform: translateX(4px); }
 .trust-row { display: flex; align-items: center; justify-content: center; gap: 34px; color: #8d949e; font-size: 12px; }
 .trust-row span { display: flex; align-items: center; gap: 7px; }
+.ride-recovery { width: min(820px,100%); display: grid; grid-template-columns: auto minmax(0,1fr) auto auto; align-items: center; gap: 12px; margin-top: 28px; padding: 14px 2px; text-align: left; border-top: 1px solid #34503d; border-bottom: 1px solid #34503d; }
+.ride-recovery__icon { width: 38px; height: 38px; display: grid; place-items: center; color: #66db90; border: 1px solid #315b40; border-radius: 8px; background: #12251a; }
+.ride-recovery > div { display: flex; min-width: 0; flex-direction: column; gap: 4px; }
+.ride-recovery strong { font-size: 13px; }
+.ride-recovery small { overflow: hidden; color: #929ca7; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.ride-recovery button { min-height: 36px; display: inline-flex; align-items: center; justify-content: center; padding: 0 12px; color: #0d1b12; border: 0; border-radius: 8px; background: #58d383; font-size: 10px; font-weight: 800; cursor: pointer; }
+.ride-recovery button:disabled { opacity: .5; cursor: wait; }
+.ride-recovery .ride-recovery__new { color: #c7cdd5; border: 1px solid #3a424b; background: #1a1e23; }
+.ride-history { width: min(920px,100%); margin-top: 28px; text-align: left; border-top: 1px solid #2b3139; }
+.ride-history__heading { min-height: 48px; display: flex; align-items: center; justify-content: space-between; }
+.ride-history__heading > div { display: flex; align-items: center; gap: 8px; color: #d5dae0; }
+.ride-history__heading > div svg { color: var(--gold); }
+.ride-history__heading strong { font-size: 13px; }
+.ride-history__heading > button { width: 32px; height: 32px; display: grid; place-items: center; color: #9ea6b0; border: 1px solid #353c45; border-radius: 8px; background: #171b20; cursor: pointer; }
+.ride-history__columns { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 18px; }
+.ride-history__group { min-width: 0; }
+.ride-history__group h3 { display: flex; align-items: center; gap: 7px; margin: 0 0 8px; color: #aeb6c0; font-size: 10px; font-weight: 700; }
+.ride-history__group h3 span { min-width: 19px; height: 19px; display: grid; place-items: center; color: #7e8792; border: 1px solid #333a43; border-radius: 50%; font-size: 8px; }
+.ride-history__list { max-height: 272px; display: flex; flex-direction: column; gap: 7px; overflow-y: auto; padding-right: 3px; }
+.ride-history__item { min-height: 64px; display: grid; grid-template-columns: minmax(0,1fr) auto; align-items: center; gap: 7px 10px; padding: 10px 11px; border: 1px solid #303740; border-radius: 8px; background: #15191e; }
+.ride-history__main { display: flex; min-width: 0; flex-direction: column; gap: 4px; }
+.ride-history__main strong { overflow: hidden; color: #e1e5e9; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.ride-history__main span { overflow: hidden; color: #7f8994; font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
+.ride-availability { display: flex; align-items: center; justify-self: end; gap: 5px; color: #8b949f; font-size: 8px; white-space: nowrap; }
+.ride-availability i { width: 6px; height: 6px; border-radius: 50%; background: #727b85; }
+.ride-availability--online { color: #70d894; }
+.ride-availability--online i { background: var(--green); box-shadow: 0 0 8px #22c55e66; }
+.ride-availability--scheduled { color: #d4b65e; }
+.ride-availability--scheduled i { background: var(--gold); }
+.ride-availability--expired, .ride-availability--stopped { color: #7a828c; }
+.ride-history__item > button { grid-column: 2; display: inline-flex; align-items: center; justify-content: center; gap: 5px; min-width: 88px; height: 28px; padding: 0 8px; color: #e5cb75; border: 1px solid #5c4b20; border-radius: 7px; background: #242013; font-size: 9px; font-weight: 700; cursor: pointer; }
+.ride-history__item > button:disabled { color: #6f7781; border-color: #303740; background: #191d22; cursor: not-allowed; }
+.ride-history__empty, .ride-history__loading { margin: 0; padding: 20px 12px; color: #69727d; border: 1px dashed #303740; border-radius: 8px; font-size: 9px; text-align: center; }
 
 .first-run { width: min(640px, 100%); min-height: calc(100vh - 128px); margin: 0 auto; display: flex; flex-direction: column; justify-content: center; align-items: center; padding: 32px 0 24px; text-align: center; }
 .first-run__icon { width: 66px; height: 66px; display: grid; place-items: center; margin-bottom: 20px; color: #1a1407; border-radius: 22px; background: linear-gradient(145deg, #ffe680, #ffb827); box-shadow: 0 18px 60px rgba(255,190,47,.22), inset 0 1px #fff8; }
@@ -205,7 +238,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .segmented-control { display: grid; grid-template-columns: repeat(2,1fr); padding: 3px; border: 1px solid #333943; border-radius: 12px; background: #111419; }
 .segmented-control button { height: 35px; border: 0; border-radius: 9px; color: #8f97a2; font-size: 11px; font-weight: 600; background: transparent; cursor: pointer; }
 .segmented-control button.is-active { color: #181307; background: linear-gradient(180deg,#ffdb6c,var(--gold)); box-shadow: 0 5px 16px rgba(255,192,45,.14); }
-.duration-options { display: grid; grid-template-columns: repeat(5,1fr); gap: 7px; }
+.duration-options { display: grid; grid-template-columns: repeat(6,1fr); gap: 7px; }
 .duration-options button { position: relative; min-width: 0; height: 38px; padding: 0 6px; color: #aeb5bf; border: 1px solid #373e47; border-radius: 10px; font-size: 10px; background: #14171b; cursor: pointer; }
 .duration-options button:hover { border-color: #626a75; }
 .duration-options button.is-active { color: #ffe39a; border-color: #a47b1f; background: #2a2415; box-shadow: inset 0 0 0 1px rgba(255,200,61,.08); }
@@ -564,6 +597,11 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   .role-grid, .tool-grid, .ride-tool-grid { grid-template-columns: 1fr; }
   .role-card { min-height: 120px; }
   .trust-row { gap: 14px; flex-wrap: wrap; }
+  .ride-history__columns { grid-template-columns: 1fr; }
+  .ride-recovery { grid-template-columns: auto minmax(0,1fr); }
+  .ride-recovery button { grid-row: 2; }
+  .ride-recovery button:nth-of-type(1) { grid-column: 1; }
+  .ride-recovery button:nth-of-type(2) { grid-column: 2; }
   .stepper { grid-template-columns: 1fr; }
   .stepper i { display: none; }
   .setup-stack { grid-template-columns: 1fr; }
@@ -620,6 +658,9 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   .code-boxes span { height: 54px; font-size: 15px; letter-spacing: 2px; }
   .schedule-row, .schedule-datetime { grid-template-columns: 1fr; gap: 7px; }
   .duration-options { grid-template-columns: repeat(3,1fr); }
+  .ride-history__item { grid-template-columns: minmax(0,1fr); }
+  .ride-availability { justify-self: start; }
+  .ride-history__item > button { grid-column: 1; width: 100%; }
   .ride-tool { grid-template-columns: auto 1fr; }
   .ride-tool__actions { grid-column: 1/-1; }
   .ride-tool__actions button { flex: 1; }

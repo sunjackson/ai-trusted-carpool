@@ -17,6 +17,7 @@ mod pricing;
 mod protocol;
 mod quota;
 mod relay;
+mod ride_history;
 mod runtime;
 mod status_tray;
 mod terminal_launcher;
@@ -35,10 +36,11 @@ use commands::{
     delete_account, detect_tools, execute_relay_request, export_account_backup,
     focus_client_instance, get_active_car, get_ice_servers, get_shared_car_status, import_accounts,
     import_local_accounts, install_tool, join_car, launch_tool, leave_car, list_accounts,
-    list_client_instances, open_releases_page, poll_webrtc_signals, preview_account_import,
-    preview_account_restore, preview_invite, refresh_account_quotas, retry_account_route,
-    send_webrtc_signal, start_car, start_relay_request, stop_car, submit_relay_response,
-    submit_relay_stream_event, update_account, update_member_token_limits,
+    list_client_instances, list_ride_history, open_releases_page, poll_webrtc_signals,
+    preview_account_import, preview_account_restore, preview_invite, refresh_account_quotas,
+    resume_host_car, resume_passenger_ride, retry_account_route, send_webrtc_signal, start_car,
+    start_relay_request, stop_car, submit_relay_response, submit_relay_stream_event, suspend_car,
+    update_account, update_member_token_limits,
 };
 use diagnostics::{
     clear_debug_logs, export_diagnostic_bundle, get_debug_logs, open_debug_log_directory,
@@ -83,6 +85,12 @@ pub fn run() {
                 .map_err(|_| std::io::Error::other("运行状态暂时不可用"))?;
             runtime.usage_history_path = Some(history_path);
             runtime.account_pool_path = Some(app_data_dir.join("accounts.json"));
+            let ride_history_path = app_data_dir.join("ride-history.json");
+            let ride_history_recovered =
+                ride_history::RideHistoryStore::new(ride_history_path.clone())
+                    .prepare()
+                    .map_err(std::io::Error::other)?;
+            runtime.ride_history_path = Some(ride_history_path);
             let route_state_recovered = runtime
                 .account_router
                 .configure(app_data_dir.join("account-route-state.json"))
@@ -93,6 +101,13 @@ pub fn run() {
                     "warn",
                     "account-router",
                     "damaged route health state was quarantined and reset",
+                );
+            }
+            if ride_history_recovered {
+                diagnostics::record(
+                    "warn",
+                    "ride-history",
+                    "damaged ride history was quarantined and reset",
                 );
             }
             let route_flush_state = setup_state.clone();
@@ -210,7 +225,11 @@ pub fn run() {
             open_releases_page,
             start_car,
             stop_car,
+            suspend_car,
             get_active_car,
+            list_ride_history,
+            resume_host_car,
+            resume_passenger_ride,
             refresh_account_quotas,
             update_member_token_limits,
             get_shared_car_status,

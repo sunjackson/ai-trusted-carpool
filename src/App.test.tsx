@@ -102,6 +102,28 @@ describe('Trusted Carpool simple flow', () => {
     expect(screen.queryByText(/共 4 小时/)).not.toBeInTheDocument();
   });
 
+  it('supports all-day hosting and keeps a visible host history record after stopping', async () => {
+    render(<App />);
+    fireEvent.click(screen.getByRole('button', { name: /我要发车/ }));
+    await screen.findByRole('heading', { name: '选择要共享的工具' });
+    fireEvent.change(screen.getByDisplayValue('我的高效车队'), {
+      target: { value: '全天测试车队' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /全天发车/ }));
+    expect(screen.getByRole('button', { name: /全天发车/ })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByText(/重启后可恢复原通道/)).toBeInTheDocument();
+
+    const startButton = screen.getByRole('button', { name: /开始发车/ });
+    await waitFor(() => expect(startButton).toBeEnabled());
+    fireEvent.click(startButton);
+    expect(await screen.findByText(/全天持续发车/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '停止发车' }));
+
+    expect(await screen.findByText('我的拼车记录')).toBeInTheDocument();
+    expect(screen.getByText('全天测试车队')).toBeInTheDocument();
+    expect(screen.getAllByText('已结束').length).toBeGreaterThan(0);
+  });
+
   it('keeps the member list concise and opens detailed usage on demand', async () => {
     render(<App />);
     fireEvent.click(screen.getByRole('button', { name: /我要发车/ }));
