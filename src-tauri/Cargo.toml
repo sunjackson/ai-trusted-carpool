@@ -1,6 +1,6 @@
 [package]
 name = "trusted-carpool-desktop"
-version = "0.0.4"
+version = "0.0.5"
 description = "One-click trusted carpool for Claude Code and Codex"
 authors = ["CNAIGC"]
 edition = "2021"
@@ -35,7 +35,9 @@ tar = "0.4.46"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 [target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
+tauri-plugin-process = "2.3.1"
 tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
+tauri-plugin-updater = "2.10.1"
 
 [dev-dependencies]
 tauri = { version = "2", features = ["test"] }

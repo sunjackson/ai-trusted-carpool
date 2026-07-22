@@ -26,7 +26,6 @@ import {
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   cancelToolInstall,
-  checkAppUpdate,
   coordinatorHost,
   detectTools,
   getActiveCar,
@@ -37,7 +36,6 @@ import {
   listenForJoinLinks,
   listenForLocalAccountRefresh,
   listenForToolInstallProgress,
-  openReleasesPage,
   previewInvite,
   refreshAccountQuotas,
   serverJoinUrl,
@@ -48,7 +46,6 @@ import {
 } from './api';
 import type {
   AccountQuotaSnapshot,
-  AppUpdateInfo,
   CarSession,
   JoinPreview,
   MemberTokenLimitStatus,
@@ -64,6 +61,7 @@ import type {
 import { t } from './i18n';
 import { DebugPanel } from './DebugPanel';
 import { AccountManager } from './AccountManager';
+import { AppUpdater } from './AppUpdater';
 import { debugLog } from './debugLog';
 import { trustedWebRtc, type P2pConnectionState } from './trustedWebRtc';
 import appIcon from '../src-tauri/icons/128x128.png';
@@ -189,13 +187,13 @@ function Brand({ onHome, onDebug }: { onHome: () => void; onDebug: () => void })
 function WindowShell({
   children,
   onHome,
-  appUpdate,
+  rideActive,
   accountNotice,
   onAccountNoticeHandled,
 }: {
   children: React.ReactNode;
   onHome: () => void;
-  appUpdate: AppUpdateInfo | null;
+  rideActive: boolean;
   accountNotice: number;
   onAccountNoticeHandled: () => void;
 }) {
@@ -225,15 +223,7 @@ function WindowShell({
           >
             <KeyRound size={17} />
           </button>
-          {appUpdate && (
-            <button
-              className="update-pill"
-              onClick={() => void openReleasesPage().catch(() => undefined)}
-              title={`当前 v${appUpdate.currentVersion}，点击打开官方发布页`}
-            >
-              <Download size={13} /> 新版本 {appUpdate.latestVersion}
-            </button>
-          )}
+          <AppUpdater rideActive={rideActive} />
           <span className="official-pill">
             <ShieldCheck size={14} /> {t('titlebar.officialOnly')}
           </span>
@@ -1512,7 +1502,6 @@ export default function App() {
   const [loadingTools, setLoadingTools] = useState(true);
   const [installingTool, setInstallingTool] = useState<ToolKind | null>(null);
   const [installProgress, setInstallProgress] = useState<ToolInstallProgress | null>(null);
-  const [appUpdate, setAppUpdate] = useState<AppUpdateInfo | null>(null);
   const [car, setCar] = useState<CarSession | null>(null);
   const [access, setAccess] = useState<RideAccess | null>(null);
   const [pendingServerJoin, setPendingServerJoin] = useState<PendingServerJoin | null>(null);
@@ -1566,18 +1555,6 @@ export default function App() {
   };
 
   useEffect(() => { void loadTools(); }, [loadTools]);
-  useEffect(() => {
-    let disposed = false;
-    // Best-effort awareness of newer app releases; failures stay silent.
-    void checkAppUpdate()
-      .then(update => {
-        if (!disposed) setAppUpdate(update);
-      })
-      .catch(() => undefined);
-    return () => {
-      disposed = true;
-    };
-  }, []);
   useEffect(() => {
     let disposed = false;
     let unlisten: (() => void) | undefined;
@@ -1668,7 +1645,7 @@ export default function App() {
   return (
     <WindowShell
       onHome={goHome}
-      appUpdate={appUpdate}
+      rideActive={car !== null || access !== null}
       accountNotice={accountNotice}
       onAccountNoticeHandled={() => setAccountNotice(0)}
     >

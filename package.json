@@ -1,13 +1,14 @@
 {
   "name": "trusted-carpool-desktop",
   "private": true,
-  "version": "0.0.4",
+  "version": "0.0.5",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
     "test": "vitest run",
+    "test:release": "node --test scripts/generate-updater-manifest.test.mjs scripts/verify-updater-artifacts.test.mjs",
     "test:coverage": "vitest run --coverage",
     "test:webrtc:e2e": "node --use-system-ca e2e/run-browser-webrtc.mjs",
     "lint": "eslint . --max-warnings 0",

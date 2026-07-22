@@ -150,6 +150,27 @@ export type AppUpdateInfo = {
   releaseUrl: string;
 };
 
+export type SignedAppUpdateInfo = {
+  currentVersion: string;
+  version: string;
+  notes: string | null;
+  date: string | null;
+  installSupported: boolean;
+  installBlockReason: 'unsupportedPlatform' | 'activeRide' | null;
+};
+
+export type AppUpdateDownloadProgress = {
+  event: 'started' | 'progress' | 'finished';
+  downloadedBytes: number;
+  totalBytes: number | null;
+};
+
+export type AppUpdateDownloadResult = {
+  update: SignedAppUpdateInfo;
+  downloadedBytes: number;
+  totalBytes: number | null;
+};
+
 export type ToolInstallPhase = 'resolving' | 'downloading' | 'verifying' | 'installing' | 'npm';
 
 export type ToolInstallProgress = {

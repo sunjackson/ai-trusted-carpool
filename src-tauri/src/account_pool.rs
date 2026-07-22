@@ -2895,7 +2895,7 @@ fn replace_file(source: &Path, destination: &Path) -> Result<(), String> {
 
 #[cfg(windows)]
 fn replace_file(source: &Path, destination: &Path) -> Result<(), String> {
-    let parent = destination
+    let _parent = destination
         .parent()
         .ok_or_else(|| "账号存储路径无效".to_string())?;
     let backup = account_store_backup_path(destination);

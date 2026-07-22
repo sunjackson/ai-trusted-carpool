@@ -20,12 +20,37 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 20.19.4
           cache: npm
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Gate release tag before any signing job
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          APP_VERSION="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          PACKAGE_VERSION="$(node -p "require('./package.json').version")"
+          CARGO_VERSION="$(awk -F ' *= *' '/^version *=/ { gsub(/\"/, "", $2); print $2; exit }' src-tauri/Cargo.toml)"
+          test "${APP_VERSION}" = "${PACKAGE_VERSION}"
+          test "${APP_VERSION}" = "${CARGO_VERSION}"
+          test "${GITHUB_REF_NAME}" = "v${APP_VERSION}" || {
+            echo "Tag ${GITHUB_REF_NAME} does not match application version v${APP_VERSION}" >&2
+            exit 1
+          }
+          test -s "docs/releases/${GITHUB_REF_NAME}.md" || {
+            echo "Missing bilingual release notes at docs/releases/${GITHUB_REF_NAME}.md" >&2
+            exit 1
+          }
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          git merge-base --is-ancestor HEAD refs/remotes/origin/main || {
+            echo "Release tag must point to a commit reachable from origin/main" >&2
+            exit 1
+          }
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable 2026-07-22
         with:
           components: rustfmt, clippy
       - name: Install Linux desktop dependencies
@@ -43,6 +68,8 @@ jobs:
         run: npm audit --audit-level=high
       - name: Test frontend
         run: npm test -- --run
+      - name: Test release tooling
+        run: npm run test:release
       - name: Report frontend coverage (non-blocking)
         run: npm run test:coverage
         continue-on-error: true
@@ -59,7 +86,7 @@ jobs:
       - name: Lint Rust backend
         run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
       - name: Install cargo-audit
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9 # v2
         with:
           tool: cargo-audit
       - name: Audit Rust dependencies
@@ -68,6 +95,8 @@ jobs:
   build:
     name: Build ${{ matrix.label }}
     needs: verify
+    environment:
+      name: ${{ startsWith(github.ref, 'refs/tags/v') && 'release' || 'continuous-integration' }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -75,29 +104,43 @@ jobs:
         include:
           - label: macOS universal DMG
             os: macos-15
-            build_args: --target universal-apple-darwin --bundles dmg
+            build_args: --target universal-apple-darwin --bundles app,dmg
+            signing_config: ''
             artifact_name: macos-universal
-            artifact_path: src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+            bundle_dir: src-tauri/target/universal-apple-darwin/release/bundle
+            artifact_path: |
+              src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+              src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app.tar.gz
+              src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app.tar.gz.sig
           - label: Windows x64 installer
             os: windows-2022
             build_args: --bundles nsis
+            signing_config: --config src-tauri/tauri.windows-ci.conf.json
             artifact_name: windows-x86_64
-            artifact_path: src-tauri/target/release/bundle/nsis/*.exe
+            bundle_dir: src-tauri/target/release/bundle
+            artifact_path: |
+              src-tauri/target/release/bundle/nsis/*.exe
+              src-tauri/target/release/bundle/nsis/*.exe.sig
           - label: Linux x64 packages
             os: ubuntu-22.04
             build_args: --bundles deb,appimage
+            signing_config: ''
             artifact_name: linux-x86_64
+            bundle_dir: src-tauri/target/release/bundle
             artifact_path: |
               src-tauri/target/release/bundle/deb/*.deb
               src-tauri/target/release/bundle/appimage/*.AppImage
+              src-tauri/target/release/bundle/appimage/*.AppImage.sig
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 20.19.4
           cache: npm
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable 2026-07-22
       - name: Install macOS universal Rust targets
         if: runner.os == 'macOS'
         run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
@@ -113,10 +156,142 @@ jobs:
             xdg-utils
       - name: Install frontend dependencies
         run: npm ci
-      - name: Build installer
+      - name: Import and pin Windows code-signing certificate
+        if: runner.os == 'Windows' && startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE_PFX: ${{ secrets.WINDOWS_CERTIFICATE_PFX }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          WINDOWS_CERTIFICATE_THUMBPRINT: ${{ secrets.WINDOWS_CERTIFICATE_THUMBPRINT }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($name in @('WINDOWS_CERTIFICATE_PFX', 'WINDOWS_CERTIFICATE_PASSWORD', 'WINDOWS_CERTIFICATE_THUMBPRINT')) {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+              throw "Required release secret $name is missing"
+            }
+          }
+
+          $expected = ($env:WINDOWS_CERTIFICATE_THUMBPRINT -replace '\s', '').ToUpperInvariant()
+          if ($expected -notmatch '^[0-9A-F]{40}$') {
+            throw 'WINDOWS_CERTIFICATE_THUMBPRINT must contain exactly 40 hexadecimal characters'
+          }
+
+          $pfxPath = Join-Path $env:RUNNER_TEMP 'trusted-carpool-code-signing.pfx'
+          $thumbprintListPath = Join-Path $env:RUNNER_TEMP 'trusted-carpool-imported-certificates.txt'
+          New-Item -Path $thumbprintListPath -ItemType File -Force | Out-Null
+          try {
+            [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_PFX))
+            $password = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+            $imported = @(Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation 'Cert:\CurrentUser\My' -Password $password)
+            $importedThumbprints = @($imported | ForEach-Object {
+              ($_.Thumbprint -replace '\s', '').ToUpperInvariant()
+            } | Select-Object -Unique)
+            $invalidThumbprints = @($importedThumbprints | Where-Object { $_ -notmatch '^[0-9A-F]{40}$' })
+            $validImportedThumbprints = @($importedThumbprints | Where-Object { $_ -match '^[0-9A-F]{40}$' })
+            [IO.File]::WriteAllLines($thumbprintListPath, [string[]]$validImportedThumbprints)
+            if ($importedThumbprints.Count -ne $imported.Count -or $invalidThumbprints.Count -gt 0) {
+              throw 'The PFX import returned an invalid certificate thumbprint'
+            }
+            $certificate = $imported | Where-Object HasPrivateKey | Select-Object -First 1
+            if ($null -eq $certificate) { throw 'The PFX did not import a certificate with a private key' }
+
+            $actual = ($certificate.Thumbprint -replace '\s', '').ToUpperInvariant()
+            if ($actual -ne $expected) {
+              throw "Imported certificate thumbprint $actual does not match the pinned fingerprint"
+            }
+
+            @{
+              bundle = @{
+                windows = @{
+                  certificateThumbprint = $actual
+                  digestAlgorithm = 'sha256'
+                  timestampUrl = 'http://timestamp.digicert.com'
+                }
+              }
+            } | ConvertTo-Json -Depth 8 | Set-Content -Encoding utf8 'src-tauri/tauri.windows-ci.conf.json'
+          } finally {
+            Remove-Item -Force -ErrorAction SilentlyContinue $pfxPath
+          }
+      - name: Build installer (unsigned development artifact)
+        if: ${{ ! startsWith(github.ref, 'refs/tags/v') }}
         run: npm run tauri build -- ${{ matrix.build_args }}
+      - name: Require updater signing key
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          test -n "${TAURI_SIGNING_PRIVATE_KEY:-}" || {
+            echo 'TAURI_SIGNING_PRIVATE_KEY is required for tag builds' >&2
+            exit 1
+          }
+      - name: Build signed release and updater artifacts
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npm run tauri build -- ${{ matrix.build_args }} --config src-tauri/tauri.release.conf.json ${{ matrix.signing_config }}
+      - name: Verify updater signatures against embedded public key
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: node scripts/verify-updater-artifacts.mjs --assets-dir "${{ matrix.bundle_dir }}"
+      - name: Verify Windows Authenticode signatures
+        if: runner.os == 'Windows' && startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE_THUMBPRINT: ${{ secrets.WINDOWS_CERTIFICATE_THUMBPRINT }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Filter signtool.exe -Recurse |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if ($null -eq $signtool) { throw 'signtool.exe was not found' }
+          $expectedSigner = ($env:WINDOWS_CERTIFICATE_THUMBPRINT -replace '\s', '').ToUpperInvariant()
+          if ($expectedSigner -notmatch '^[0-9A-F]{40}$') {
+            throw 'WINDOWS_CERTIFICATE_THUMBPRINT must contain exactly 40 hexadecimal characters'
+          }
+          $installers = @(Get-ChildItem 'src-tauri/target/release/bundle/nsis' -Filter '*.exe')
+          if ($installers.Count -ne 1) { throw "Expected one NSIS installer, found $($installers.Count)" }
+          foreach ($installer in $installers) {
+            $signature = Get-AuthenticodeSignature $installer.FullName
+            if ($signature.Status -ne 'Valid' -or $null -eq $signature.SignerCertificate) {
+              throw "Authenticode signature is not valid for $($installer.Name): $($signature.Status)"
+            }
+            $actualSigner = ($signature.SignerCertificate.Thumbprint -replace '\s', '').ToUpperInvariant()
+            if ($actualSigner -notmatch '^[0-9A-F]{40}$') {
+              throw "Installer signer thumbprint has an invalid format: $actualSigner"
+            }
+            if ($actualSigner -ne $expectedSigner) {
+              throw "Installer signer $actualSigner does not match pinned fingerprint $expectedSigner"
+            }
+            & $signtool.FullName verify /pa /all /v $installer.FullName
+            if ($LASTEXITCODE -ne 0) { throw "Authenticode verification failed for $($installer.Name)" }
+            if (-not (Test-Path "$($installer.FullName).sig")) {
+              throw "Tauri updater signature is missing for $($installer.Name)"
+            }
+          }
+      - name: Remove imported Windows certificate
+        if: ${{ always() && runner.os == 'Windows' && startsWith(github.ref, 'refs/tags/v') }}
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE_THUMBPRINT: ${{ secrets.WINDOWS_CERTIFICATE_THUMBPRINT }}
+        run: |
+          $thumbprintListPath = Join-Path $env:RUNNER_TEMP 'trusted-carpool-imported-certificates.txt'
+          $thumbprints = @()
+          if (Test-Path $thumbprintListPath) {
+            $thumbprints += @(Get-Content $thumbprintListPath)
+          }
+          $expected = ($env:WINDOWS_CERTIFICATE_THUMBPRINT -replace '\s', '').ToUpperInvariant()
+          if ($expected -match '^[0-9A-F]{40}$') {
+            $thumbprints += $expected
+          }
+          foreach ($thumbprint in @($thumbprints | Select-Object -Unique)) {
+            if ($thumbprint -match '^[0-9A-F]{40}$') {
+              Remove-Item -Force -ErrorAction SilentlyContinue "Cert:\CurrentUser\My\$thumbprint"
+            }
+          }
+          Remove-Item -Force -ErrorAction SilentlyContinue $thumbprintListPath
       - name: Upload installer
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: trusted-carpool-${{ matrix.artifact_name }}
           path: ${{ matrix.artifact_path }}
@@ -130,27 +305,53 @@ jobs:
     needs: build
     runs-on: ubuntu-22.04
     timeout-minutes: 15
+    environment:
+      name: release
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 20.19.4
       - name: Verify tag matches application version
         shell: bash
         run: |
           APP_VERSION="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          PACKAGE_VERSION="$(node -p "require('./package.json').version")"
+          CARGO_VERSION="$(awk -F ' *= *' '/^version *=/ { gsub(/\"/, "", $2); print $2; exit }' src-tauri/Cargo.toml)"
+          test "${APP_VERSION}" = "${PACKAGE_VERSION}"
+          test "${APP_VERSION}" = "${CARGO_VERSION}"
           test "${GITHUB_REF_NAME}" = "v${APP_VERSION}" || {
             echo "Tag ${GITHUB_REF_NAME} does not match application version v${APP_VERSION}" >&2
             exit 1
           }
+          test -s "docs/releases/${GITHUB_REF_NAME}.md" || {
+            echo "Missing bilingual release notes at docs/releases/${GITHUB_REF_NAME}.md" >&2
+            exit 1
+          }
       - name: Download installers
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: trusted-carpool-*
           path: release-assets
           merge-multiple: true
+      - name: Verify downloaded updater signatures
+        run: node scripts/verify-updater-artifacts.mjs --assets-dir release-assets
+      - name: Generate updater manifest for signed artifacts
+        shell: bash
+        run: |
+          APP_VERSION="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          node scripts/generate-updater-manifest.mjs \
+            --assets-dir release-assets \
+            --version "${APP_VERSION}" \
+            --tag "${GITHUB_REF_NAME}" \
+            --repository "${GITHUB_REPOSITORY}" \
+            --notes-file "docs/releases/${GITHUB_REF_NAME}.md" \
+            --pub-date "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+            --output release-assets/latest.json
       - name: Create checksums
         shell: bash
         run: |
@@ -161,14 +362,42 @@ jobs:
                 printf '%s  %s\n' "$hash" "$(basename "$file")"
               done > release-assets/SHA256SUMS.txt
           test -s release-assets/SHA256SUMS.txt
-      - name: Publish release and attach installers
+      - name: Stage, verify, and publish release atomically
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           mapfile -d '' assets < <(find release-assets -type f -print0 | sort -z)
-          test "${#assets[@]}" -ge 4
-          gh release create "${GITHUB_REF_NAME}" "${assets[@]}" \
+          test "${#assets[@]}" -ge 8
+
+          expected_assets="$(mktemp)"
+          remote_assets="$(mktemp)"
+          trap 'rm -f "${expected_assets}" "${remote_assets}"' EXIT
+          for asset in "${assets[@]}"; do
+            printf '%s\t%s\n' "$(basename "${asset}")" "$(stat -c '%s' "${asset}")"
+          done | sort > "${expected_assets}"
+          if cut -f 1 "${expected_assets}" | uniq -d | grep -q .; then
+            echo 'Release assets contain duplicate basenames and cannot be uploaded safely' >&2
+            exit 1
+          fi
+
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            echo "Release ${GITHUB_REF_NAME} already exists; refusing to overwrite it" >&2
+            exit 1
+          fi
+          gh release create "${GITHUB_REF_NAME}" \
+            --draft \
             --verify-tag \
-            --generate-notes \
+            --notes-file "docs/releases/${GITHUB_REF_NAME}.md" \
             --title "可信拼车 ${GITHUB_REF_NAME}"
+          gh release upload "${GITHUB_REF_NAME}" "${assets[@]}"
+
+          test "$(gh release view "${GITHUB_REF_NAME}" --json isDraft --jq '.isDraft')" = 'true'
+          gh release view "${GITHUB_REF_NAME}" --json assets \
+            --jq '.assets[] | [.name, (.size | tostring)] | @tsv' \
+            | sort > "${remote_assets}"
+          diff -u "${expected_assets}" "${remote_assets}"
+
+          gh release edit "${GITHUB_REF_NAME}" --draft=false --latest
+          test "$(gh release view "${GITHUB_REF_NAME}" --json isDraft --jq '.isDraft')" = 'false'

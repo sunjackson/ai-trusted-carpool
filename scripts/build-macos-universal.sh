@@ -4,7 +4,6 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TARGET="universal-apple-darwin"
 APP_NAME="可信拼车.app"
-DMG_NAME="可信拼车_0.1.0_universal.dmg"
 APP_PATH="${ROOT_DIR}/src-tauri/target/${TARGET}/release/bundle/macos/${APP_NAME}"
 OUTPUT_DIR="${ROOT_DIR}/artifacts/macos-universal"
 STAGING_DIR="$(mktemp -d "${TMPDIR:-/tmp}/trusted-carpool-macos.XXXXXX")"
@@ -15,6 +14,8 @@ cleanup() {
 trap cleanup EXIT
 
 cd "${ROOT_DIR}"
+APP_VERSION="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+DMG_NAME="可信拼车_${APP_VERSION}_universal.dmg"
 rustup target add aarch64-apple-darwin x86_64-apple-darwin
 npm ci
 npm run build

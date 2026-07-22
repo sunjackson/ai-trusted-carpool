@@ -48,7 +48,7 @@
 
 从 [GitHub Releases](https://github.com/sunjackson/ai-trusted-carpool/releases) 下载对应平台安装包（macOS 通用 DMG、Windows x64 NSIS、Linux x64 DEB/AppImage），校验 `SHA256SUMS.txt` 后安装。每次 CI 运行的安装包也在 Actions Artifacts 保留 30 天。
 
-> 当前安装包尚未进行 Apple 公证与 Windows 代码签名（进展见 [docs/RELEASE.md](docs/RELEASE.md)），首次打开需要在系统安全设置中手动允许。
+> macOS 安装包尚未进行 Apple 公证，仍需手动允许并从 Release 页面更新。正式 tag 的 Windows 安装包会经过固定证书指纹签名与 `signtool` 验证；普通分支的 Actions Artifact 只是未签名开发包。状态与所需 Secrets 见 [docs/RELEASE.md](docs/RELEASE.md)。
 
 ## 本地开发
 
@@ -69,7 +69,7 @@ cargo test --manifest-path src-tauri/Cargo.toml --all-targets --all-features
 ./scripts/build-linux-docker.sh
 ```
 
-GitHub Actions 会先执行前后端与协调服务自测，再并行生成 macOS 通用 DMG、Windows x64 NSIS、Linux x64 DEB 与 AppImage；每次运行的安装包在 Actions Artifacts 保留 30 天。推送与应用版本一致的 `vX.Y.Z` 标签会自动创建 GitHub Release、附加全部安装包和 `SHA256SUMS.txt`。macOS 正式分发仍需 Apple Developer ID 与公证；Windows 正式分发仍需代码签名证书。
+GitHub Actions 会先执行前后端、发布清单与协调服务自测，再并行生成 macOS 通用 DMG、Windows x64 NSIS、Linux x64 DEB 与 AppImage；每次运行的安装包在 Actions Artifacts 保留 30 天。推送与应用版本一致的 `vX.Y.Z` 标签后，签名门禁会生成 Windows/Linux 更新签名、只包含 NSIS 与 AppImage 的 `latest.json`、`SHA256SUMS.txt` 和中英双语 Release Notes。macOS 与 DEB 保持手动更新。
 
 ## 安全边界
 

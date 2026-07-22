@@ -2,6 +2,7 @@ mod account_pool;
 mod account_quota;
 mod account_router;
 mod account_transfer;
+mod app_updater;
 mod client_launcher;
 mod client_process;
 mod commands;
@@ -24,6 +25,10 @@ mod tool_provisioner;
 mod usage;
 mod usage_history;
 
+use app_updater::{
+    check_signed_app_update, download_app_update, install_app_update, restart_after_app_update,
+    AppUpdaterState,
+};
 use commands::{
     cancel_account_import, cancel_account_restore, cancel_tool_install, check_app_update,
     close_client_instance, commit_account_import, commit_account_restore, confirm_passenger_link,
@@ -48,19 +53,24 @@ use tauri_plugin_deep_link::DeepLinkExt;
 pub fn run() {
     diagnostics::record("info", "runtime", "application starting");
     let state = RuntimeState::default();
+    let updater_state = AppUpdaterState::default();
     let setup_state = state.clone();
     let single_instance_state = state.clone();
     let builder = tauri::Builder::default();
     #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
-    let builder = builder.plugin(tauri_plugin_single_instance::init(
-        move |app, arguments, _working_directory| {
-            join_link::accept_urls(app, &single_instance_state, arguments.iter());
-            join_link::show_main_window(app);
-        },
-    ));
+    let builder = builder
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_single_instance::init(
+            move |app, arguments, _working_directory| {
+                join_link::accept_urls(app, &single_instance_state, arguments.iter());
+                join_link::show_main_window(app);
+            },
+        ));
     builder
         .plugin(tauri_plugin_deep_link::init())
         .manage(state)
+        .manage(updater_state)
         .setup(move |app| {
             client_launcher::recover_stale(app.handle()).map_err(std::io::Error::other)?;
             let app_data_dir = app.path().app_data_dir().map_err(std::io::Error::other)?;
@@ -193,6 +203,10 @@ pub fn run() {
             install_tool,
             cancel_tool_install,
             check_app_update,
+            check_signed_app_update,
+            download_app_update,
+            install_app_update,
+            restart_after_app_update,
             open_releases_page,
             start_car,
             stop_car,

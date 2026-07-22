@@ -207,6 +207,7 @@ describe('zero-dependency one-click provisioning', () => {
     render(<App />);
     const pill = await screen.findByRole('button', { name: /新版本 v0\.2\.0/ });
     fireEvent.click(pill);
+    fireEvent.click(await screen.findByRole('button', { name: '打开官方发布页' }));
     expect(openReleasesPageMock).toHaveBeenCalled();
   });
 

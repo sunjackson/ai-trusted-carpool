@@ -1296,6 +1296,7 @@ pub async fn start_car(
     if input.enabled_tools.is_empty() {
         return Err("至少选择一个工具".to_string());
     }
+    let _ride_transition = state.begin_ride_transition()?;
     if let Err(error) = refresh_known_local_accounts(&app, &state) {
         crate::diagnostics::record(
             "warn",
@@ -1595,6 +1596,7 @@ pub async fn join_car(
         return Err("昵称应为 1 到 20 个字符".to_string());
     }
     let normalized = normalize_code(&code)?;
+    let _ride_transition = state.begin_ride_transition()?;
     let identity = load_or_create(&app)?;
     let coordinator = CoordinatorClient::from_environment()?;
     let (payload, owner) = coordinator.resolve_invite(&normalized).await?;

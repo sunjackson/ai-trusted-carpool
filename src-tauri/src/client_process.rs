@@ -2,8 +2,8 @@ use crate::models::ToolKind;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::thread;
-use std::time::Duration;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use std::{thread, time::Duration};
 
 #[cfg(target_os = "windows")]
 use serde_json::Value;
@@ -48,13 +48,15 @@ pub(crate) fn canonical_path_key(path: &Path) -> String {
     let value = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     #[cfg(target_os = "windows")]
     {
-        return value
+        value
             .to_string_lossy()
             .replace('/', "\\")
-            .to_ascii_lowercase();
+            .to_ascii_lowercase()
     }
     #[cfg(not(target_os = "windows"))]
-    value.to_string_lossy().into_owned()
+    {
+        value.to_string_lossy().into_owned()
+    }
 }
 
 #[cfg(target_os = "windows")]

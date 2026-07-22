@@ -7,20 +7,24 @@ vi.mock('./tauriInvoke', () => ({ invoke: invokeMock }));
 import {
   cancelAccountImport,
   cancelAccountRestore,
+  checkSignedAppUpdate,
   closeClientInstance,
   commitAccountImport,
   commitAccountRestore,
   deleteAccount,
+  downloadAppUpdate,
   exportAccountBackup,
   focusClientInstance,
   importAccounts,
   importLocalAccounts,
+  installAppUpdate,
   launchTool,
   listAccounts,
   listClientInstances,
   previewAccountImport,
   previewAccountRestore,
   retryAccountRoute,
+  restartAfterAppUpdate,
   serverJoinUrl,
   updateAccount,
 } from './api';
@@ -93,6 +97,76 @@ describe('managed desktop client commands', () => {
     expect(invokeMock).toHaveBeenNthCalledWith(4, 'close_client_instance', {
       instanceId: 'instance-1',
     });
+  });
+});
+
+describe('signed application updater commands', () => {
+  it('uses the Rust invoke contract and forwards Channel progress events', async () => {
+    const transformCallback = vi.fn(() => 41);
+    const unregisterCallback = vi.fn();
+    Object.defineProperty(window, '__TAURI_INTERNALS__', {
+      configurable: true,
+      value: { transformCallback, unregisterCallback },
+    });
+    const update = {
+      currentVersion: '0.0.4',
+      version: '0.0.5',
+      notes: 'signed release',
+      date: '2026-07-22T00:00:00Z',
+      installSupported: true,
+      installBlockReason: null,
+    } as const;
+    const download = {
+      update,
+      downloadedBytes: 512,
+      totalBytes: 1024,
+    };
+    const progressEvents: unknown[] = [];
+    const progressChannel: {
+      current: { onmessage: (event: unknown) => void; toJSON: () => string } | null;
+    } = { current: null };
+
+    invokeMock
+      .mockResolvedValueOnce(update)
+      .mockImplementationOnce((_command, args) => {
+        progressChannel.current = args.progress;
+        progressChannel.current?.onmessage({
+          event: 'progress',
+          downloadedBytes: 512,
+          totalBytes: 1024,
+        });
+        return Promise.resolve(download);
+      })
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce(undefined);
+
+    await expect(checkSignedAppUpdate()).resolves.toEqual(update);
+    await expect(downloadAppUpdate(event => progressEvents.push(event))).resolves.toEqual(download);
+    await expect(installAppUpdate()).resolves.toBeUndefined();
+    await expect(restartAfterAppUpdate()).resolves.toBeUndefined();
+
+    expect(invokeMock).toHaveBeenNthCalledWith(1, 'check_signed_app_update');
+    expect(invokeMock).toHaveBeenNthCalledWith(2, 'download_app_update', {
+      progress: expect.any(Object),
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(3, 'install_app_update');
+    expect(invokeMock).toHaveBeenNthCalledWith(4, 'restart_after_app_update');
+    expect(progressEvents).toEqual([
+      { event: 'progress', downloadedBytes: 512, totalBytes: 1024 },
+    ]);
+    expect(progressChannel.current?.toJSON()).toBe('__CHANNEL__:41');
+    expect(transformCallback).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not expose updater download or install in browser preview mode', async () => {
+    await expect(downloadAppUpdate(() => undefined)).rejects.toThrow(
+      '应用更新仅在桌面应用中可用'
+    );
+    await expect(installAppUpdate()).rejects.toThrow('应用更新仅在桌面应用中可用');
+    await expect(restartAfterAppUpdate()).rejects.toThrow(
+      '应用更新仅在桌面应用中可用'
+    );
+    expect(invokeMock).not.toHaveBeenCalled();
   });
 });
 

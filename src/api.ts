@@ -1,3 +1,4 @@
+import { Channel } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { invoke } from './tauriInvoke';
 import type {
@@ -12,6 +13,9 @@ import type {
   AccountRestoreResult,
   AccountUpdateInput,
   AppUpdateInfo,
+  AppUpdateDownloadProgress,
+  AppUpdateDownloadResult,
+  SignedAppUpdateInfo,
   CarSession,
   JoinPreview,
   MemberTokenLimits,
@@ -659,6 +663,28 @@ export async function cancelToolInstall(kind: ToolKind): Promise<boolean> {
 
 export async function checkAppUpdate(): Promise<AppUpdateInfo | null> {
   return inTauri() ? invoke<AppUpdateInfo | null>('check_app_update') : null;
+}
+
+export async function checkSignedAppUpdate(): Promise<SignedAppUpdateInfo | null> {
+  return inTauri() ? invoke<SignedAppUpdateInfo | null>('check_signed_app_update') : null;
+}
+
+export async function downloadAppUpdate(
+  onProgress: (progress: AppUpdateDownloadProgress) => void
+): Promise<AppUpdateDownloadResult> {
+  if (!inTauri()) throw new Error('应用更新仅在桌面应用中可用');
+  const progress = new Channel<AppUpdateDownloadProgress>(onProgress);
+  return invoke<AppUpdateDownloadResult>('download_app_update', { progress });
+}
+
+export async function installAppUpdate(): Promise<void> {
+  if (!inTauri()) throw new Error('应用更新仅在桌面应用中可用');
+  await invoke('install_app_update');
+}
+
+export async function restartAfterAppUpdate(): Promise<void> {
+  if (!inTauri()) throw new Error('应用更新仅在桌面应用中可用');
+  await invoke('restart_after_app_update');
 }
 
 export async function openReleasesPage(): Promise<void> {

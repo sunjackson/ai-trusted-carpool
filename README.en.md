@@ -48,7 +48,7 @@ A desktop app for sharing a locally signed-in Claude Code / Codex account among 
 
 Download the installer for your platform from [GitHub Releases](https://github.com/sunjackson/ai-trusted-carpool/releases) (macOS universal DMG, Windows x64 NSIS, Linux x64 DEB/AppImage) and verify `SHA256SUMS.txt`. Installers from every CI run are also kept as Actions artifacts for 30 days.
 
-> Installers are not yet Apple-notarized or Windows code-signed (progress tracked in [docs/RELEASE.md](docs/RELEASE.md)), so the first launch needs a manual allow in your OS security settings.
+> macOS builds are not yet Apple-notarized and remain manual installs/updates. Tagged Windows releases are signed with a pinned certificate fingerprint and verified with `signtool`; ordinary branch artifacts are unsigned development builds. See [docs/RELEASE.md](docs/RELEASE.md) for status and required Secrets.
 
 ## Local development
 
@@ -69,7 +69,7 @@ cargo test --manifest-path src-tauri/Cargo.toml --all-targets --all-features
 ./scripts/build-linux-docker.sh
 ```
 
-GitHub Actions runs frontend, backend, and coordinator self-tests first, then builds the macOS universal DMG, Windows x64 NSIS, and Linux x64 DEB/AppImage in parallel. Pushing a `vX.Y.Z` tag matching the app version creates a GitHub Release with all installers and `SHA256SUMS.txt`.
+GitHub Actions runs frontend, release-manifest, backend, and coordinator tests first, then builds the macOS universal DMG, Windows x64 NSIS, and Linux x64 DEB/AppImage in parallel. A matching `vX.Y.Z` tag enters the signing gate, producing Windows/Linux updater signatures, a `latest.json` containing only NSIS and AppImage targets, `SHA256SUMS.txt`, and bilingual release notes. macOS and DEB updates remain manual.
 
 ## Security boundary
 
