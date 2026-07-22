@@ -1355,14 +1355,14 @@ function ToolChooser({ access, tools, installingTool, installProgress, onInstall
         ) : busy ? (
           <><RefreshCw className="spin" size={19} /> 正在打开...</>
         ) : mode === 'desktop' ? (
-          <><MonitorUp size={20} /> 打开 {TOOL_LABEL[selected]} 客户端</>
+          <><MonitorUp size={20} /> 使用拼车配置打开 {TOOL_LABEL[selected]} 客户端</>
         ) : needsDownload ? (
           <><Download size={20} /> 下载并打开 {TOOL_LABEL[selected]} 终端</>
         ) : (
           <><SquareTerminal size={20} /> 打开 {TOOL_LABEL[selected]} 终端</>
         )}
       </button>
-      <p className="quiet-note">客户端会临时使用本车路由，离车后自动恢复原配置</p>
+      <p className="quiet-note">客户端会使用独立的本车配置，离车后自动清理</p>
     </section>
   );
 }
@@ -1451,7 +1451,11 @@ function RidePage({ access, tools, initiallyOpened, installingTool, installProgr
               <ToolMark kind={kind} />
               <div className="ride-tool__meta"><strong>{TOOL_LABEL[kind]}</strong><small><i /> {isOpen ? `${desktopOpen ? '客户端' : ''}${desktopOpen && terminalOpen ? '、' : ''}${terminalOpen ? '终端' : ''}已打开` : '未打开'}</small></div>
               <div className="ride-tool__actions">
-                <button onClick={() => open(kind, 'desktop')} disabled={busy === `${kind}-desktop` || !detection?.desktopInstalled} title={detection?.desktopDetail}>
+                <button
+                  onClick={() => open(kind, 'desktop')}
+                  disabled={busy === `${kind}-desktop` || !detection?.desktopInstalled}
+                  title={detection?.desktopInstalled ? `使用 ${TOOL_LABEL[kind]} 拼车配置启动客户端` : detection?.desktopDetail}
+                >
                   <MonitorUp size={15} /> {busy === `${kind}-desktop` ? '打开中' : desktopOpen ? '新客户端' : '客户端'}
                 </button>
                 {detection?.installed === false ? (

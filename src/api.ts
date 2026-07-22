@@ -78,7 +78,7 @@ const demoTools: ToolDetection[] = [
     desktopSupported: true,
     desktopInstalled: true,
     desktopPath: '/Applications/Claude.app',
-    desktopDetail: '已安装，可一键配置并启动',
+    desktopDetail: '已安装，可使用拼车配置独立启动',
   },
   {
     kind: 'codex',
@@ -96,7 +96,7 @@ const demoTools: ToolDetection[] = [
     desktopSupported: true,
     desktopInstalled: true,
     desktopPath: '/Applications/ChatGPT.app',
-    desktopDetail: '已找到 ChatGPT.app（Codex 客户端），可一键配置并启动',
+    desktopDetail: '已找到 ChatGPT.app（Codex 客户端），可使用拼车配置独立启动',
   },
 ];
 

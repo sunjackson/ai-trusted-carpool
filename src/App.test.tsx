@@ -183,7 +183,7 @@ describe('Trusted Carpool simple flow', () => {
 
     expect(await screen.findByRole('heading', { name: '选择要打开的工具' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /^客户端/ })).toHaveAttribute('aria-pressed', 'true');
-    expect(screen.getByRole('button', { name: /打开 Claude 客户端/ })).toBeEnabled();
+    expect(screen.getByRole('button', { name: /使用拼车配置打开 Claude 客户端/ })).toBeEnabled();
     expect(screen.queryByText('项目目录（可选）')).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: /^终端/ }));
@@ -191,7 +191,7 @@ describe('Trusted Carpool simple flow', () => {
     expect(screen.getByRole('button', { name: /打开 Claude 终端/ })).toBeEnabled();
 
     fireEvent.click(screen.getByRole('button', { name: /^客户端/ }));
-    fireEvent.click(screen.getByRole('button', { name: /打开 Claude 客户端/ }));
+    fireEvent.click(screen.getByRole('button', { name: /使用拼车配置打开 Claude 客户端/ }));
     expect(await screen.findByRole('heading', { name: '需要哪个，点哪个' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /新客户端/ })).toBeInTheDocument();
     expect(screen.getAllByRole('button', { name: /终端/ })).toHaveLength(2);

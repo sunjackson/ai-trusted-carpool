@@ -1,6 +1,7 @@
 use crate::models::{RideAccess, ToolKind};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -12,6 +13,8 @@ use uuid::Uuid;
 const CLAUDE_PROFILE_ID: &str = "00000000-0000-4000-8000-000000157211";
 const CLAUDE_PROFILE_NAME: &str = "可信拼车";
 const ROUTE_STATE_DIR: &str = "client-routes";
+const CLIENT_PROFILE_DIR: &str = "client-profiles";
+const CLAUDE_PROFILE_DIR: &str = "client-profiles/claude";
 const CODEX_PROFILE_DIR: &str = "client-profiles/codex";
 
 #[cfg(target_os = "windows")]
@@ -45,6 +48,12 @@ struct DetectedClient {
     launcher: Option<DesktopLauncher>,
     display_path: Option<String>,
     detail: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ProfileLaunchSettings {
+    env: BTreeMap<String, String>,
+    args: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -82,6 +91,9 @@ struct ActiveRoute {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum RouteStrategy {
+    ClaudeIsolatedProfile,
+    // Retained so upgrades can restore routes created by versions before
+    // per-ride desktop profiles were introduced.
     ClaudeManagedProfile,
     CodexIsolatedHome,
     CodexGlobalConfig,
@@ -95,6 +107,16 @@ pub fn detect(kind: ToolKind) -> DesktopClientDetection {
         path: detected.display_path,
         detail: detected.detail,
     }
+}
+
+#[cfg(target_os = "windows")]
+fn supports_isolated_profile(launcher: &DesktopLauncher) -> bool {
+    !matches!(launcher, DesktopLauncher::WindowsAppUri(_))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn supports_isolated_profile(_launcher: &DesktopLauncher) -> bool {
+    true
 }
 
 pub fn launch(
@@ -112,36 +134,44 @@ pub fn launch(
         return Err(detected.detail);
     }
     let launcher = detected.launcher.ok_or_else(|| detected.detail.clone())?;
+    let isolated_supported = supports_isolated_profile(&launcher);
 
     restore_kind(&app_data, kind, None, false)?;
-    close_client(kind);
-    thread::sleep(Duration::from_millis(350));
+    if !isolated_supported {
+        close_client(kind);
+        thread::sleep(Duration::from_millis(350));
+    }
 
     let route = match kind {
         ToolKind::Claude => {
-            let paths = current_claude_paths()?;
-            let backup_dir = backup_dir(&app_data, kind);
-            apply_claude_route(
-                &paths,
-                &backup_dir,
-                &access.access_id,
-                &local_base(access, kind),
-                session_secret,
-            )?;
-            ActiveRoute {
-                access_id: access.access_id.clone(),
-                strategy: RouteStrategy::ClaudeManagedProfile,
-                profile_path: None,
+            if isolated_supported {
+                let profile = client_profile_path(&app_data, kind, &access.access_id)?;
+                prepare_claude_profile(&profile, &local_base(access, kind), session_secret)?;
+                ActiveRoute {
+                    access_id: access.access_id.clone(),
+                    strategy: RouteStrategy::ClaudeIsolatedProfile,
+                    profile_path: Some(profile),
+                }
+            } else {
+                let paths = current_claude_paths()?;
+                let backup_dir = backup_dir(&app_data, kind);
+                apply_claude_route(
+                    &paths,
+                    &backup_dir,
+                    &access.access_id,
+                    &local_base(access, kind),
+                    session_secret,
+                )?;
+                ActiveRoute {
+                    access_id: access.access_id.clone(),
+                    strategy: RouteStrategy::ClaudeManagedProfile,
+                    profile_path: None,
+                }
             }
         }
         ToolKind::Codex => {
-            let isolated_supported = match &launcher {
-                #[cfg(target_os = "windows")]
-                DesktopLauncher::WindowsAppUri(_) => false,
-                _ => true,
-            };
             if isolated_supported {
-                let profile = codex_profile_path(&app_data, &access.access_id)?;
+                let profile = client_profile_path(&app_data, kind, &access.access_id)?;
                 prepare_codex_profile(&profile, &local_base(access, kind), session_secret)?;
                 ActiveRoute {
                     access_id: access.access_id.clone(),
@@ -172,7 +202,7 @@ pub fn launch(
         let _ = rollback_prepared_route(&app_data, kind, &route);
         return Err(error);
     }
-    if let Err(error) = launch_client(&launcher, route.profile_path.as_deref()) {
+    if let Err(error) = launch_client(&launcher, kind, route.profile_path.as_deref()) {
         let _ = restore_kind(&app_data, kind, Some(&access.access_id), false);
         return Err(error);
     }
@@ -202,10 +232,10 @@ pub fn recover_stale(app: &AppHandle) -> Result<(), String> {
             restore_snapshot(&backup)?;
         }
     }
-    let profiles = app_data.join(CODEX_PROFILE_DIR);
+    let profiles = app_data.join(CLIENT_PROFILE_DIR);
     if profiles.exists() {
         fs::remove_dir_all(&profiles)
-            .map_err(|error| format!("无法清理 Codex 临时配置 {}: {error}", profiles.display()))?;
+            .map_err(|error| format!("无法清理客户端临时配置 {}: {error}", profiles.display()))?;
     }
     Ok(())
 }
@@ -236,13 +266,11 @@ fn restore_kind(
             if backup.join("manifest.json").exists() {
                 restore_snapshot(&backup)?;
             }
-            if matches!(kind, ToolKind::Codex) {
-                let profiles = app_data.join(CODEX_PROFILE_DIR);
-                if profiles.exists() {
-                    fs::remove_dir_all(&profiles).map_err(|error| {
-                        format!("无法清理 Codex 临时配置 {}: {error}", profiles.display())
-                    })?;
-                }
+            let profiles = app_data.join(CLIENT_PROFILE_DIR).join(kind_name(kind));
+            if profiles.exists() {
+                fs::remove_dir_all(&profiles).map_err(|error| {
+                    format!("无法清理客户端临时配置 {}: {error}", profiles.display())
+                })?;
             }
             remove_file_if_exists(&marker_path)?;
             return Ok(());
@@ -261,11 +289,11 @@ fn restore_kind(
         RouteStrategy::ClaudeManagedProfile | RouteStrategy::CodexGlobalConfig => {
             restore_snapshot(&backup_dir(app_data, kind))?;
         }
-        RouteStrategy::CodexIsolatedHome => {
+        RouteStrategy::ClaudeIsolatedProfile | RouteStrategy::CodexIsolatedHome => {
             if let Some(profile) = route.profile_path {
                 if profile.exists() {
                     fs::remove_dir_all(&profile).map_err(|error| {
-                        format!("无法清理 Codex 临时配置 {}: {error}", profile.display())
+                        format!("无法清理客户端临时配置 {}: {error}", profile.display())
                     })?;
                 }
             }
@@ -275,7 +303,7 @@ fn restore_kind(
 
     if reopen {
         if let Some(launcher) = detect_client(kind).launcher {
-            launch_client(&launcher, None)?;
+            launch_client(&launcher, kind, None)?;
         }
     }
     Ok(())
@@ -290,11 +318,11 @@ fn rollback_prepared_route(
         RouteStrategy::ClaudeManagedProfile | RouteStrategy::CodexGlobalConfig => {
             restore_snapshot(&backup_dir(app_data, kind))
         }
-        RouteStrategy::CodexIsolatedHome => {
+        RouteStrategy::ClaudeIsolatedProfile | RouteStrategy::CodexIsolatedHome => {
             if let Some(profile) = route.profile_path.as_deref() {
                 if profile.exists() {
                     fs::remove_dir_all(profile).map_err(|error| {
-                        format!("无法清理 Codex 临时配置 {}: {error}", profile.display())
+                        format!("无法清理客户端临时配置 {}: {error}", profile.display())
                     })?;
                 }
             }
@@ -378,6 +406,30 @@ fn write_claude_meta(path: &Path) -> Result<(), String> {
     write_json_secure(path, &value)
 }
 
+fn prepare_claude_profile(profile: &Path, base_url: &str, api_key: &str) -> Result<(), String> {
+    if profile.exists() {
+        fs::remove_dir_all(profile)
+            .map_err(|error| format!("无法重建 Claude 拼车配置 {}: {error}", profile.display()))?;
+    }
+    fs::create_dir_all(profile)
+        .map_err(|error| format!("无法创建 Claude 拼车配置 {}: {error}", profile.display()))?;
+    secure_directory(profile)?;
+
+    let library = profile.join("configLibrary");
+    let result = (|| {
+        write_deployment_mode(&profile.join("claude_desktop_config.json"), "3p")?;
+        write_json_secure(
+            &library.join(format!("{CLAUDE_PROFILE_ID}.json")),
+            &claude_gateway_profile(base_url, api_key),
+        )?;
+        write_claude_meta(&library.join("_meta.json"))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(profile);
+    }
+    result
+}
+
 fn prepare_codex_profile(profile: &Path, base_url: &str, api_key: &str) -> Result<(), String> {
     if profile.exists() {
         fs::remove_dir_all(profile)
@@ -386,10 +438,31 @@ fn prepare_codex_profile(profile: &Path, base_url: &str, api_key: &str) -> Resul
     fs::create_dir_all(profile)
         .map_err(|error| format!("无法创建 Codex 临时配置 {}: {error}", profile.display()))?;
     secure_directory(profile)?;
-    atomic_write(
-        &profile.join("config.toml"),
-        codex_config(base_url, api_key).as_bytes(),
-    )
+    let result = (|| {
+        write_json_secure(
+            &profile.join("auth.json"),
+            &json!({
+                "auth_mode": "apikey",
+                "OPENAI_API_KEY": api_key,
+            }),
+        )?;
+        atomic_write(
+            &profile.join("config.toml"),
+            codex_config(base_url, api_key).as_bytes(),
+        )?;
+        let app_data = profile.join("app-data");
+        fs::create_dir_all(&app_data).map_err(|error| {
+            format!(
+                "无法创建 Codex 客户端运行目录 {}: {error}",
+                app_data.display()
+            )
+        })?;
+        secure_directory(&app_data)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(profile);
+    }
+    result
 }
 
 fn codex_config(base_url: &str, api_key: &str) -> String {
@@ -400,8 +473,9 @@ fn codex_config(base_url: &str, api_key: &str) -> String {
          name = \"Trusted Carpool\"\n\
          base_url = {}\n\
          wire_api = \"responses\"\n\
-         requires_openai_auth = false\n\
-         experimental_bearer_token = {}\n",
+         requires_openai_auth = true\n\
+         experimental_bearer_token = {}\n\
+         supports_websockets = false\n",
         toml_string(base_url),
         toml_string(api_key)
     )
@@ -497,9 +571,41 @@ fn kind_name(kind: ToolKind) -> &'static str {
     }
 }
 
-fn codex_profile_path(app_data: &Path, access_id: &str) -> Result<PathBuf, String> {
+fn client_profile_path(
+    app_data: &Path,
+    kind: ToolKind,
+    access_id: &str,
+) -> Result<PathBuf, String> {
     let id = Uuid::parse_str(access_id).map_err(|_| "上车凭据格式无效".to_string())?;
-    Ok(app_data.join(CODEX_PROFILE_DIR).join(id.to_string()))
+    let root = match kind {
+        ToolKind::Claude => CLAUDE_PROFILE_DIR,
+        ToolKind::Codex => CODEX_PROFILE_DIR,
+    };
+    Ok(app_data.join(root).join(id.to_string()))
+}
+
+fn profile_launch_settings(kind: ToolKind, profile: Option<&Path>) -> ProfileLaunchSettings {
+    let Some(profile) = profile else {
+        return ProfileLaunchSettings::default();
+    };
+    let profile_value = profile.to_string_lossy().into_owned();
+    let mut env = BTreeMap::new();
+    let args = match kind {
+        ToolKind::Claude => {
+            env.insert("CLAUDE_USER_DATA_DIR".to_string(), profile_value.clone());
+            vec!["--user-data-dir".to_string(), profile_value]
+        }
+        ToolKind::Codex => {
+            let app_data = profile.join("app-data").to_string_lossy().into_owned();
+            env.insert("CODEX_HOME".to_string(), profile_value);
+            env.insert(
+                "CODEX_ELECTRON_USER_DATA_PATH".to_string(),
+                app_data.clone(),
+            );
+            vec![format!("--user-data-dir={app_data}")]
+        }
+    };
+    ProfileLaunchSettings { env, args }
 }
 
 fn user_codex_config_path() -> PathBuf {
@@ -634,9 +740,9 @@ fn detect_client(kind: ToolKind) -> DetectedClient {
             detail: if matches!(kind, ToolKind::Codex)
                 && path.file_name().and_then(|value| value.to_str()) == Some("ChatGPT.app")
             {
-                "已找到 ChatGPT.app（Codex 客户端），可一键配置并启动".to_string()
+                "已找到 ChatGPT.app（Codex 客户端），可使用拼车配置独立启动".to_string()
             } else {
-                "已安装，可一键配置并启动".to_string()
+                "已安装，可使用拼车配置独立启动".to_string()
             },
         },
         None => DetectedClient {
@@ -664,12 +770,12 @@ fn find_macos_client(
             ("Codex.app", "Contents/MacOS/Codex"),
         ],
     };
-    [system_applications, user_applications]
-        .into_iter()
-        .flat_map(|root| {
-            specs
-                .iter()
-                .map(move |(bundle, executable)| (root, bundle, executable))
+    specs
+        .iter()
+        .flat_map(|(bundle, executable)| {
+            [system_applications, user_applications]
+                .into_iter()
+                .map(move |root| (root, bundle, executable))
         })
         .find_map(|(root, bundle, executable)| {
             let path = root.join(bundle);
@@ -701,8 +807,8 @@ fn detect_client(kind: ToolKind) -> DetectedClient {
         }
         ToolKind::Codex => vec![
             local.join("Programs/ChatGPT/ChatGPT.exe"),
-            local.join("Programs/Codex/Codex.exe"),
             local.join("Microsoft/WindowsApps/ChatGPT.exe"),
+            local.join("Programs/Codex/Codex.exe"),
             local.join("Microsoft/WindowsApps/Codex.exe"),
         ],
     };
@@ -711,7 +817,7 @@ fn detect_client(kind: ToolKind) -> DetectedClient {
             supported: true,
             launcher: Some(DesktopLauncher::Executable(path.clone())),
             display_path: Some(path.to_string_lossy().into_owned()),
-            detail: "已安装，可一键配置并启动".to_string(),
+            detail: "已安装，可使用拼车配置独立启动".to_string(),
         };
     }
 
@@ -720,7 +826,7 @@ fn detect_client(kind: ToolKind) -> DetectedClient {
             "Get-AppxPackage | Where-Object { $_.Name -match '^Anthropic.*Claude' } | Select-Object -First 1 -ExpandProperty PackageFamilyName"
         }
         ToolKind::Codex => {
-            "Get-AppxPackage OpenAI.Codex | Select-Object -First 1 -ExpandProperty PackageFamilyName"
+            "Get-AppxPackage | Where-Object { $_.Name -match '^OpenAI\\.(ChatGPT|Codex)' } | Sort-Object @{ Expression = { if ($_.Name -match '^OpenAI\\.ChatGPT') { 0 } else { 1 } } }, @{ Expression = { $_.Version }; Descending = $true } | Select-Object -First 1 -ExpandProperty PackageFamilyName"
         }
     };
     if let Some(uri) = windows_app_uri(package_query) {
@@ -728,7 +834,7 @@ fn detect_client(kind: ToolKind) -> DetectedClient {
             supported: true,
             launcher: Some(DesktopLauncher::WindowsAppUri(uri.clone())),
             display_path: Some(uri),
-            detail: "已安装，可一键配置并启动".to_string(),
+            detail: "已安装，将临时切换为拼车配置后启动".to_string(),
         };
     }
 
@@ -794,7 +900,7 @@ fn detect_client(kind: ToolKind) -> DetectedClient {
             supported: true,
             launcher: Some(DesktopLauncher::Executable(path.clone())),
             display_path: Some(path.to_string_lossy().into_owned()),
-            detail: "已安装，可一键配置并启动".to_string(),
+            detail: "已安装，可使用拼车配置独立启动".to_string(),
         },
         None => DetectedClient {
             supported: true,
@@ -864,15 +970,24 @@ fn claude_paths_from_dirs(normal: PathBuf, threep: PathBuf) -> ClaudePaths {
 }
 
 #[cfg(target_os = "macos")]
-fn launch_client(launcher: &DesktopLauncher, codex_home: Option<&Path>) -> Result<(), String> {
+fn launch_client(
+    launcher: &DesktopLauncher,
+    kind: ToolKind,
+    profile: Option<&Path>,
+) -> Result<(), String> {
     let DesktopLauncher::MacBundle(bundle) = launcher;
+    let settings = profile_launch_settings(kind, profile);
     let mut command = Command::new("open");
-    if let Some(home) = codex_home {
-        command
-            .arg("--env")
-            .arg(format!("CODEX_HOME={}", home.display()));
+    command
+        .env_remove("__CFBundleIdentifier")
+        .env_remove("XPC_SERVICE_NAME");
+    for (key, value) in settings.env {
+        command.arg("--env").arg(format!("{key}={value}"));
     }
     command.args(["-n", "-a"]).arg(bundle);
+    if !settings.args.is_empty() {
+        command.arg("--args").args(settings.args);
+    }
     command
         .spawn()
         .map(|_| ())
@@ -880,33 +995,50 @@ fn launch_client(launcher: &DesktopLauncher, codex_home: Option<&Path>) -> Resul
 }
 
 #[cfg(target_os = "windows")]
-fn launch_client(launcher: &DesktopLauncher, codex_home: Option<&Path>) -> Result<(), String> {
+fn launch_client(
+    launcher: &DesktopLauncher,
+    kind: ToolKind,
+    profile: Option<&Path>,
+) -> Result<(), String> {
+    let settings = profile_launch_settings(kind, profile);
     match launcher {
         DesktopLauncher::Executable(path) => {
             let mut command = Command::new(path);
-            if let Some(home) = codex_home {
-                command.env("CODEX_HOME", home);
-            }
+            command.envs(settings.env).args(settings.args);
+            hide_console_window(&mut command);
             command
                 .spawn()
                 .map(|_| ())
                 .map_err(|error| format!("无法启动客户端 {}: {error}", path.display()))
         }
-        DesktopLauncher::WindowsAppUri(uri) => Command::new("explorer.exe")
-            .arg(uri)
-            .spawn()
-            .map(|_| ())
-            .map_err(|error| format!("无法启动 Codex 客户端: {error}")),
+        DesktopLauncher::WindowsAppUri(uri) => {
+            if profile.is_some() {
+                return Err(
+                    "Microsoft Store 客户端无法接收独立拼车配置，请使用客户端独立安装版或终端"
+                        .to_string(),
+                );
+            }
+            let mut command = Command::new("explorer.exe");
+            command.arg(uri);
+            hide_console_window(&mut command);
+            command
+                .spawn()
+                .map(|_| ())
+                .map_err(|error| format!("无法启动客户端: {error}"))
+        }
     }
 }
 
 #[cfg(target_os = "linux")]
-fn launch_client(launcher: &DesktopLauncher, codex_home: Option<&Path>) -> Result<(), String> {
+fn launch_client(
+    launcher: &DesktopLauncher,
+    kind: ToolKind,
+    profile: Option<&Path>,
+) -> Result<(), String> {
     let DesktopLauncher::Executable(path) = launcher;
+    let settings = profile_launch_settings(kind, profile);
     let mut command = Command::new(path);
-    if let Some(home) = codex_home {
-        command.env("CODEX_HOME", home);
-    }
+    command.envs(settings.env).args(settings.args);
     command
         .spawn()
         .map(|_| ())
@@ -1029,14 +1161,99 @@ mod tests {
     }
 
     #[test]
-    fn codex_profile_is_provider_scoped_and_does_not_require_openai_auth() {
+    fn codex_profile_is_provider_scoped_and_uses_carpool_auth() {
         let config = codex_config("http://127.0.0.1:25342/access/id/codex/v1", "secret\"token");
         assert!(config.contains("model_provider = \"trusted_carpool\""));
         assert!(config.contains("[model_providers.trusted_carpool]"));
         assert!(config.contains("wire_api = \"responses\""));
-        assert!(config.contains("requires_openai_auth = false"));
+        assert!(config.contains("requires_openai_auth = true"));
         assert!(config.contains("experimental_bearer_token = \"secret\\\"token\""));
-        assert!(!config.contains("auth.json"));
+        assert!(config.contains("supports_websockets = false"));
+    }
+
+    #[test]
+    fn codex_isolated_profile_separates_config_and_electron_data() {
+        let temp = TempDir::new().expect("temp dir");
+        let profile = temp.path().join("codex-profile");
+        prepare_codex_profile(
+            &profile,
+            "http://127.0.0.1:25342/access/id/codex/v1",
+            "session-secret",
+        )
+        .expect("prepare profile");
+
+        let config = fs::read_to_string(profile.join("config.toml")).expect("read config");
+        let auth: Value = read_json(&profile.join("auth.json")).unwrap().unwrap();
+        assert!(config.contains("model_provider = \"trusted_carpool\""));
+        assert!(config.contains("experimental_bearer_token = \"session-secret\""));
+        assert_eq!(auth["auth_mode"], "apikey");
+        assert_eq!(auth["OPENAI_API_KEY"], "session-secret");
+        assert!(profile.join("app-data").is_dir());
+    }
+
+    #[test]
+    fn claude_isolated_profile_contains_only_the_carpool_gateway() {
+        let temp = TempDir::new().expect("temp dir");
+        let profile = temp.path().join("claude-profile");
+        prepare_claude_profile(
+            &profile,
+            "http://127.0.0.1:25342/access/id/claude",
+            "session-secret",
+        )
+        .expect("prepare profile");
+
+        let desktop: Value = read_json(&profile.join("claude_desktop_config.json"))
+            .unwrap()
+            .unwrap();
+        let gateway: Value = read_json(
+            &profile
+                .join("configLibrary")
+                .join(format!("{CLAUDE_PROFILE_ID}.json")),
+        )
+        .unwrap()
+        .unwrap();
+        let meta: Value = read_json(&profile.join("configLibrary/_meta.json"))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(desktop["deploymentMode"], "3p");
+        assert_eq!(gateway["inferenceProvider"], "gateway");
+        assert_eq!(
+            gateway["inferenceGatewayBaseUrl"],
+            "http://127.0.0.1:25342/access/id/claude"
+        );
+        assert_eq!(gateway["inferenceGatewayApiKey"], "session-secret");
+        assert_eq!(meta["appliedId"], CLAUDE_PROFILE_ID);
+    }
+
+    #[test]
+    fn isolated_desktop_launches_bind_their_profile_environment_and_arguments() {
+        let profile = Path::new("/tmp/trusted carpool/profile");
+
+        let claude = profile_launch_settings(ToolKind::Claude, Some(profile));
+        assert_eq!(
+            claude.env.get("CLAUDE_USER_DATA_DIR"),
+            Some(&profile.to_string_lossy().into_owned())
+        );
+        assert_eq!(
+            claude.args,
+            vec![
+                "--user-data-dir".to_string(),
+                profile.to_string_lossy().into_owned()
+            ]
+        );
+
+        let codex = profile_launch_settings(ToolKind::Codex, Some(profile));
+        let app_data = profile.join("app-data").to_string_lossy().into_owned();
+        assert_eq!(
+            codex.env.get("CODEX_HOME"),
+            Some(&profile.to_string_lossy().into_owned())
+        );
+        assert_eq!(
+            codex.env.get("CODEX_ELECTRON_USER_DATA_PATH"),
+            Some(&app_data)
+        );
+        assert_eq!(codex.args, vec![format!("--user-data-dir={app_data}")]);
     }
 
     #[cfg(target_os = "macos")]
@@ -1052,6 +1269,26 @@ mod tests {
         assert_eq!(
             find_macos_client(ToolKind::Codex, &system, &user),
             Some(system.join("ChatGPT.app"))
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn codex_desktop_detection_prefers_the_current_chatgpt_app() {
+        let temp = TempDir::new().expect("temp dir");
+        let system = temp.path().join("Applications");
+        let user = temp.path().join("UserApplications");
+        for executable in [
+            user.join("ChatGPT.app/Contents/MacOS/ChatGPT"),
+            system.join("Codex.app/Contents/MacOS/Codex"),
+        ] {
+            fs::create_dir_all(executable.parent().unwrap()).expect("create fake app");
+            fs::write(&executable, b"fake executable").expect("write fake app");
+        }
+
+        assert_eq!(
+            find_macos_client(ToolKind::Codex, &system, &user),
+            Some(user.join("ChatGPT.app"))
         );
     }
 }
