@@ -37,7 +37,7 @@
 - 每辆车最多四名乘客并发，每个座位独立绑定设备。
 - 支持固定时段和全天发车。全天模式只在车主电脑在线时持续开放；应用每分钟续签短租约，关机或断网后旧邀请会自动变为离线。
 - 重启应用后由车主选择“恢复原通道”或“开新车”。恢复会保留原车队编号与四个座位码，但所有乘客都需重新认领并获得新的会话授权。
-- 首页分别显示发车记录和上车记录；乘客记录会实时标明在线、等待开放、离线、已过期，并只允许对仍在线的车重新上车。
+- 首页分别显示发车记录和上车记录；点击记录可查看模式、时间、工具、座位和昵称等详情。乘客记录会实时标明在线、等待开放、离线、已过期，并只允许对仍在线的车重新上车。
 - 优先 WebRTC 直连，失败时自动使用 TURN；应用层请求与连接信令均端到端加密（协调服务看不到 SDP、候选 IP 等元数据）。
 - 断线自动恢复：乘客侧心跳判活 + 指数退避自动重连（TURN 凭据自动刷新），使用中页面实时显示连接状态。
 - 密钥只保存在车主本机，只允许 Anthropic、OpenAI/ChatGPT 官方接口。
@@ -50,12 +50,12 @@
 
 ## 安装
 
-从 [GitHub Releases](https://github.com/sunjackson/ai-trusted-carpool/releases) 下载对应平台安装包（macOS 通用 DMG、Windows x64 NSIS、Linux x64 DEB/AppImage），并按同一 Release 中的 `SHA256SUMS.txt` 核对文件 SHA-256 后安装。当前推荐 [v0.0.6-test.1 未签名测试版](https://github.com/sunjackson/ai-trusted-carpool/releases/tag/v0.0.6-test.1)，全天发车与拼车历史的版本说明见 [Release Notes](docs/releases/v0.0.6-test.1.md)。
+从 [GitHub Releases](https://github.com/sunjackson/ai-trusted-carpool/releases) 下载对应平台安装包（macOS 通用 DMG、Windows x64 NSIS、Linux x64 DEB/AppImage），并按同一 Release 中的 `SHA256SUMS.txt` 核对文件 SHA-256 后安装。当前推荐 [v0.0.6 未签名正式版](https://github.com/sunjackson/ai-trusted-carpool/releases/tag/v0.0.6)，它包含 Windows 首次启动白屏、乘客连接以及拼车记录详情修复，完整说明见 [Release Notes](docs/releases/v0.0.6.md)。
 
 ## 当前未签名发布策略
 
 > [!IMPORTANT]
-> 项目目前没有 Windows Authenticode 证书/PFX，也没有 Apple Developer ID 和公证凭据；测试 Release 同样不配置 Tauri 自动更新私钥。安装包是 GitHub Actions 从公开源码构建的**未签名测试包**，因此 Windows 和 macOS 的安全提示属于预期行为，不代表已经完成系统签名验证。
+> 项目目前没有 Windows Authenticode 证书/PFX，也没有 Apple Developer ID、公证凭据或 Tauri 自动更新私钥。安装包是 GitHub Actions 从公开源码构建的**未签名手动分发包**，因此 Windows 和 macOS 的安全提示属于预期行为，不代表已经完成系统签名验证。
 
 | 平台安装包 | 当前更新方式 | 安装时可能出现的提示 |
 | --- | --- | --- |
@@ -64,7 +64,7 @@
 | Linux x64 AppImage | 手动下载、校验并赋予执行权限 | 文件管理器可能提示文件不可执行或来源未知 |
 | Linux x64 DEB | 使用系统包管理器手动安装 | 软件中心可能提示第三方/非仓库软件包 |
 
-- 当前只使用 `vX.Y.Z-test.N` 未签名测试预发布通道。Release 包含安装包和 `SHA256SUMS.txt`，不包含 `.sig` 或 `latest.json`，不会被应用内自动更新发现。
+- 当前使用精确的 `vX.Y.Z` 标签发布 GitHub 正式 Release，但安装包仍是未签名手动分发包。“正式版”只表示版本通道稳定，不表示已通过 Windows/macOS 系统签名。Release 包含安装包和 `SHA256SUMS.txt`，不包含 `.sig` 或 `latest.json`，不会被应用内自动更新发现。
 - 仓库保留签名更新代码和正式发布门禁，供未来取得证书与密钥后启用；在此之前它们不是当前分发承诺。
 - 不要从第三方下载所谓“补签名”文件。没有对应私钥时无法事后生成可信签名，手动伪造 `.sig` 也不会通过客户端内置公钥验证。
 
@@ -124,7 +124,7 @@ cargo test --manifest-path src-tauri/Cargo.toml --all-targets --all-features
 ./scripts/build-linux-docker.sh
 ```
 
-GitHub Actions 会先执行前后端、发布清单与协调服务自测，再并行生成 macOS 通用 DMG、Windows x64 NSIS、Linux x64 DEB 与 AppImage；每次运行的开发安装包在 Actions Artifacts 保留 30 天。当前使用 `vX.Y.Z-test.N` 标签生成未签名 Pre-release 与 `SHA256SUMS.txt`，CI 先创建草稿、上传并逐项核对远端资产，全部一致后才公开。精确的 `vX.Y.Z` 正式标签会进入签名门禁，但在证书和更新私钥配置完成前不使用该通道。
+GitHub Actions 会先执行前后端、发布清单与协调服务自测，再并行生成 macOS 通用 DMG、Windows x64 NSIS、Linux x64 DEB 与 AppImage；每次运行的开发安装包在 Actions Artifacts 保留 30 天。当前使用精确的 `vX.Y.Z` 标签生成未签名稳定 Release 与 `SHA256SUMS.txt`，CI 先创建草稿、上传并逐项核对远端资产，全部一致后才公开。取得证书和更新私钥后，只有显式启用 `SIGNED_RELEASES_ENABLED` 才会切换到签名与自动更新门禁。
 
 ## 安全边界
 

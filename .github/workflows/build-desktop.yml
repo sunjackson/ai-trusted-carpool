@@ -10,6 +10,11 @@ on:
 permissions:
   contents: read
 
+env:
+  # Keep exact-version tags on the unsigned manual-download path until the
+  # repository owner explicitly enables signing and provides every secret.
+  SIGNED_RELEASES_ENABLED: ${{ vars.SIGNED_RELEASES_ENABLED || 'false' }}
+
 concurrency:
   group: desktop-installers-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -39,10 +44,15 @@ jobs:
           CARGO_VERSION="$(awk -F ' *= *' '/^version *=/ { gsub(/\"/, "", $2); print $2; exit }' src-tauri/Cargo.toml)"
           test "${APP_VERSION}" = "${PACKAGE_VERSION}"
           test "${APP_VERSION}" = "${CARGO_VERSION}"
+          SIGNING_ARGS=()
+          if [[ "${SIGNED_RELEASES_ENABLED}" == "true" ]]; then
+            SIGNING_ARGS+=(--signed-release)
+          fi
           RELEASE_MODE="$(node scripts/classify-release-ref.mjs \
             --ref "${GITHUB_REF}" \
             --ref-name "${GITHUB_REF_NAME}" \
-            --version "${APP_VERSION}")"
+            --version "${APP_VERSION}" \
+            "${SIGNING_ARGS[@]}")"
           echo "mode=${RELEASE_MODE}" >> "${GITHUB_OUTPUT}"
 
           if [[ "${RELEASE_MODE}" != "development" ]]; then
@@ -221,8 +231,8 @@ jobs:
       - name: Build installer (unsigned development artifact)
         if: needs.verify.outputs.release_mode == 'development'
         run: npm run tauri build -- ${{ matrix.build_args }}
-      - name: Build installer (unsigned test prerelease)
-        if: needs.verify.outputs.release_mode == 'test'
+      - name: Build installer (unsigned manual distribution)
+        if: needs.verify.outputs.release_mode == 'unsigned' || needs.verify.outputs.release_mode == 'test'
         run: npm run tauri build -- ${{ matrix.build_args }} --config src-tauri/tauri.distribution.conf.json
       - name: Require updater signing key
         if: needs.verify.outputs.release_mode == 'signed'
@@ -310,7 +320,7 @@ jobs:
 
   release:
     name: Publish GitHub Release
-    if: needs.verify.outputs.release_mode == 'signed' || needs.verify.outputs.release_mode == 'test'
+    if: needs.verify.outputs.release_mode == 'signed' || needs.verify.outputs.release_mode == 'unsigned' || needs.verify.outputs.release_mode == 'test'
     needs: [verify, build]
     runs-on: ubuntu-22.04
     timeout-minutes: 15
@@ -335,10 +345,15 @@ jobs:
           CARGO_VERSION="$(awk -F ' *= *' '/^version *=/ { gsub(/\"/, "", $2); print $2; exit }' src-tauri/Cargo.toml)"
           test "${APP_VERSION}" = "${PACKAGE_VERSION}"
           test "${APP_VERSION}" = "${CARGO_VERSION}"
+          SIGNING_ARGS=()
+          if [[ "${SIGNED_RELEASES_ENABLED}" == "true" ]]; then
+            SIGNING_ARGS+=(--signed-release)
+          fi
           ACTUAL_MODE="$(node scripts/classify-release-ref.mjs \
             --ref "${GITHUB_REF}" \
             --ref-name "${GITHUB_REF_NAME}" \
-            --version "${APP_VERSION}")"
+            --version "${APP_VERSION}" \
+            "${SIGNING_ARGS[@]}")"
           test "${ACTUAL_MODE}" = "${RELEASE_MODE}"
           test -s "docs/releases/${GITHUB_REF_NAME}.md" || {
             echo "Missing bilingual release notes at docs/releases/${GITHUB_REF_NAME}.md" >&2
@@ -386,18 +401,22 @@ jobs:
           minimum_assets=8
           release_title="可信拼车 ${GITHUB_REF_NAME}"
           release_flags=()
-          if [[ "${RELEASE_MODE}" == "test" ]]; then
+          if [[ "${RELEASE_MODE}" == "test" || "${RELEASE_MODE}" == "unsigned" ]]; then
             minimum_assets=5
-            release_title="可信拼车 ${GITHUB_REF_NAME}（未签名测试版）"
-            release_flags+=(--prerelease)
+            if [[ "${RELEASE_MODE}" == "test" ]]; then
+              release_title="可信拼车 ${GITHUB_REF_NAME}（未签名测试版）"
+              release_flags+=(--prerelease)
+            else
+              release_title="可信拼车 ${GITHUB_REF_NAME}（未签名手动版）"
+            fi
             for pattern in '*.dmg' '*.exe' '*.deb' '*.AppImage'; do
               find release-assets -type f -name "${pattern}" | grep -q . || {
-                echo "Unsigned test release is missing ${pattern}" >&2
+                echo "Unsigned release is missing ${pattern}" >&2
                 exit 1
               }
             done
             if find release-assets -type f \( -name '*.sig' -o -name 'latest.json' \) | grep -q .; then
-              echo 'Unsigned test releases must not contain updater signatures or latest.json' >&2
+              echo 'Unsigned releases must not contain updater signatures or latest.json' >&2
               exit 1
             fi
           fi
@@ -415,9 +434,17 @@ jobs:
           fi
 
           if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            if [[ "${RELEASE_MODE}" == "test" ]] \
-              && [[ "$(gh release view "${GITHUB_REF_NAME}" --json isDraft --jq '.isDraft')" == "true" ]] \
-              && [[ "$(gh release view "${GITHUB_REF_NAME}" --json isPrerelease --jq '.isPrerelease')" == "true" ]]; then
+            existing_draft="$(gh release view "${GITHUB_REF_NAME}" --json isDraft --jq '.isDraft')"
+            existing_prerelease="$(gh release view "${GITHUB_REF_NAME}" --json isPrerelease --jq '.isPrerelease')"
+            replace_draft=false
+            if [[ "${existing_draft}" == "true" ]]; then
+              if [[ "${RELEASE_MODE}" == "test" && "${existing_prerelease}" == "true" ]]; then
+                replace_draft=true
+              elif [[ "${RELEASE_MODE}" == "unsigned" && "${existing_prerelease}" == "false" ]]; then
+                replace_draft=true
+              fi
+            fi
+            if [[ "${replace_draft}" == "true" ]]; then
               gh release delete "${GITHUB_REF_NAME}" --yes
             else
               echo "Release ${GITHUB_REF_NAME} already exists; refusing to overwrite it" >&2
@@ -438,7 +465,7 @@ jobs:
             | sort > "${remote_assets}"
           diff -u "${expected_assets}" "${remote_assets}"
 
-          if [[ "${RELEASE_MODE}" == "signed" ]]; then
+          if [[ "${RELEASE_MODE}" == "signed" || "${RELEASE_MODE}" == "unsigned" ]]; then
             gh release edit "${GITHUB_REF_NAME}" --draft=false --latest
           else
             gh release edit "${GITHUB_REF_NAME}" --draft=false
@@ -446,4 +473,6 @@ jobs:
           test "$(gh release view "${GITHUB_REF_NAME}" --json isDraft --jq '.isDraft')" = 'false'
           if [[ "${RELEASE_MODE}" == "test" ]]; then
             test "$(gh release view "${GITHUB_REF_NAME}" --json isPrerelease --jq '.isPrerelease')" = 'true'
+          elif [[ "${RELEASE_MODE}" == "unsigned" ]]; then
+            test "$(gh release view "${GITHUB_REF_NAME}" --json isPrerelease --jq '.isPrerelease')" = 'false'
           fi

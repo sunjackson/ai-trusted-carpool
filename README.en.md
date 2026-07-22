@@ -37,7 +37,7 @@ A desktop app for sharing a locally signed-in Claude Code / Codex account among 
 - Up to four concurrent passengers per car; every seat is bound to one device.
 - Fixed-window and all-day hosting are both supported. All-day invites remain discoverable only while the host is online: the app renews short coordinator leases, so shutdowns and network loss naturally make the car offline.
 - After a restart, the host chooses between restoring the original channel or starting a new car. A restore keeps the car ID and four codes, but passengers must claim again and receive fresh session authorization.
-- The home page keeps separate host and passenger history. Passenger entries show online, scheduled, offline, or expired status and enable rejoin only while the car is available.
+- The home page keeps separate host and passenger history. Click an entry to inspect its mode, time window, tools, seat, and nickname. Passenger entries show online, scheduled, offline, or expired status and enable rejoin only while the car is available.
 - WebRTC direct connection first, automatic TURN fallback; both application payloads and connection signaling are end-to-end encrypted (the coordinator never sees SDP or candidate IPs).
 - Automatic drop recovery: passenger-side heartbeat detection plus exponential-backoff reconnects (with fresh TURN credentials), and the ride page shows the real link state.
 - Credentials never leave the host machine; only official Anthropic and OpenAI/ChatGPT endpoints are allowed.
@@ -50,12 +50,12 @@ A desktop app for sharing a locally signed-in Claude Code / Codex account among 
 
 ## Install
 
-Download the installer for your platform from [GitHub Releases](https://github.com/sunjackson/ai-trusted-carpool/releases) (macOS universal DMG, Windows x64 NSIS, Linux x64 DEB/AppImage), then compare its SHA-256 digest with `SHA256SUMS.txt` from the same release. The currently recommended download is the unsigned [v0.0.6-test.1 prerelease](https://github.com/sunjackson/ai-trusted-carpool/releases/tag/v0.0.6-test.1); see its [release notes](docs/releases/v0.0.6-test.1.md) for all-day hosting and ride history.
+Download the installer for your platform from [GitHub Releases](https://github.com/sunjackson/ai-trusted-carpool/releases) (macOS universal DMG, Windows x64 NSIS, Linux x64 DEB/AppImage), then compare its SHA-256 digest with `SHA256SUMS.txt` from the same release. The currently recommended download is the unsigned stable [v0.0.6 release](https://github.com/sunjackson/ai-trusted-carpool/releases/tag/v0.0.6), which includes fixes for the first-launch blank window on Windows, passenger connectivity, and ride-history details. See the complete [release notes](docs/releases/v0.0.6.md).
 
 ## Current unsigned release policy
 
 > [!IMPORTANT]
-> The project currently has no Windows Authenticode certificate/PFX and no Apple Developer ID or notarization credentials. Test releases also have no Tauri updater signing key. GitHub Actions builds these **unsigned test packages** from the public source, so Windows and macOS security warnings are expected and do not mean the package has passed operating-system signature verification.
+> The project currently has no Windows Authenticode certificate/PFX, Apple Developer ID, notarization credentials, or Tauri updater signing key. GitHub Actions builds these **unsigned manual-distribution packages** from the public source, so Windows and macOS security warnings are expected and do not mean the package has passed operating-system signature verification.
 
 | Package | Current update path | Expected installation warning |
 | --- | --- | --- |
@@ -64,7 +64,7 @@ Download the installer for your platform from [GitHub Releases](https://github.c
 | Linux x64 AppImage | Manual download, checksum verification, and executable permission | The file manager may report that the file is not executable or comes from an unknown source |
 | Linux x64 DEB | Manual installation through the system package manager | The software center may identify it as a third-party or out-of-repository package |
 
-- The current distribution channel is limited to unsigned `vX.Y.Z-test.N` prereleases. A Release contains installers and `SHA256SUMS.txt`, but no `.sig` files or `latest.json`, so the in-app updater never discovers it.
+- Exact `vX.Y.Z` tags now publish stable GitHub Releases, but their installers remain unsigned manual downloads. “Stable” describes the version channel only; it does not claim Windows or macOS system signing. A Release contains installers and `SHA256SUMS.txt`, but no `.sig` files or `latest.json`, so the in-app updater never discovers it.
 - The repository retains signed-updater code and production release gates for possible future use after certificates and keys are obtained; they are not part of the current distribution promise.
 - Do not download “extra signature” files from third parties. A trusted signature cannot be created after the fact without the matching private key, and a fabricated `.sig` will not verify against the public key embedded in the client.
 
@@ -124,7 +124,7 @@ cargo test --manifest-path src-tauri/Cargo.toml --all-targets --all-features
 ./scripts/build-linux-docker.sh
 ```
 
-GitHub Actions runs frontend, release-manifest, backend, and coordinator tests first, then builds the macOS universal DMG, Windows x64 NSIS, and Linux x64 DEB/AppImage in parallel. Development installers from each run remain in Actions Artifacts for 30 days. The current `vX.Y.Z-test.N` path publishes an unsigned prerelease with `SHA256SUMS.txt`; CI creates a draft, uploads and verifies every remote asset, and publishes only after all assets match. An exact `vX.Y.Z` production tag enters the signing gate, but that path is not used until the required certificates and updater key exist.
+GitHub Actions runs frontend, release-manifest, backend, and coordinator tests first, then builds the macOS universal DMG, Windows x64 NSIS, and Linux x64 DEB/AppImage in parallel. Development installers from each run remain in Actions Artifacts for 30 days. Exact `vX.Y.Z` tags currently publish an unsigned stable Release with `SHA256SUMS.txt`; CI creates a draft, uploads and verifies every remote asset, and publishes only after all assets match. After certificates and an updater key are available, the signed/automatic-update gate activates only when `SIGNED_RELEASES_ENABLED` is explicitly enabled.
 
 ## Security boundary
 

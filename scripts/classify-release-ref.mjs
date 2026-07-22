@@ -1,12 +1,17 @@
 import { pathToFileURL } from 'node:url'
 
-export function classifyReleaseRef({ ref, refName, appVersion }) {
+export function classifyReleaseRef({
+  ref,
+  refName,
+  appVersion,
+  signedReleasesEnabled = false,
+}) {
   if (!ref.startsWith('refs/tags/v')) {
     return 'development'
   }
 
   if (refName === `v${appVersion}`) {
-    return 'signed'
+    return signedReleasesEnabled ? 'signed' : 'unsigned'
   }
 
   const testPrefix = `v${appVersion}-test.`
@@ -37,6 +42,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
         ref: readArgument('--ref'),
         refName: readArgument('--ref-name'),
         appVersion: readArgument('--version'),
+        signedReleasesEnabled: process.argv.includes('--signed-release'),
       }),
     )
   } catch (error) {

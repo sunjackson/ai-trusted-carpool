@@ -20,12 +20,24 @@ test('classifies branches and pull requests as development builds', () => {
   )
 })
 
-test('classifies an exact version tag as a signed release', () => {
+test('classifies an exact version tag as an unsigned manual release by default', () => {
   assert.equal(
     classifyReleaseRef({
       ref: 'refs/tags/v0.0.5',
       refName: 'v0.0.5',
       appVersion,
+    }),
+    'unsigned',
+  )
+})
+
+test('requires an explicit policy opt-in before classifying a signed release', () => {
+  assert.equal(
+    classifyReleaseRef({
+      ref: 'refs/tags/v0.0.5',
+      refName: 'v0.0.5',
+      appVersion,
+      signedReleasesEnabled: true,
     }),
     'signed',
   )
