@@ -19,10 +19,13 @@ let nextId = 0;
 let captureInstalled = false;
 
 const REDACTED = '[REDACTED]';
-const SENSITIVE_ASSIGNMENT_PATTERN = /((?:["'`]?)(?:access[_-]?token|refresh[_-]?token|id[_-]?token|api[_-]?key|x[_-]?api[_-]?key|openai[_-]?api[_-]?key|anthropic[_-]?api[_-]?key|authorization|client[_-]?secret|secret|password|credential(?:s)?|cookie|token)(?:["'`]?)\s*[:=]\s*)("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|(?:bearer|basic)\s+[^\s,;}&\]]+|[^\s,;}&\]]+)/gi;
+const SENSITIVE_ASSIGNMENT_PATTERN = /((?:["'`]?)(?:access[_-]?token|refresh[_-]?token|id[_-]?token|api[_-]?key|x[_-]?api[_-]?key|openai[_-]?api[_-]?key|anthropic[_-]?api[_-]?key|authorization|client[_-]?secret|session[_-]?secret|secret|password|credential(?:s)?|cookie|token|prompt|request[_-]?body|response[_-]?body|environment)(?:["'`]?)\s*[:=]\s*)("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|(?:bearer|basic)\s+[^\s,;}&\]]+|[^\s,;}&\]]+)/gi;
 const AUTH_SCHEME_PATTERN = /\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]+/gi;
 const API_KEY_PATTERN = /\bsk-(?:ant-|proj-)?[A-Za-z0-9_-]{8,}\b/gi;
 const JWT_PATTERN = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g;
+const EMAIL_PATTERN = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi;
+const JOIN_CODE_PATTERN = /\b[A-HJ-NP-Z2-9]{12}\b/g;
+const USER_DIRECTORY_PATTERN = /(?:\/Users\/|\/home\/|[A-Z]:\\Users\\)[^/\\\s]+/gi;
 
 export const redactDebugMessage = (message: string): string =>
   message
@@ -32,7 +35,10 @@ export const redactDebugMessage = (message: string): string =>
     })
     .replace(AUTH_SCHEME_PATTERN, '$1 [REDACTED]')
     .replace(API_KEY_PATTERN, REDACTED)
-    .replace(JWT_PATTERN, REDACTED);
+    .replace(JWT_PATTERN, REDACTED)
+    .replace(EMAIL_PATTERN, '[EMAIL]')
+    .replace(JOIN_CODE_PATTERN, '[JOIN_CODE]')
+    .replace(USER_DIRECTORY_PATTERN, '~');
 
 const formatValue = (value: unknown): string => {
   if (value instanceof Error) return value.stack || `${value.name}: ${value.message}`;
@@ -51,14 +57,25 @@ export function debugLog(
   source: string,
   ...values: unknown[]
 ): void {
-  entries.push({
+  const entry: DebugLogEntry = {
     id: `frontend-${Date.now()}-${nextId++}`,
     timestamp: Date.now(),
     level,
     source,
     message: redactDebugMessage(values.map(formatValue).join(' ')),
-  });
+  };
+  entries.push(entry);
   if (entries.length > MAX_LOG_ENTRIES) entries.splice(0, entries.length - MAX_LOG_ENTRIES);
+  if (inTauri()) {
+    void rawTauriInvoke('record_frontend_log', {
+      input: {
+        level: entry.level,
+        source: entry.source,
+        message: entry.message,
+        timestamp: entry.timestamp,
+      },
+    }).catch(() => undefined);
+  }
   notify();
 }
 
@@ -84,7 +101,7 @@ export function installDebugCapture(): void {
     const original = console[level].bind(console);
     console[level] = (...values: unknown[]) => {
       debugLog(level, 'Console', ...values);
-      original(...values);
+      original(redactDebugMessage(values.map(formatValue).join(' ')));
     };
   });
 
@@ -106,7 +123,9 @@ export async function getBackendDebugLogs(): Promise<DebugLogEntry[]> {
   return backendEntries.map(entry => ({
     ...entry,
     id: `backend-${entry.id}`,
-    source: `Rust · ${entry.source}`,
+    source: entry.source.startsWith('frontend · ')
+      ? entry.source.slice('frontend · '.length)
+      : `Rust · ${entry.source}`,
     message: redactDebugMessage(entry.message),
   }));
 }
@@ -114,4 +133,14 @@ export async function getBackendDebugLogs(): Promise<DebugLogEntry[]> {
 export async function clearBackendDebugLogs(): Promise<void> {
   if (!inTauri()) return;
   await rawTauriInvoke('clear_debug_logs');
+}
+
+export async function openDebugLogDirectory(): Promise<string | null> {
+  if (!inTauri()) return null;
+  return rawTauriInvoke<string>('open_debug_log_directory');
+}
+
+export async function exportDiagnosticBundle(): Promise<string | null> {
+  if (!inTauri()) return null;
+  return rawTauriInvoke<string>('export_diagnostic_bundle');
 }

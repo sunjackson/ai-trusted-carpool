@@ -8,6 +8,7 @@ const apiMocks = vi.hoisted(() => ({
   importAccounts: vi.fn(),
   importLocalAccounts: vi.fn(),
   listAccounts: vi.fn(),
+  retryAccountRoute: vi.fn(),
   updateAccount: vi.fn(),
 }));
 
@@ -26,6 +27,16 @@ const accounts: LocalAccountSummary[] = [
     source: 'Claude 本机配置',
     createdAtMs: 100,
     updatedAtMs: 100,
+    credentialState: 'normal',
+    routeHealth: {
+      status: 'normal',
+      reason: null,
+      cooldownUntilMs: null,
+      consecutiveFailures: 0,
+      lastAttemptAtMs: null,
+      lastSuccessAtMs: null,
+      lastFailureAtMs: null,
+    },
   },
   {
     id: 'codex-backup',
@@ -37,6 +48,16 @@ const accounts: LocalAccountSummary[] = [
     source: '手动导入',
     createdAtMs: 200,
     updatedAtMs: 200,
+    credentialState: 'normal',
+    routeHealth: {
+      status: 'normal',
+      reason: null,
+      cooldownUntilMs: null,
+      consecutiveFailures: 0,
+      lastAttemptAtMs: null,
+      lastSuccessAtMs: null,
+      lastFailureAtMs: null,
+    },
   },
 ];
 
@@ -52,6 +73,7 @@ describe('AccountManager', () => {
     apiMocks.importLocalAccounts.mockResolvedValue(importResult([accounts[0]]));
     apiMocks.importAccounts.mockResolvedValue(importResult([accounts[0]]));
     apiMocks.updateAccount.mockResolvedValue(accounts[0]);
+    apiMocks.retryAccountRoute.mockResolvedValue(accounts[0]);
     apiMocks.deleteAccount.mockResolvedValue(undefined);
   });
 
@@ -87,6 +109,42 @@ describe('AccountManager', () => {
     await waitFor(() =>
       expect(apiMocks.updateAccount).toHaveBeenCalledWith({ id: 'codex-backup', enabled: false })
     );
+  });
+
+  it('shows enumerated health without leaking errors and retries one cooled account', async () => {
+    apiMocks.listAccounts.mockResolvedValueOnce([
+      {
+        ...accounts[0],
+        routeHealth: {
+          ...accounts[0].routeHealth,
+          status: 'cooling',
+          reason: 'rateLimited',
+          cooldownUntilMs: Date.now() + 60_000,
+          consecutiveFailures: 1,
+          lastFailureAtMs: Date.now(),
+        },
+      },
+      {
+        ...accounts[1],
+        credentialState: 'reimportRequired',
+        routeHealth: {
+          ...accounts[1].routeHealth,
+          reason: 'authentication',
+          consecutiveFailures: 2,
+        },
+      },
+    ]);
+    render(<AccountManager onClose={vi.fn()} />);
+
+    expect(await screen.findByText('冷却中')).toBeInTheDocument();
+    expect(screen.getByText('官方额度受限')).toBeInTheDocument();
+    expect(screen.getByText('需从官方客户端重新导入')).toBeInTheDocument();
+    expect(screen.getByText('官方认证失败')).toBeInTheDocument();
+    expect(screen.queryByText(/429|token|secret/i)).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '立即重试 Claude 主账号' }));
+    await waitFor(() => expect(apiMocks.retryAccountRoute).toHaveBeenCalledWith('claude-main'));
+    expect(screen.queryByRole('button', { name: '立即重试 Codex 备用账号' })).not.toBeInTheDocument();
   });
 
   it('imports pasted credentials, local configs, and multiple JSON files', async () => {

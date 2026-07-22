@@ -1,6 +1,8 @@
 use crate::account_pool::{
-    AccountPool, AccountSource, AccountSummary, ImportOptions, ImportResult, UpdateAccountInput,
+    AccountAuthKind, AccountPool, AccountSource, AccountSummary, CredentialState, ImportOptions,
+    ImportResult, LocalRefreshResult, UpdateAccountInput,
 };
+use crate::account_router::RouteFailure;
 use crate::coordinator::{CoordinatorClient, CoordinatorMessage, IceServer, PublicInvitePayload};
 use crate::crypto::{decrypt_access, encrypt_access, EncryptedEnvelope};
 use crate::identity::{load_or_create, DeviceIdentity, PublicIdentity};
@@ -15,20 +17,28 @@ use crate::relay::{
 };
 use crate::runtime::{HostSeatBinding, PassengerAccessContext, RuntimeState};
 use ring::rand::{SecureRandom, SystemRandom};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::time::{sleep, Instant};
 use uuid::Uuid;
 
 const JOIN_TIMEOUT_SECONDS: u64 = 20;
 const SIGNAL_PAYLOAD_LIMIT: usize = 48 * 1024;
 const PENDING_SIGNAL_LIMIT: usize = 256;
+const LOCAL_ACCOUNT_REFRESH_EVENT: &str = "trusted-carpool:local-account-refresh";
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalAccountRefreshNotice {
+    updated: usize,
+    discovered: usize,
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -109,6 +119,61 @@ fn clear_managed_account_routes<'a>(
             runtime.account_router.remove(&format!("managed:{id}"));
         }
     }
+}
+
+fn apply_account_route_health(state: &RuntimeState, accounts: &mut [AccountSummary]) {
+    let Ok(runtime) = state.inner.lock() else {
+        return;
+    };
+    let current_ms = now_ms();
+    for account in accounts {
+        let mut health = runtime
+            .account_router
+            .summary(&format!("managed:{}", account.id), current_ms);
+        if account.credential_state == CredentialState::Expired {
+            health.reason = Some(RouteFailure::Expired);
+        } else if health.reason == Some(RouteFailure::Authentication) {
+            account.credential_state = match account.auth_kind {
+                AccountAuthKind::OAuth => CredentialState::ReimportRequired,
+                AccountAuthKind::ApiKey => CredentialState::Expired,
+            };
+        }
+        account.route_health = health;
+    }
+}
+
+pub(crate) fn refresh_known_local_accounts(
+    app: &AppHandle,
+    state: &RuntimeState,
+) -> Result<LocalRefreshResult, String> {
+    let mut result = account_pool(state)?.refresh_known_local()?;
+    if !result.accounts.is_empty() {
+        clear_managed_account_routes(
+            state,
+            result.accounts.iter().map(|account| account.id.as_str()),
+        );
+        apply_account_route_health(state, &mut result.accounts);
+    }
+    if result.updated > 0 || result.discovered > 0 {
+        crate::diagnostics::record(
+            "info",
+            "account-pool",
+            format!(
+                "official client credential check completed: {} known account(s) updated, {} new account(s) require review",
+                result.updated, result.discovered
+            ),
+        );
+    }
+    if result.discovered > 0 {
+        let _ = app.emit(
+            LOCAL_ACCOUNT_REFRESH_EVENT,
+            LocalAccountRefreshNotice {
+                updated: result.updated,
+                discovered: result.discovered,
+            },
+        );
+    }
+    Ok(result)
 }
 
 fn account_update_resets_route_health(input: &UpdateManagedAccountInput) -> bool {
@@ -807,12 +872,14 @@ fn spawn_host_claim_loop(
 
 #[tauri::command]
 pub fn list_accounts(state: State<'_, RuntimeState>) -> Result<Vec<AccountSummary>, String> {
-    account_pool(&state)?.list()
+    let mut accounts = account_pool(&state)?.list()?;
+    apply_account_route_health(&state, &mut accounts);
+    Ok(accounts)
 }
 
 #[tauri::command]
 pub fn import_local_accounts(state: State<'_, RuntimeState>) -> Result<ImportResult, String> {
-    let result = account_pool(&state)?.import_local()?;
+    let mut result = account_pool(&state)?.import_local()?;
     clear_managed_account_routes(
         &state,
         result.accounts.iter().map(|account| account.id.as_str()),
@@ -825,6 +892,7 @@ pub fn import_local_accounts(state: State<'_, RuntimeState>) -> Result<ImportRes
             result.imported, result.updated
         ),
     );
+    apply_account_route_health(&state, &mut result.accounts);
     Ok(result)
 }
 
@@ -833,7 +901,7 @@ pub fn import_accounts(
     input: ImportAccountsInput,
     state: State<'_, RuntimeState>,
 ) -> Result<ImportResult, String> {
-    let result = account_pool(&state)?.import_content(
+    let mut result = account_pool(&state)?.import_content(
         &input.content,
         ImportOptions {
             tool: input.tool,
@@ -855,6 +923,7 @@ pub fn import_accounts(
             result.imported, result.updated
         ),
     );
+    apply_account_route_health(&state, &mut result.accounts);
     Ok(result)
 }
 
@@ -865,7 +934,7 @@ pub fn update_account(
 ) -> Result<AccountSummary, String> {
     let reset_route_health = account_update_resets_route_health(&input);
     let id = input.id;
-    let summary = account_pool(&state)?.update(
+    let mut summary = account_pool(&state)?.update(
         &id,
         UpdateAccountInput {
             name: input.name,
@@ -876,6 +945,32 @@ pub fn update_account(
     if reset_route_health {
         clear_managed_account_routes(&state, [id.as_str()]);
     }
+    apply_account_route_health(&state, std::slice::from_mut(&mut summary));
+    Ok(summary)
+}
+
+#[tauri::command]
+pub fn retry_account_route(
+    id: String,
+    state: State<'_, RuntimeState>,
+) -> Result<AccountSummary, String> {
+    let mut summary = account_pool(&state)?
+        .list()?
+        .into_iter()
+        .find(|account| account.id == id)
+        .ok_or_else(|| "账号不存在".to_string())?;
+    apply_account_route_health(&state, std::slice::from_mut(&mut summary));
+    if summary.credential_state != CredentialState::Normal {
+        return Err("凭据已失效，请先从官方客户端重新登录并导入".to_string());
+    }
+    {
+        let mut runtime = state
+            .inner
+            .lock()
+            .map_err(|_| "运行状态暂时不可用".to_string())?;
+        runtime.account_router.retry_now(&format!("managed:{id}"));
+    }
+    apply_account_route_health(&state, std::slice::from_mut(&mut summary));
     Ok(summary)
 }
 
@@ -1015,6 +1110,13 @@ pub async fn start_car(
 ) -> Result<CarSession, String> {
     if input.enabled_tools.is_empty() {
         return Err("至少选择一个工具".to_string());
+    }
+    if let Err(error) = refresh_known_local_accounts(&app, &state) {
+        crate::diagnostics::record(
+            "warn",
+            "account-pool",
+            format!("official client credential check was unavailable before hosting: {error}"),
+        );
     }
     let now = now_ms();
     validate_schedule(input.starts_at, input.ends_at, now)?;
@@ -1532,7 +1634,7 @@ pub async fn launch_tool(
     input: LaunchToolInput,
     app: AppHandle,
     state: State<'_, RuntimeState>,
-) -> Result<(), String> {
+) -> Result<crate::client_launcher::ToolLaunchResult, String> {
     let work_dir = if input.mode == LaunchMode::Terminal {
         validate_work_dir(input.work_dir.as_deref())?
     } else {
@@ -1583,12 +1685,35 @@ pub async fn launch_tool(
                 work_dir.as_deref(),
                 executable,
                 managed_by_app,
-            )
+            )?;
+            Ok(crate::client_launcher::ToolLaunchResult {
+                instance_id: format!("terminal-{}", Uuid::new_v4()),
+                status: crate::client_launcher::ClientInstanceStatus::Ready,
+                reused: false,
+                ready_at_ms: now_ms(),
+            })
         }
         LaunchMode::Desktop => {
             crate::client_launcher::launch(&app, input.kind, &access, &session_secret)
         }
     }
+}
+
+#[tauri::command]
+pub fn list_client_instances(
+    app: AppHandle,
+) -> Result<Vec<crate::client_launcher::ClientInstanceSummary>, String> {
+    crate::client_launcher::list_instances(&app)
+}
+
+#[tauri::command]
+pub fn focus_client_instance(instance_id: String, app: AppHandle) -> Result<(), String> {
+    crate::client_launcher::focus_instance(&app, &instance_id)
+}
+
+#[tauri::command]
+pub fn close_client_instance(instance_id: String, app: AppHandle) -> Result<bool, String> {
+    crate::client_launcher::close_instance(&app, &instance_id)
 }
 
 fn allowed_signal_kind(kind: &str) -> bool {

@@ -1,7 +1,43 @@
 export type ToolKind = 'claude' | 'codex';
 export type LaunchMode = 'terminal' | 'desktop';
 
+export type ClientInstanceStatus = 'starting' | 'ready';
+
+export type ToolLaunchResult = {
+  instanceId: string;
+  status: ClientInstanceStatus;
+  reused: boolean;
+  readyAtMs: number;
+};
+
+export type ClientInstanceSummary = {
+  instanceId: string;
+  accessId: string;
+  tool: ToolKind;
+  status: ClientInstanceStatus;
+  processId: number;
+  launchedAtMs: number;
+  readyAtMs: number;
+};
+
 export type AccountAuthKind = 'apiKey' | 'oauth';
+export type CredentialState = 'normal' | 'expired' | 'reimportRequired';
+export type RouteHealthReason =
+  | 'network'
+  | 'authentication'
+  | 'rateLimited'
+  | 'upstream'
+  | 'expired';
+
+export type AccountRouteHealth = {
+  status: 'normal' | 'cooling';
+  reason: RouteHealthReason | null;
+  cooldownUntilMs: number | null;
+  consecutiveFailures: number;
+  lastAttemptAtMs: number | null;
+  lastSuccessAtMs: number | null;
+  lastFailureAtMs: number | null;
+};
 
 export type LocalAccountSummary = {
   id: string;
@@ -13,12 +49,19 @@ export type LocalAccountSummary = {
   source: string;
   createdAtMs: number;
   updatedAtMs: number;
+  credentialState: CredentialState;
+  routeHealth: AccountRouteHealth;
 };
 
 export type AccountImportResult = {
   imported: number;
   updated: number;
   accounts: LocalAccountSummary[];
+};
+
+export type LocalAccountRefreshNotice = {
+  updated: number;
+  discovered: number;
 };
 
 // Keep the domain name available to callers that do not need to distinguish

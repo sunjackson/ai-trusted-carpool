@@ -35,6 +35,7 @@ import {
   launchTool,
   leaveCar,
   listenForJoinLinks,
+  listenForLocalAccountRefresh,
   listenForToolInstallProgress,
   openReleasesPage,
   previewInvite,
@@ -189,10 +190,14 @@ function WindowShell({
   children,
   onHome,
   appUpdate,
+  accountNotice,
+  onAccountNoticeHandled,
 }: {
   children: React.ReactNode;
   onHome: () => void;
   appUpdate: AppUpdateInfo | null;
+  accountNotice: number;
+  onAccountNoticeHandled: () => void;
 }) {
   const [debugOpen, setDebugOpen] = useState(false);
   const [accountManagerOpen, setAccountManagerOpen] = useState(false);
@@ -234,7 +239,17 @@ function WindowShell({
           </span>
         </div>
       </header>
-      <div className="content-frame">{children}</div>
+      <div className="content-frame">
+        {accountNotice > 0 && (
+          <div className="account-refresh-notice" role="status">
+            <KeyRound size={16} />
+            <span>官方客户端发现 {accountNotice} 个新账号，确认后再加入发车池。</span>
+            <button onClick={() => { onAccountNoticeHandled(); setAccountManagerOpen(true); }}>查看账号</button>
+            <button className="account-refresh-notice__close" onClick={onAccountNoticeHandled} aria-label="关闭新账号提示"><X size={14} /></button>
+          </div>
+        )}
+        {children}
+      </div>
       {accountManagerOpen && <AccountManager onClose={() => setAccountManagerOpen(false)} />}
       {debugOpen && <DebugPanel onClose={closeDebug} />}
     </main>
@@ -1456,7 +1471,7 @@ function RidePage({ access, tools, initiallyOpened, installingTool, installProgr
                   disabled={busy === `${kind}-desktop` || !detection?.desktopInstalled}
                   title={detection?.desktopInstalled ? `使用 ${TOOL_LABEL[kind]} 拼车配置启动客户端` : detection?.desktopDetail}
                 >
-                  <MonitorUp size={15} /> {busy === `${kind}-desktop` ? '打开中' : desktopOpen ? '新客户端' : '客户端'}
+                  <MonitorUp size={15} /> {busy === `${kind}-desktop` ? '打开中' : desktopOpen ? '定位客户端' : '客户端'}
                 </button>
                 {detection?.installed === false ? (
                   <InstallToolButton
@@ -1503,6 +1518,7 @@ export default function App() {
   const [pendingServerJoin, setPendingServerJoin] = useState<PendingServerJoin | null>(null);
   const [openedTarget, setOpenedTarget] = useState<LaunchTarget>({ kind: 'claude', mode: 'terminal' });
   const [error, setError] = useState<string | null>(null);
+  const [accountNotice, setAccountNotice] = useState(0);
   const joinRequestId = useRef(0);
   const toolsRequestId = useRef(0);
   const showError = useCallback((message: string) => {
@@ -1560,6 +1576,20 @@ export default function App() {
       .catch(() => undefined);
     return () => {
       disposed = true;
+    };
+  }, []);
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listenForLocalAccountRefresh(notice => {
+      if (!disposed) setAccountNotice(notice.discovered);
+    }).then(fn => {
+      if (disposed) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
     };
   }, []);
   useEffect(() => {
@@ -1636,7 +1666,12 @@ export default function App() {
   })();
 
   return (
-    <WindowShell onHome={goHome} appUpdate={appUpdate}>
+    <WindowShell
+      onHome={goHome}
+      appUpdate={appUpdate}
+      accountNotice={accountNotice}
+      onAccountNoticeHandled={() => setAccountNotice(0)}
+    >
       {error && <ErrorBanner message={error} onClose={() => setError(null)} />}
       {riskAcknowledged ? page : <FirstRunNotice onConfirm={confirmRisk} />}
     </WindowShell>

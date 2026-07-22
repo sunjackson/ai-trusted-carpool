@@ -2,6 +2,7 @@ mod account_pool;
 mod account_quota;
 mod account_router;
 mod client_launcher;
+mod client_process;
 mod commands;
 mod coordinator;
 mod crypto;
@@ -23,14 +24,18 @@ mod usage;
 mod usage_history;
 
 use commands::{
-    cancel_tool_install, check_app_update, confirm_passenger_link, delete_account, detect_tools,
-    execute_relay_request, get_active_car, get_ice_servers, get_shared_car_status, import_accounts,
-    import_local_accounts, install_tool, join_car, launch_tool, leave_car, list_accounts,
-    open_releases_page, poll_webrtc_signals, preview_invite, refresh_account_quotas,
+    cancel_tool_install, check_app_update, close_client_instance, confirm_passenger_link,
+    delete_account, detect_tools, execute_relay_request, focus_client_instance, get_active_car,
+    get_ice_servers, get_shared_car_status, import_accounts, import_local_accounts, install_tool,
+    join_car, launch_tool, leave_car, list_accounts, list_client_instances, open_releases_page,
+    poll_webrtc_signals, preview_invite, refresh_account_quotas, retry_account_route,
     send_webrtc_signal, start_car, start_relay_request, stop_car, submit_relay_response,
     submit_relay_stream_event, update_account, update_member_token_limits,
 };
-use diagnostics::{clear_debug_logs, get_debug_logs};
+use diagnostics::{
+    clear_debug_logs, export_diagnostic_bundle, get_debug_logs, open_debug_log_directory,
+    record_frontend_log,
+};
 use relay::RelayBridge;
 use runtime::RuntimeState;
 use tauri::Manager;
@@ -56,6 +61,7 @@ pub fn run() {
         .setup(move |app| {
             client_launcher::recover_stale(app.handle()).map_err(std::io::Error::other)?;
             let app_data_dir = app.path().app_data_dir().map_err(std::io::Error::other)?;
+            diagnostics::configure(&app_data_dir).map_err(std::io::Error::other)?;
             let history_path = app_data_dir.join("usage-history.jsonl");
             usage_history::prepare(&history_path).map_err(std::io::Error::other)?;
             let mut runtime = setup_state
@@ -64,7 +70,61 @@ pub fn run() {
                 .map_err(|_| std::io::Error::other("运行状态暂时不可用"))?;
             runtime.usage_history_path = Some(history_path);
             runtime.account_pool_path = Some(app_data_dir.join("accounts.json"));
+            let route_state_recovered = runtime
+                .account_router
+                .configure(app_data_dir.join("account-route-state.json"))
+                .map_err(std::io::Error::other)?;
             drop(runtime);
+            if route_state_recovered {
+                diagnostics::record(
+                    "warn",
+                    "account-router",
+                    "damaged route health state was quarantined and reset",
+                );
+            }
+            let route_flush_state = setup_state.clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    if let Ok(mut runtime) = route_flush_state.inner.lock() {
+                        if let Err(error) = runtime.account_router.flush() {
+                            diagnostics::record(
+                                "error",
+                                "account-router",
+                                format!("failed to persist route health state: {error}"),
+                            );
+                        }
+                    }
+                }
+            });
+            let credential_refresh_app = app.handle().clone();
+            let credential_refresh_state = setup_state.clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                loop {
+                    let app = credential_refresh_app.clone();
+                    let state = credential_refresh_state.clone();
+                    match tauri::async_runtime::spawn_blocking(move || {
+                        commands::refresh_known_local_accounts(&app, &state)
+                    })
+                    .await
+                    {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(error)) if error.starts_with("未找到本机") => {}
+                        Ok(Err(error)) => diagnostics::record(
+                            "warn",
+                            "account-pool",
+                            format!("periodic official client credential check failed: {error}"),
+                        ),
+                        Err(error) => diagnostics::record(
+                            "warn",
+                            "account-pool",
+                            format!("periodic credential check stopped unexpectedly: {error}"),
+                        ),
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                }
+            });
             tauri::async_runtime::block_on(
                 RelayBridge::global().set_app_handle(app.handle().clone()),
             );
@@ -118,6 +178,7 @@ pub fn run() {
             import_local_accounts,
             import_accounts,
             update_account,
+            retry_account_route,
             delete_account,
             install_tool,
             cancel_tool_install,
@@ -133,6 +194,9 @@ pub fn run() {
             join_car,
             leave_car,
             launch_tool,
+            list_client_instances,
+            focus_client_instance,
+            close_client_instance,
             get_ice_servers,
             confirm_passenger_link,
             send_webrtc_signal,
@@ -143,6 +207,9 @@ pub fn run() {
             submit_relay_stream_event,
             get_debug_logs,
             clear_debug_logs,
+            record_frontend_log,
+            open_debug_log_directory,
+            export_diagnostic_bundle,
             join_link::take_pending_join_code
         ])
         .build(tauri::generate_context!())
@@ -162,6 +229,17 @@ pub fn run() {
                 }
             }
             if matches!(event, tauri::RunEvent::Exit) {
+                if let Some(state) = app.try_state::<RuntimeState>() {
+                    if let Ok(mut runtime) = state.inner.lock() {
+                        if let Err(error) = runtime.account_router.flush() {
+                            diagnostics::record(
+                                "error",
+                                "account-router",
+                                format!("failed to flush route health state on exit: {error}"),
+                            );
+                        }
+                    }
+                }
                 if let Err(error) = client_launcher::recover_stale(app) {
                     diagnostics::record(
                         "error",

@@ -1,3 +1,4 @@
+use crate::account_router::RouteHealthSummary;
 use crate::models::ToolKind;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ring::{
@@ -50,6 +51,14 @@ pub enum AccountSource {
     File,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum CredentialState {
+    Normal,
+    Expired,
+    ReimportRequired,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountSummary {
@@ -62,6 +71,8 @@ pub struct AccountSummary {
     pub source: AccountSource,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+    pub credential_state: CredentialState,
+    pub route_health: RouteHealthSummary,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -95,6 +106,14 @@ pub struct UpdateAccountInput {
 pub struct ImportResult {
     pub imported: usize,
     pub updated: usize,
+    pub accounts: Vec<AccountSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalRefreshResult {
+    pub updated: usize,
+    pub discovered: usize,
     pub accounts: Vec<AccountSummary>,
 }
 
@@ -270,71 +289,7 @@ impl AccountPool {
         home: &Path,
         keychain_json: Option<&str>,
     ) -> Result<ImportResult, String> {
-        let allow_codex_api_keys = codex_local_config_allows_official_api(home);
-        let sources = [
-            (home.join(".claude/.credentials.json"), ToolKind::Claude),
-            (home.join(".claude/settings.json"), ToolKind::Claude),
-            (home.join(".claude/settings.local.json"), ToolKind::Claude),
-            (home.join(".claude.json"), ToolKind::Claude),
-            (home.join(".codex/auth.json"), ToolKind::Codex),
-        ];
-        let mut parsed = Vec::new();
-        let mut found_files = 0usize;
-        let mut first_error = None;
-
-        for (path, tool) in sources {
-            if !path.exists() {
-                continue;
-            }
-            found_files += 1;
-            let content = match fs::read_to_string(&path) {
-                Ok(content) => content,
-                Err(error) => {
-                    first_error.get_or_insert_with(|| {
-                        format!("无法读取本机 {} 账号配置: {error}", tool.command())
-                    });
-                    continue;
-                }
-            };
-            match parse_import_content(&content, Some(tool)) {
-                Ok(mut accounts) => {
-                    if tool == ToolKind::Codex && !allow_codex_api_keys {
-                        accounts
-                            .retain(|account| account.credential.kind() == AccountAuthKind::OAuth);
-                    }
-                    parsed.append(&mut accounts);
-                }
-                Err(error) => {
-                    first_error.get_or_insert_with(|| {
-                        format!("本机 {} 账号配置无法导入: {error}", tool.command())
-                    });
-                }
-            }
-        }
-
-        if let Some(content) = keychain_json {
-            found_files += 1;
-            match parse_import_content(content, Some(ToolKind::Claude)) {
-                Ok(mut accounts) => parsed.append(&mut accounts),
-                Err(error) => {
-                    first_error.get_or_insert_with(|| {
-                        format!("本机 Claude Keychain 配置无法导入: {error}")
-                    });
-                }
-            }
-        }
-
-        if parsed.is_empty() {
-            if let Some(error) = first_error {
-                return Err(error);
-            }
-            return if found_files == 0 {
-                Err("未找到本机 Claude 或 Codex 账号配置".to_string())
-            } else {
-                Err("本机配置中未找到可导入的 Claude 或 Codex 凭证".to_string())
-            };
-        }
-
+        let parsed = collect_local_accounts(home, keychain_json)?;
         self.import_parsed(
             parsed,
             ImportOptions {
@@ -343,6 +298,68 @@ impl AccountPool {
             },
             AccountSource::Local,
         )
+    }
+
+    pub fn refresh_known_local(&self) -> Result<LocalRefreshResult, String> {
+        let home = dirs::home_dir().ok_or_else(|| "无法获取用户主目录".to_string())?;
+        #[cfg(target_os = "macos")]
+        let keychain_json = read_claude_keychain_credentials();
+        #[cfg(not(target_os = "macos"))]
+        let keychain_json: Option<String> = None;
+        self.refresh_known_local_with_keychain(&home, keychain_json.as_deref())
+    }
+
+    fn refresh_known_local_with_keychain(
+        &self,
+        home: &Path,
+        keychain_json: Option<&str>,
+    ) -> Result<LocalRefreshResult, String> {
+        let parsed = collect_local_accounts(home, keychain_json)?;
+        let _guard = ACCOUNT_STORE_LOCK
+            .lock()
+            .map_err(|_| "账号存储暂时不可用".to_string())?;
+        let mut store = load_store(&self.path)?;
+        let now = now_ms();
+        let mut updated_ids = Vec::new();
+        let mut unmatched: Vec<ParsedAccount> = Vec::new();
+
+        for candidate in parsed {
+            if let Some(account) = store.accounts.iter_mut().find(|account| {
+                account.tool == candidate.tool
+                    && account.credential.same_identity(&candidate.credential)
+            }) {
+                if account.credential != candidate.credential {
+                    account.credential = candidate.credential;
+                    account.updated_at_ms = now;
+                    if !updated_ids.contains(&account.id) {
+                        updated_ids.push(account.id.clone());
+                    }
+                }
+            } else if !unmatched.iter().any(|other| {
+                other.tool == candidate.tool
+                    && other.credential.same_identity(&candidate.credential)
+            }) {
+                unmatched.push(candidate);
+            }
+        }
+
+        if !updated_ids.is_empty() {
+            validate_store(&store)?;
+            save_store(&self.path, &store)?;
+        }
+        let affected = updated_ids.iter().cloned().collect::<HashSet<_>>();
+        let mut accounts = store
+            .accounts
+            .iter()
+            .filter(|account| affected.contains(&account.id))
+            .map(StoredAccount::summary)
+            .collect::<Vec<_>>();
+        sort_summaries(&mut accounts);
+        Ok(LocalRefreshResult {
+            updated: accounts.len(),
+            discovered: unmatched.len(),
+            accounts,
+        })
     }
 
     pub fn update(&self, id: &str, input: UpdateAccountInput) -> Result<AccountSummary, String> {
@@ -502,6 +519,75 @@ impl AccountPool {
     }
 }
 
+fn collect_local_accounts(
+    home: &Path,
+    keychain_json: Option<&str>,
+) -> Result<Vec<ParsedAccount>, String> {
+    let allow_codex_api_keys = codex_local_config_allows_official_api(home);
+    let sources = [
+        (home.join(".claude/.credentials.json"), ToolKind::Claude),
+        (home.join(".claude/settings.json"), ToolKind::Claude),
+        (home.join(".claude/settings.local.json"), ToolKind::Claude),
+        (home.join(".claude.json"), ToolKind::Claude),
+        (home.join(".codex/auth.json"), ToolKind::Codex),
+    ];
+    let mut parsed = Vec::new();
+    let mut found_files = 0usize;
+    let mut first_error = None;
+
+    for (path, tool) in sources {
+        if !path.exists() {
+            continue;
+        }
+        found_files += 1;
+        let content = match fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(error) => {
+                first_error.get_or_insert_with(|| {
+                    format!("无法读取本机 {} 账号配置: {error}", tool.command())
+                });
+                continue;
+            }
+        };
+        match parse_import_content(&content, Some(tool)) {
+            Ok(mut accounts) => {
+                if tool == ToolKind::Codex && !allow_codex_api_keys {
+                    accounts.retain(|account| account.credential.kind() == AccountAuthKind::OAuth);
+                }
+                parsed.append(&mut accounts);
+            }
+            Err(error) => {
+                first_error.get_or_insert_with(|| {
+                    format!("本机 {} 账号配置无法导入: {error}", tool.command())
+                });
+            }
+        }
+    }
+
+    if let Some(content) = keychain_json {
+        found_files += 1;
+        match parse_import_content(content, Some(ToolKind::Claude)) {
+            Ok(mut accounts) => parsed.append(&mut accounts),
+            Err(error) => {
+                first_error
+                    .get_or_insert_with(|| format!("本机 Claude Keychain 配置无法导入: {error}"));
+            }
+        }
+    }
+
+    if parsed.is_empty() {
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        return if found_files == 0 {
+            Err("未找到本机 Claude 或 Codex 账号配置".to_string())
+        } else {
+            Err("本机配置中未找到可导入的 Claude 或 Codex 凭证".to_string())
+        };
+    }
+    Ok(parsed)
+}
+
 #[cfg(target_os = "macos")]
 fn read_claude_keychain_credentials() -> Option<String> {
     let output = std::process::Command::new("security")
@@ -573,6 +659,15 @@ impl StoredAccount {
             source: self.source,
             created_at_ms: self.created_at_ms,
             updated_at_ms: self.updated_at_ms,
+            credential_state: if self
+                .credential
+                .is_expired_at(now_ms().saturating_add(60_000))
+            {
+                CredentialState::Expired
+            } else {
+                CredentialState::Normal
+            },
+            route_health: RouteHealthSummary::default(),
         }
     }
 
@@ -587,7 +682,7 @@ impl StoredAccount {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum StoredCredential {
     ApiKey {
@@ -2860,7 +2955,9 @@ mod tests {
         assert!(!summary_json.contains(secret));
         assert!(!summary_debug.contains(secret));
         assert!(!summary_json.to_ascii_lowercase().contains("secret"));
-        assert!(!summary_json.contains("credential"));
+        assert!(summary_json.contains("\"credentialState\":\"normal\""));
+        assert!(!summary_json.contains("\"credential\":"));
+        assert!(!summary_json.contains("accessToken"));
 
         let stored = fs::read_to_string(pool.path()).expect("encrypted store");
         assert!(!stored.contains(secret));
@@ -3077,6 +3174,83 @@ mod tests {
         let candidates = pool.candidates(ToolKind::Codex).expect("Codex candidates");
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].credential.secret(), "at-official-oauth");
+    }
+
+    #[test]
+    fn periodic_local_refresh_updates_only_known_accounts_and_preserves_metadata() {
+        let (temp, pool) = pool();
+        let home = temp.path().join("home");
+        fs::create_dir_all(home.join(".codex")).expect("codex dir");
+        let auth_path = home.join(".codex/auth.json");
+        fs::write(
+            &auth_path,
+            json!({
+                "accounts": [{"tokens": {
+                    "access_token": "known-access-v1",
+                    "refresh_token": "known-refresh",
+                    "account_id": "known-account"
+                }}]
+            })
+            .to_string(),
+        )
+        .expect("initial auth");
+        let imported = pool.import_local_from(&home).expect("initial import");
+        let id = imported.accounts[0].id.clone();
+        pool.update(
+            &id,
+            UpdateAccountInput {
+                name: Some("用户自定义名称".to_string()),
+                enabled: Some(false),
+                priority: Some(7),
+            },
+        )
+        .expect("customize");
+
+        fs::write(
+            &auth_path,
+            json!({
+                "accounts": [
+                    {"tokens": {
+                        "access_token": "known-access-v2",
+                        "refresh_token": "known-refresh",
+                        "account_id": "known-account"
+                    }},
+                    {"tokens": {
+                        "access_token": "new-access",
+                        "refresh_token": "new-refresh",
+                        "account_id": "new-account"
+                    }}
+                ]
+            })
+            .to_string(),
+        )
+        .expect("rotated auth");
+        let refreshed = pool
+            .refresh_known_local_with_keychain(&home, None)
+            .expect("refresh");
+        assert_eq!(refreshed.updated, 1);
+        assert_eq!(refreshed.discovered, 1);
+        assert_eq!(pool.list().unwrap().len(), 1, "new accounts require review");
+        let summary = &pool.list().unwrap()[0];
+        assert_eq!(summary.id, id);
+        assert_eq!(summary.name, "用户自定义名称");
+        assert!(!summary.enabled);
+        assert_eq!(summary.priority, 7);
+        assert!(pool.candidates(ToolKind::Codex).unwrap().is_empty());
+        pool.update(
+            &id,
+            UpdateAccountInput {
+                enabled: Some(true),
+                ..UpdateAccountInput::default()
+            },
+        )
+        .expect("enable for credential inspection");
+        assert_eq!(
+            pool.candidates(ToolKind::Codex).unwrap()[0]
+                .credential
+                .secret(),
+            "known-access-v2"
+        );
     }
 
     #[test]

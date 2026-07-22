@@ -5,6 +5,7 @@ import {
   HardDriveDownload,
   KeyRound,
   LoaderCircle,
+  RotateCcw,
   Save,
   ShieldCheck,
   Sparkles,
@@ -18,6 +19,7 @@ import {
   importAccounts,
   importLocalAccounts,
   listAccounts,
+  retryAccountRoute,
   updateAccount,
 } from './api';
 import type { AccountImportResult, LocalAccountSummary, ToolKind } from './types';
@@ -38,6 +40,26 @@ const SOURCE_LABEL: Record<string, string> = {
   json: '粘贴内容',
   local: '本机配置',
   unknown: '本机账号库',
+};
+const HEALTH_REASON_LABEL: Record<NonNullable<LocalAccountSummary['routeHealth']['reason']>, string> = {
+  network: '网络连接失败',
+  authentication: '官方认证失败',
+  rateLimited: '官方额度受限',
+  upstream: '官方服务异常',
+  expired: '凭据已过期',
+};
+
+const accountHealth = (account: LocalAccountSummary) => {
+  if (account.credentialState === 'reimportRequired') {
+    return { label: '需从官方客户端重新导入', tone: 'blocked', retryable: false } as const;
+  }
+  if (account.credentialState === 'expired') {
+    return { label: '凭据过期', tone: 'blocked', retryable: false } as const;
+  }
+  if (account.routeHealth.status === 'cooling') {
+    return { label: '冷却中', tone: 'cooling', retryable: true } as const;
+  }
+  return { label: '正常', tone: 'healthy', retryable: false } as const;
 };
 
 const messageFrom = (reason: unknown): string =>
@@ -252,6 +274,12 @@ export function AccountManager({ onClose }: { onClose: () => void }) {
       return account.enabled ? `已停用 ${account.name}` : `已启用 ${account.name}`;
     });
 
+  const retryRoute = (account: LocalAccountSummary) =>
+    void run(`retry:${account.id}`, async () => {
+      await retryAccountRoute(account.id);
+      return `已允许 ${account.name} 立即重试`;
+    });
+
   const removeAccount = (account: LocalAccountSummary) => {
     if (!window.confirm(`确认删除“${account.name}”？此操作不会删除原始工具配置。`)) return;
     void run(`delete:${account.id}`, async () => {
@@ -379,6 +407,10 @@ export function AccountManager({ onClose }: { onClose: () => void }) {
                   const draft = drafts[account.id] ?? { name: account.name, priority: String(account.priority) };
                   const changed = draft.name.trim() !== account.name || draft.priority !== String(account.priority);
                   const rowBusy = busy?.endsWith(account.id) ?? false;
+                  const health = accountHealth(account);
+                  const healthReason = account.routeHealth.reason
+                    ? HEALTH_REASON_LABEL[account.routeHealth.reason]
+                    : null;
                   return (
                     <article className={`account-row ${account.enabled ? '' : 'is-disabled'}`} key={account.id}>
                       <div className="account-row__summary">
@@ -391,6 +423,20 @@ export function AccountManager({ onClose }: { onClose: () => void }) {
                           <input type="checkbox" checked={account.enabled} onChange={() => toggleAccount(account)} disabled={isLocked} aria-label={`${account.enabled ? '停用' : '启用'} ${account.name}`} />
                           <span aria-hidden="true" />
                         </label>
+                      </div>
+                      <div className="account-row__health">
+                        <span className={`account-health-badge is-${health.tone}`}>{health.label}</span>
+                        {healthReason && <small>{healthReason}</small>}
+                        {health.retryable && (
+                          <button
+                            onClick={() => retryRoute(account)}
+                            disabled={isLocked}
+                            aria-label={`立即重试 ${account.name}`}
+                          >
+                            {rowBusy && busy?.startsWith('retry:') ? <LoaderCircle className="spin" size={12} /> : <RotateCcw size={12} />}
+                            立即重试
+                          </button>
+                        )}
                       </div>
                       <div className="account-row__fields">
                         <label className="account-field">

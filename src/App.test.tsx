@@ -47,6 +47,10 @@ describe('Trusted Carpool simple flow', () => {
 
     expect(screen.getByRole('dialog', { name: '调试日志' })).toBeInTheDocument();
     expect(screen.getByText('调试模式已打开')).toBeInTheDocument();
+    expect(screen.getByRole('searchbox', { name: '搜索日志' })).toBeInTheDocument();
+    expect(screen.getByRole('combobox', { name: '日志来源' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /日志目录/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /导出诊断包/ })).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '关闭调试模式' }));
     expect(screen.queryByRole('dialog', { name: '调试日志' })).not.toBeInTheDocument();
   });
@@ -193,7 +197,7 @@ describe('Trusted Carpool simple flow', () => {
     fireEvent.click(screen.getByRole('button', { name: /^客户端/ }));
     fireEvent.click(screen.getByRole('button', { name: /使用拼车配置打开 Claude 客户端/ }));
     expect(await screen.findByRole('heading', { name: '需要哪个，点哪个' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /新客户端/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /定位客户端/ })).toBeInTheDocument();
     expect(screen.getAllByRole('button', { name: /终端/ })).toHaveLength(2);
   });
 });

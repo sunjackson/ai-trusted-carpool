@@ -17,10 +17,17 @@ import type {
   ToolKind,
   LaunchMode,
   LocalAccountSummary,
+  ClientInstanceSummary,
+  ToolLaunchResult,
+  AccountRouteHealth,
+  CredentialState,
+  RouteHealthReason,
+  LocalAccountRefreshNotice,
 } from './types';
 
 const inTauri = (): boolean => '__TAURI_INTERNALS__' in window;
 const JOIN_LINK_EVENT = 'trusted-carpool:join-link';
+const LOCAL_ACCOUNT_REFRESH_EVENT = 'trusted-carpool:local-account-refresh';
 const JOIN_CODE_PATTERN = /^[A-HJ-NP-Z2-9]{12}$/;
 const DEFAULT_COORDINATOR_URL = 'https://p2p.cnaigc.ai';
 
@@ -58,6 +65,15 @@ export async function listenForJoinLinks(
   if (!inTauri()) return () => undefined;
   return listen<string>(JOIN_LINK_EVENT, event => {
     if (JOIN_CODE_PATTERN.test(event.payload)) onCode(event.payload);
+  });
+}
+
+export async function listenForLocalAccountRefresh(
+  onNotice: (notice: LocalAccountRefreshNotice) => void
+): Promise<UnlistenFn> {
+  if (!inTauri()) return () => undefined;
+  return listen<LocalAccountRefreshNotice>(LOCAL_ACCOUNT_REFRESH_EVENT, event => {
+    if (event.payload.discovered > 0) onNotice(event.payload);
   });
 }
 
@@ -268,10 +284,53 @@ const demoCar = (
 let demoActiveCar: CarSession | null = null;
 let demoAccounts: LocalAccountSummary[] = [];
 
+const EMPTY_ROUTE_HEALTH: AccountRouteHealth = {
+  status: 'normal',
+  reason: null,
+  cooldownUntilMs: null,
+  consecutiveFailures: 0,
+  lastAttemptAtMs: null,
+  lastSuccessAtMs: null,
+  lastFailureAtMs: null,
+};
+
+const nullableNumber = (value: unknown): number | null =>
+  value === null || value === undefined || !Number.isFinite(Number(value)) ? null : Number(value);
+
+const normalizeRouteHealth = (value: unknown): AccountRouteHealth => {
+  const record = (value && typeof value === 'object' ? value : {}) as Record<string, unknown>;
+  const reason = String(record.reason ?? '');
+  const allowedReasons: RouteHealthReason[] = [
+    'network',
+    'authentication',
+    'rateLimited',
+    'upstream',
+    'expired',
+  ];
+  return {
+    status: record.status === 'cooling' ? 'cooling' : 'normal',
+    reason: allowedReasons.includes(reason as RouteHealthReason)
+      ? (reason as RouteHealthReason)
+      : null,
+    cooldownUntilMs: nullableNumber(record.cooldownUntilMs ?? record.cooldown_until_ms),
+    consecutiveFailures: Math.max(0, Number(record.consecutiveFailures ?? record.consecutive_failures ?? 0) || 0),
+    lastAttemptAtMs: nullableNumber(record.lastAttemptAtMs ?? record.last_attempt_at_ms),
+    lastSuccessAtMs: nullableNumber(record.lastSuccessAtMs ?? record.last_success_at_ms),
+    lastFailureAtMs: nullableNumber(record.lastFailureAtMs ?? record.last_failure_at_ms),
+  };
+};
+
 const normalizeAccountSummary = (value: unknown): LocalAccountSummary => {
   const record = (value && typeof value === 'object' ? value : {}) as Record<string, unknown>;
   const authKind = String(record.authKind ?? record.auth_kind ?? 'apiKey').toLowerCase();
   const source = String(record.source ?? 'unknown');
+  const rawCredentialState = String(
+    record.credentialState ?? record.credential_state ?? 'normal'
+  );
+  const credentialState: CredentialState =
+    rawCredentialState === 'expired' || rawCredentialState === 'reimportRequired'
+      ? rawCredentialState
+      : 'normal';
   return {
     id: String(record.id ?? crypto.randomUUID()),
     tool: record.tool === 'claude' ? 'claude' : 'codex',
@@ -282,6 +341,8 @@ const normalizeAccountSummary = (value: unknown): LocalAccountSummary => {
     source,
     createdAtMs: Number(record.createdAtMs ?? record.created_at_ms ?? Date.now()),
     updatedAtMs: Number(record.updatedAtMs ?? record.updated_at_ms ?? Date.now()),
+    credentialState,
+    routeHealth: normalizeRouteHealth(record.routeHealth ?? record.route_health),
   };
 };
 
@@ -349,6 +410,8 @@ const inferDemoAccount = (
     source: '手动导入',
     createdAtMs: now,
     updatedAtMs: now,
+    credentialState: 'normal',
+    routeHealth: { ...EMPTY_ROUTE_HEALTH },
   };
 };
 
@@ -373,6 +436,16 @@ export async function listAccounts(): Promise<LocalAccountSummary[]> {
   return inTauri()
     ? invoke<unknown>('list_accounts').then(normalizeAccountList)
     : structuredClone(demoAccounts);
+}
+
+export async function retryAccountRoute(id: string): Promise<LocalAccountSummary> {
+  if (inTauri()) {
+    return invoke<unknown>('retry_account_route', { id }).then(normalizeAccountSummary);
+  }
+  const account = demoAccounts.find(candidate => candidate.id === id);
+  if (!account) throw new Error('账号不存在');
+  account.routeHealth = { ...EMPTY_ROUTE_HEALTH };
+  return structuredClone(account);
 }
 
 export async function importLocalAccounts(): Promise<AccountImportResult> {
@@ -553,8 +626,26 @@ export async function launchTool(input: {
   mode: LaunchMode;
   accessId: string;
   workDir?: string;
-}): Promise<void> {
-  if (inTauri()) await invoke('launch_tool', { input });
+}): Promise<ToolLaunchResult> {
+  if (inTauri()) return invoke<ToolLaunchResult>('launch_tool', { input });
+  return {
+    instanceId: `${input.mode}-${crypto.randomUUID()}`,
+    status: 'ready',
+    reused: false,
+    readyAtMs: Date.now(),
+  };
+}
+
+export async function listClientInstances(): Promise<ClientInstanceSummary[]> {
+  return inTauri() ? invoke<ClientInstanceSummary[]>('list_client_instances') : [];
+}
+
+export async function focusClientInstance(instanceId: string): Promise<void> {
+  if (inTauri()) await invoke('focus_client_instance', { instanceId });
+}
+
+export async function closeClientInstance(instanceId: string): Promise<boolean> {
+  return inTauri() ? invoke<boolean>('close_client_instance', { instanceId }) : true;
 }
 
 export async function leaveCar(accessId: string): Promise<void> {
