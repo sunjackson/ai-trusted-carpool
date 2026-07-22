@@ -1,5 +1,6 @@
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { invoke } from './tauriInvoke';
+import { debugLog } from './debugLog';
 import type {
   CoordinatorMessage,
   IceServer,
@@ -37,6 +38,7 @@ const MAX_BUFFERED_AMOUNT = 1024 * 1024;
 const POLL_INTERVAL_MS = 700;
 const POLL_MAX_BACKOFF_MS = 5_000;
 const CONNECT_TIMEOUT_MS = 45_000;
+const ICE_GATHER_TIMEOUT_MS = 6_000;
 const EARLY_ICE_TTL_MS = 30_000;
 // The host broadcasts a status snapshot every 2s; missing six in a row means
 // the link is effectively dead even if ICE has not noticed yet.
@@ -44,6 +46,50 @@ const HEARTBEAT_TIMEOUT_MS = 12_000;
 const FAST_RECONNECT_ATTEMPTS = 6;
 const RECONNECT_MAX_BACKOFF_MS = 15_000;
 const RECONNECT_IDLE_BACKOFF_MS = 30_000;
+const OFFICIAL_TURN_HOST = 'p2p.cnaigc.ai';
+// Keep this aligned with e2e/run-browser-webrtc.mjs. The hostname remains the
+// primary route; the pinned address only bypasses proxy/TUN DNS implementations
+// that return an RFC 2544 fake IP which WebRTC cannot use for TURN traffic.
+const OFFICIAL_TURN_FALLBACK_IPV4 = '192.220.24.20';
+
+const officialTurnFallbackUrl = (url: string): string | null => {
+  const prefix = `turn:${OFFICIAL_TURN_HOST}`;
+  if (!url.toLowerCase().startsWith(prefix)) return null;
+  const boundary = url.charAt(prefix.length);
+  if (boundary && boundary !== ':' && boundary !== '?') return null;
+  return `turn:${OFFICIAL_TURN_FALLBACK_IPV4}${url.slice(prefix.length)}`;
+};
+
+export const addOfficialTurnFallback = (servers: IceServer[]): IceServer[] =>
+  servers.map(server => {
+    const urls = server.urls.flatMap(url => {
+      const fallback = officialTurnFallbackUrl(url);
+      return fallback ? [url, fallback] : [url];
+    });
+    return { ...server, urls: [...new Set(urls)] };
+  });
+
+export const waitForIceGatheringComplete = (
+  connection: RTCPeerConnection,
+  timeoutMs: number
+): Promise<boolean> => {
+  if (connection.iceGatheringState === 'complete') return Promise.resolve(true);
+  return new Promise(resolve => {
+    const finish = (completed: boolean) => {
+      window.clearTimeout(timeout);
+      connection.removeEventListener('icegatheringstatechange', onStateChange);
+      resolve(completed);
+    };
+    const onStateChange = () => {
+      if (connection.iceGatheringState === 'complete') finish(true);
+    };
+    const timeout = window.setTimeout(() => finish(false), timeoutMs);
+    connection.addEventListener('icegatheringstatechange', onStateChange);
+    // Close the small race where gathering completes after the initial state
+    // check but before the listener is installed.
+    onStateChange();
+  });
+};
 
 const errorMessage = (error: unknown): string => {
   if (error instanceof Error) return error.message;
@@ -151,16 +197,24 @@ class TrustedWebRtcRuntime {
   /// Creates a fresh connection to the owner, sends an offer, and waits for
   /// the data channel to open. Shared by the first join and reconnects.
   private async dialOwner(ownerPeerId: string): Promise<void> {
+    const deadline = Date.now() + CONNECT_TIMEOUT_MS;
     this.removeConnection(ownerPeerId);
     const connection = this.createConnection(ownerPeerId);
     const channel = connection.pc.createDataChannel('trusted-carpool-v1', { ordered: true });
     this.bindChannel(connection, channel);
     const offer = await connection.pc.createOffer();
     await connection.pc.setLocalDescription(offer);
+    const gathered = await waitForIceGatheringComplete(
+      connection.pc,
+      ICE_GATHER_TIMEOUT_MS
+    );
+    if (!gathered) {
+      debugLog('warn', 'WebRTC', '网络候选收集未按时完成，继续使用增量信令');
+    }
     await this.sendSignal(ownerPeerId, 'webrtc_offer', {
       sdp: connection.pc.localDescription ?? offer,
     });
-    await this.waitForOpen(connection, CONNECT_TIMEOUT_MS);
+    await this.waitForOpen(connection, Math.max(1, deadline - Date.now()));
   }
 
   async stop(): Promise<void> {
@@ -178,7 +232,7 @@ class TrustedWebRtcRuntime {
   }
 
   private async loadIceServers(): Promise<void> {
-    const servers = await invoke<IceServer[]>('get_ice_servers');
+    const servers = addOfficialTurnFallback(await invoke<IceServer[]>('get_ice_servers'));
     this.iceServers = servers.map(server => ({
       urls: server.urls,
       username: server.username ?? undefined,
@@ -564,6 +618,13 @@ class TrustedWebRtcRuntime {
       await this.flushCandidates(connection);
       const answer = await connection.pc.createAnswer();
       await connection.pc.setLocalDescription(answer);
+      const gathered = await waitForIceGatheringComplete(
+        connection.pc,
+        ICE_GATHER_TIMEOUT_MS
+      );
+      if (!gathered) {
+        debugLog('warn', 'WebRTC', '车主网络候选收集未按时完成，继续使用增量信令');
+      }
       await this.sendSignal(message.fromPeerId, 'webrtc_answer', {
         sdp: connection.pc.localDescription ?? answer,
       });
@@ -584,7 +645,7 @@ class TrustedWebRtcRuntime {
         return;
       }
       if (connection.pc.remoteDescription) {
-        await connection.pc.addIceCandidate(payload.candidate);
+        await this.addIceCandidate(connection, payload.candidate);
       } else {
         connection.pendingCandidates.push(payload.candidate);
       }
@@ -619,7 +680,20 @@ class TrustedWebRtcRuntime {
 
   private async flushCandidates(connection: Connection): Promise<void> {
     for (const candidate of connection.pendingCandidates.splice(0)) {
+      await this.addIceCandidate(connection, candidate);
+    }
+  }
+
+  private async addIceCandidate(
+    connection: Connection,
+    candidate: RTCIceCandidateInit
+  ): Promise<void> {
+    try {
       await connection.pc.addIceCandidate(candidate);
+    } catch {
+      // A candidate already bundled in SDP, or unsupported by one WebView2
+      // build, must not abort the remaining answer/candidates.
+      debugLog('warn', 'WebRTC', '已忽略一个无法应用的网络候选');
     }
   }
 
@@ -638,7 +712,9 @@ class TrustedWebRtcRuntime {
         delay = POLL_INTERVAL_MS;
         this.lastPollError = '';
         for (const message of messages) {
-          await this.handleSignal(message).catch(() => undefined);
+          await this.handleSignal(message).catch(() => {
+            debugLog('warn', 'WebRTC', `已忽略无效的 ${message.kind} 信令`);
+          });
         }
       } catch (error) {
         this.lastPollError = errorMessage(error);

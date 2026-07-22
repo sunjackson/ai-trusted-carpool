@@ -232,3 +232,8 @@ try {
     await rm(profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   }
 }
+
+// Node 22 on macOS can retain an idle platform socket after the built-in
+// fetch/WebSocket clients have closed. All owned children and temporary files
+// are already awaited above, so end the one-shot verifier deterministically.
+process.exit(process.exitCode ?? 0);

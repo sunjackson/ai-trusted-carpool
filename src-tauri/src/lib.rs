@@ -48,8 +48,13 @@ use diagnostics::{
 };
 use relay::RelayBridge;
 use runtime::RuntimeState;
+use tauri::webview::PageLoadEvent;
 use tauri::Manager;
 use tauri_plugin_deep_link::DeepLinkExt;
+
+fn should_show_main_window(label: &str, event: PageLoadEvent) -> bool {
+    label == "main" && event == PageLoadEvent::Finished
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -70,6 +75,12 @@ pub fn run() {
             },
         ));
     builder
+        .on_page_load(|webview, payload| {
+            if should_show_main_window(webview.label(), payload.event()) {
+                join_link::show_main_window(webview.app_handle());
+                diagnostics::record("info", "runtime", "main window finished loading");
+            }
+        })
         .plugin(tauri_plugin_deep_link::init())
         .manage(state)
         .manage(updater_state)
@@ -292,4 +303,29 @@ pub fn run() {
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+
+    #[test]
+    fn main_window_waits_on_a_dark_boot_surface_instead_of_showing_blank() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).expect("tauri config");
+        let window = &config["app"]["windows"][0];
+        assert_eq!(window["visible"], false);
+        assert_eq!(window["backgroundColor"], "#0f1115");
+
+        let html = include_str!("../../index.html");
+        assert!(html.contains("id=\"boot-splash\""));
+        assert!(html.contains("正在安全启动"));
+
+        assert!(!should_show_main_window("main", PageLoadEvent::Started));
+        assert!(!should_show_main_window(
+            "secondary",
+            PageLoadEvent::Finished
+        ));
+        assert!(should_show_main_window("main", PageLoadEvent::Finished));
+    }
 }

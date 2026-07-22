@@ -122,6 +122,13 @@ describe('Trusted Carpool simple flow', () => {
     expect(await screen.findByText('我的拼车记录')).toBeInTheDocument();
     expect(screen.getByText('全天测试车队')).toBeInTheDocument();
     expect(screen.getAllByText('已结束').length).toBeGreaterThan(0);
+
+    fireEvent.click(screen.getByRole('button', { name: '查看发车记录“全天测试车队”详情' }));
+    expect(screen.getByRole('dialog', { name: '全天测试车队发车记录详情' })).toBeInTheDocument();
+    expect(screen.getByText('全天发车')).toBeInTheDocument();
+    expect(screen.getByText('车主在线时持续开放')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '关闭拼车记录详情' }));
+    expect(screen.queryByRole('dialog', { name: '全天测试车队发车记录详情' })).not.toBeInTheDocument();
   });
 
   it('keeps the member list concise and opens detailed usage on demand', async () => {
@@ -221,5 +228,12 @@ describe('Trusted Carpool simple flow', () => {
     expect(await screen.findByRole('heading', { name: '需要哪个，点哪个' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /定位客户端/ })).toBeInTheDocument();
     expect(screen.getAllByRole('button', { name: /终端/ })).toHaveLength(2);
+
+    fireEvent.click(screen.getByRole('button', { name: '离开车队' }));
+    expect(await screen.findByText('我的拼车记录')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '查看上车记录“我的高效车队”详情' }));
+    expect(screen.getByRole('dialog', { name: '我的高效车队上车记录详情' })).toBeInTheDocument();
+    expect(screen.getByText('3 号座位')).toBeInTheDocument();
+    expect(screen.getByText('小雨')).toBeInTheDocument();
   });
 });

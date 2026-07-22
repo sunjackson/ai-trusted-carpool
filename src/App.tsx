@@ -4,6 +4,7 @@ import {
   Check,
   CheckCircle2,
   ChevronDown,
+  ChevronRight,
   CircleHelp,
   Clock3,
   Code2,
@@ -26,6 +27,7 @@ import {
   X,
 } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import {
   cancelToolInstall,
   coordinatorHost,
@@ -282,16 +284,97 @@ const availabilityLabel: Record<RideHistorySummary['availability'], string> = {
   stopped: '已结束',
 };
 
+function RideHistoryDetailDialog({
+  record,
+  busyRecord,
+  onClose,
+  onResumeHost,
+  onResumePassenger,
+}: {
+  record: RideHistorySummary;
+  busyRecord: string | null;
+  onClose: () => void;
+  onResumeHost: (recordId: string) => void;
+  onResumePassenger: (recordId: string) => void;
+}) {
+  const roleLabel = record.role === 'host' ? '发车记录' : '上车记录';
+  const actionBusy = busyRecord === record.recordId;
+  const canAct = record.canResume && busyRecord === null;
+  const runAction = () => {
+    if (record.role === 'host') onResumeHost(record.recordId);
+    else onResumePassenger(record.recordId);
+  };
+
+  return createPortal(
+    <div className="dialog-backdrop" role="presentation" onMouseDown={event => event.target === event.currentTarget && onClose()}>
+      <section className="member-dialog ride-history-dialog" role="dialog" aria-modal="true" aria-label={`${record.carName}${roleLabel}详情`}>
+        <header className="member-dialog__header">
+          <div className="ride-history-dialog__icon">
+            {record.role === 'host' ? <CarFront size={22} /> : <Users size={22} />}
+          </div>
+          <div>
+            <small>{roleLabel}</small>
+            <h2>{record.carName}</h2>
+            <span>{record.enabledTools.map(kind => TOOL_LABEL[kind]).join(' / ')}</span>
+          </div>
+          <button className="dialog-close" onClick={onClose} aria-label="关闭拼车记录详情"><X size={18} /></button>
+        </header>
+
+        <div className="ride-history-dialog__status">
+          <span className={`ride-availability ride-availability--${record.availability}`}>
+            <i /> {availabilityLabel[record.availability]}
+          </span>
+          <small>{record.canResume ? (record.role === 'host' ? '可恢复原通道' : '当前可以重新上车') : '仅供查看，当前不可继续'}</small>
+        </div>
+
+        <dl className="ride-history-dialog__details">
+          <div><dt>记录类型</dt><dd>{roleLabel}</dd></div>
+          <div><dt>发车模式</dt><dd>{record.alwaysOn ? '全天发车' : '固定时段'}</dd></div>
+          <div><dt>开始时间</dt><dd>{formatDateTime(record.startedAt)}</dd></div>
+          <div><dt>结束时间</dt><dd>{record.alwaysOn ? '车主在线时持续开放' : formatDateTime(record.expiresAt)}</dd></div>
+          <div><dt>可用工具</dt><dd>{record.enabledTools.map(kind => TOOL_LABEL[kind]).join(' / ')}</dd></div>
+          <div><dt>最近活动</dt><dd>{formatDateTime(record.lastActiveAt)}</dd></div>
+          {record.role === 'passenger' && (
+            <>
+              <div><dt>我的座位</dt><dd>{record.seatNo ? `${record.seatNo} 号座位` : '未记录'}</dd></div>
+              <div><dt>上车昵称</dt><dd>{record.nickname ?? '未记录'}</dd></div>
+            </>
+          )}
+          {record.endedAt !== null && <div><dt>结束记录</dt><dd>{formatDateTime(record.endedAt)}</dd></div>}
+        </dl>
+
+        <footer className="ride-history-dialog__actions">
+          {record.role === 'host' ? (
+            record.canResume && (
+              <button className="ride-history-dialog__primary" onClick={runAction} disabled={!canAct}>
+                <RotateCcw size={16} /> {actionBusy ? '正在恢复' : '恢复原通道'}
+              </button>
+            )
+          ) : (
+            <button className="ride-history-dialog__primary" onClick={runAction} disabled={!canAct}>
+              <Users size={16} /> {actionBusy ? '正在上车' : '重新上车'}
+            </button>
+          )}
+          <button className="ride-history-dialog__secondary" onClick={onClose}>关闭</button>
+        </footer>
+      </section>
+    </div>,
+    document.body,
+  );
+}
+
 function RideHistoryList({
   title,
   records,
   busyRecord,
+  onOpenRecord,
   onResumeHost,
   onResumePassenger,
 }: {
   title: string;
   records: RideHistorySummary[];
   busyRecord: string | null;
+  onOpenRecord: (record: RideHistorySummary) => void;
   onResumeHost: (recordId: string) => void;
   onResumePassenger: (recordId: string) => void;
 }) {
@@ -302,36 +385,47 @@ function RideHistoryList({
         <p className="ride-history__empty">还没有记录</p>
       ) : (
         <div className="ride-history__list">
-          {records.map(record => (
-            <article className="ride-history__item" key={record.recordId}>
-              <div className="ride-history__main">
-                <strong>{record.carName}</strong>
-                <span>
-                  {record.alwaysOn ? '全天' : `${formatDateTime(record.startedAt)}—${formatDateTime(record.expiresAt)}`}
-                  {' · '}{record.enabledTools.map(kind => TOOL_LABEL[kind]).join(' / ')}
-                </span>
-              </div>
-              <span className={`ride-availability ride-availability--${record.availability}`}>
-                <i /> {availabilityLabel[record.availability]}
-              </span>
-              {record.role === 'host' ? (
-                record.canResume && (
-                  <button onClick={() => onResumeHost(record.recordId)} disabled={busyRecord !== null}>
-                    <RotateCcw size={15} />
-                    {busyRecord === record.recordId ? '恢复中' : '恢复通道'}
-                  </button>
-                )
-              ) : (
+          {records.map(record => {
+            const roleLabel = record.role === 'host' ? '发车记录' : '上车记录';
+            return (
+              <article className="ride-history__item" key={record.recordId}>
                 <button
-                  onClick={() => onResumePassenger(record.recordId)}
-                  disabled={!record.canResume || busyRecord !== null}
+                  className="ride-history__open"
+                  onClick={() => onOpenRecord(record)}
+                  aria-label={`查看${roleLabel}“${record.carName}”详情`}
                 >
-                  <Users size={15} />
-                  {busyRecord === record.recordId ? '上车中' : '重新上车'}
+                  <span className="ride-history__main">
+                    <strong>{record.carName}</strong>
+                    <span>
+                      {record.alwaysOn ? '全天' : `${formatDateTime(record.startedAt)}—${formatDateTime(record.expiresAt)}`}
+                      {' · '}{record.enabledTools.map(kind => TOOL_LABEL[kind]).join(' / ')}
+                    </span>
+                  </span>
+                  <span className={`ride-availability ride-availability--${record.availability}`}>
+                    <i /> {availabilityLabel[record.availability]}
+                  </span>
+                  <ChevronRight size={15} aria-hidden="true" />
                 </button>
-              )}
-            </article>
-          ))}
+                {record.role === 'host' ? (
+                  record.canResume && (
+                    <button className="ride-history__action" onClick={() => onResumeHost(record.recordId)} disabled={busyRecord !== null}>
+                      <RotateCcw size={15} />
+                      {busyRecord === record.recordId ? '恢复中' : '恢复通道'}
+                    </button>
+                  )
+                ) : (
+                  <button
+                    className="ride-history__action"
+                    onClick={() => onResumePassenger(record.recordId)}
+                    disabled={!record.canResume || busyRecord !== null}
+                  >
+                    <Users size={15} />
+                    {busyRecord === record.recordId ? '上车中' : '重新上车'}
+                  </button>
+                )}
+              </article>
+            );
+          })}
         </div>
       )}
     </div>
@@ -357,6 +451,7 @@ function Welcome({
   onResumeHost: (recordId: string) => void;
   onResumePassenger: (recordId: string) => void;
 }) {
+  const [selectedRecord, setSelectedRecord] = useState<RideHistorySummary | null>(null);
   const hostRecords = history.filter(record => record.role === 'host');
   const passengerRecords = history.filter(record => record.role === 'passenger');
   const recoverableHost = hostRecords.find(record => record.canResume);
@@ -435,6 +530,7 @@ function Welcome({
                 title="发车记录"
                 records={hostRecords}
                 busyRecord={busyRecord}
+                onOpenRecord={setSelectedRecord}
                 onResumeHost={onResumeHost}
                 onResumePassenger={onResumePassenger}
               />
@@ -442,12 +538,23 @@ function Welcome({
                 title="上车记录"
                 records={passengerRecords}
                 busyRecord={busyRecord}
+                onOpenRecord={setSelectedRecord}
                 onResumeHost={onResumeHost}
                 onResumePassenger={onResumePassenger}
               />
             </div>
           )}
         </section>
+      )}
+
+      {selectedRecord && (
+        <RideHistoryDetailDialog
+          record={selectedRecord}
+          busyRecord={busyRecord}
+          onClose={() => setSelectedRecord(null)}
+          onResumeHost={onResumeHost}
+          onResumePassenger={onResumePassenger}
+        />
       )}
     </section>
   );
