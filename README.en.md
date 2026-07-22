@@ -50,22 +50,60 @@ A desktop app for sharing a locally signed-in Claude Code / Codex account among 
 
 ## Install
 
-Download the installer for your platform from [GitHub Releases](https://github.com/sunjackson/ai-trusted-carpool/releases) (macOS universal DMG, Windows x64 NSIS, Linux x64 DEB/AppImage), then compare its SHA-256 digest with `SHA256SUMS.txt` from the same release. See the [v0.0.5 release notes](docs/releases/v0.0.5.md) for the current stable release, or use the unsigned [v0.0.6-test.1 prerelease](docs/releases/v0.0.6-test.1.md) to test all-day hosting and ride history.
+Download the installer for your platform from [GitHub Releases](https://github.com/sunjackson/ai-trusted-carpool/releases) (macOS universal DMG, Windows x64 NSIS, Linux x64 DEB/AppImage), then compare its SHA-256 digest with `SHA256SUMS.txt` from the same release. The currently recommended download is the unsigned [v0.0.6-test.1 prerelease](https://github.com/sunjackson/ai-trusted-carpool/releases/tag/v0.0.6-test.1); see its [release notes](docs/releases/v0.0.6-test.1.md) for all-day hosting and ride history.
 
-## Update and release trust
+## Current unsigned release policy
 
-| Package | Update path | Release verification |
+> [!IMPORTANT]
+> The project currently has no Windows Authenticode certificate/PFX and no Apple Developer ID or notarization credentials. Test releases also have no Tauri updater signing key. GitHub Actions builds these **unsigned test packages** from the public source, so Windows and macOS security warnings are expected and do not mean the package has passed operating-system signature verification.
+
+| Package | Current update path | Expected installation warning |
 | --- | --- | --- |
-| Windows x64 NSIS | In-app check and download, followed by user-confirmed install and restart | Authenticode-signed with a pinned certificate fingerprint and checked by `signtool verify`; the updater package also has a Tauri signature |
-| Linux x64 AppImage | In-app check and download, followed by user-confirmed install and restart | Signed Tauri update; the Release also includes SHA-256 checksums |
-| Linux x64 DEB | Manual update from Releases or through the distribution package manager | Excluded from the automatic update manifest; verify against `SHA256SUMS.txt` |
-| macOS universal DMG | Manual update from Releases | No Developer ID signing or Apple notarization yet, so it is excluded from the automatic update manifest; verify against `SHA256SUMS.txt` |
+| Windows x64 NSIS | Manual download and install from GitHub Releases | SmartScreen “Windows protected your PC,” low-reputation download, or UAC “Unknown publisher” |
+| macOS universal DMG | Manual download from GitHub Releases, then drag to Applications | Gatekeeper cannot verify the developer or check the app for malicious software |
+| Linux x64 AppImage | Manual download, checksum verification, and executable permission | The file manager may report that the file is not executable or comes from an unknown source |
+| Linux x64 DEB | Manual installation through the system package manager | The software center may identify it as a third-party or out-of-repository package |
 
-- The only supported production distribution channel is an official GitHub Release with a `vX.Y.Z` tag. Actions artifacts from ordinary branches and pull requests are unsigned development builds: they are not official releases and never enter the automatic update feed.
-- A `vX.Y.Z-test.N` tag publishes an unsigned test prerelease only: it contains installers and `SHA256SUMS.txt` for manual download, but no `.sig` files or `latest.json`, so the in-app updater never discovers it. Windows SmartScreen and macOS Gatekeeper may warn about an unknown publisher.
-- Windows and Linux AppImage updater packages are signature-verified before installation. An active hosted or joined ride may download an update, but the Rust backend refuses installation and restart until the ride ends.
-- Signature, download, or installation failure leaves the current version untouched. For a manual download, calculate the digest with `shasum -a 256 <file>` (macOS/Linux) or `certutil -hashfile <file> SHA256` (Windows), then compare it with the matching filename in `SHA256SUMS.txt`.
-- See the [release guide](docs/RELEASE.md) for signing keys, platform status, CI gates, and the complete checklist. See the [v0.0.5 release notes](docs/releases/v0.0.5.md) for the current stable release and [v0.0.6-test.1](docs/releases/v0.0.6-test.1.md) for the latest unsigned prerelease.
+- The current distribution channel is limited to unsigned `vX.Y.Z-test.N` prereleases. A Release contains installers and `SHA256SUMS.txt`, but no `.sig` files or `latest.json`, so the in-app updater never discovers it.
+- The repository retains signed-updater code and production release gates for possible future use after certificates and keys are obtained; they are not part of the current distribution promise.
+- Do not download “extra signature” files from third parties. A trusted signature cannot be created after the fact without the matching private key, and a fabricated `.sig` will not verify against the public key embedded in the client.
+
+### Windows: SmartScreen or unknown publisher
+
+1. Download only from this repository's GitHub Release and verify `SHA256SUMS.txt` first:
+
+   ```powershell
+   Get-FileHash .\Trusted-Carpool_*_x64-setup.exe -Algorithm SHA256
+   ```
+
+2. If the browser reports that the file is not commonly downloaded or may be unsafe, confirm that the URL is under `github.com/sunjackson/ai-trusted-carpool`, then choose **Keep**. Depending on the browser version, the action may be under **Show more** or **Keep anyway**.
+3. If SmartScreen displays “Windows protected your PC,” select **More info**, confirm the application and filename, then select **Run anyway**.
+4. UAC may display “Unknown publisher.” This is expected without an Authenticode certificate; after checking the SHA-256 digest, select **Yes** to continue.
+5. Organization-managed devices may hide **Run anyway** through policy. Do not disable Defender/SmartScreen or bypass organization policy; contact the administrator or build from source using the development instructions below.
+
+See [Microsoft Learn](https://learn.microsoft.com/windows/security/operating-system-security/virus-and-threat-protection/microsoft-defender-smartscreen/) for Microsoft's SmartScreen documentation.
+
+### macOS: developer cannot be verified
+
+1. Open the DMG, drag the app into Applications, and try to launch it once from Applications.
+2. Close the “developer cannot be verified” or “Apple cannot check it for malicious software” dialog, then open **System Settings → Privacy & Security**.
+3. In the Security section, find the blocked app, select **Open Anyway**, authenticate with a password or Touch ID, and select **Open** in the second dialog. The button normally appears only after a blocked launch and remains available for about one hour.
+4. If an organization-managed Mac does not offer **Open Anyway**, contact the administrator or build from source. Do not disable Gatekeeper globally or run untrusted `xattr`/`spctl` bypass commands.
+
+Apple documents the supported flow in [Open a Mac app from an unidentified developer](https://support.apple.com/guide/mac-help/open-a-mac-app-from-an-unidentified-developer-mh40616/mac).
+
+### Linux: manual installation
+
+```bash
+# AppImage
+chmod +x Trusted-Carpool_*_amd64.AppImage
+./Trusted-Carpool_*_amd64.AppImage
+
+# Debian / Ubuntu
+sudo apt install ./Trusted-Carpool_*_amd64.deb
+```
+
+For manual downloads, you can also calculate the digest with `shasum -a 256 <file>` on macOS, `sha256sum <file>` on Linux, or `certutil -hashfile <file> SHA256` on Windows and compare it with the matching entry in the same Release's `SHA256SUMS.txt`. See the [release guide](docs/RELEASE.md) for the future signing design and release gates.
 
 ## Local development
 
@@ -86,7 +124,7 @@ cargo test --manifest-path src-tauri/Cargo.toml --all-targets --all-features
 ./scripts/build-linux-docker.sh
 ```
 
-GitHub Actions runs frontend, release-manifest, backend, and coordinator tests first, then builds the macOS universal DMG, Windows x64 NSIS, and Linux x64 DEB/AppImage in parallel. Development installers from each run remain in Actions Artifacts for 30 days. A matching `vX.Y.Z` tag enters the signing gate, producing Windows/Linux updater signatures, a `latest.json` containing only NSIS and AppImage targets, `SHA256SUMS.txt`, and bilingual release notes. CI creates a draft, uploads and verifies every remote asset, and publishes the Release only after they all match.
+GitHub Actions runs frontend, release-manifest, backend, and coordinator tests first, then builds the macOS universal DMG, Windows x64 NSIS, and Linux x64 DEB/AppImage in parallel. Development installers from each run remain in Actions Artifacts for 30 days. The current `vX.Y.Z-test.N` path publishes an unsigned prerelease with `SHA256SUMS.txt`; CI creates a draft, uploads and verifies every remote asset, and publishes only after all assets match. An exact `vX.Y.Z` production tag enters the signing gate, but that path is not used until the required certificates and updater key exist.
 
 ## Security boundary
 

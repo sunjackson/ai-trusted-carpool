@@ -50,22 +50,60 @@
 
 ## 安装
 
-从 [GitHub Releases](https://github.com/sunjackson/ai-trusted-carpool/releases) 下载对应平台安装包（macOS 通用 DMG、Windows x64 NSIS、Linux x64 DEB/AppImage），并按同一 Release 中的 `SHA256SUMS.txt` 核对文件 SHA-256 后安装。正式发布说明见 [v0.0.5 Release Notes](docs/releases/v0.0.5.md)；全天发车与拼车历史功能可通过 [v0.0.6-test.1 测试版](docs/releases/v0.0.6-test.1.md)体验。
+从 [GitHub Releases](https://github.com/sunjackson/ai-trusted-carpool/releases) 下载对应平台安装包（macOS 通用 DMG、Windows x64 NSIS、Linux x64 DEB/AppImage），并按同一 Release 中的 `SHA256SUMS.txt` 核对文件 SHA-256 后安装。当前推荐 [v0.0.6-test.1 未签名测试版](https://github.com/sunjackson/ai-trusted-carpool/releases/tag/v0.0.6-test.1)，全天发车与拼车历史的版本说明见 [Release Notes](docs/releases/v0.0.6-test.1.md)。
 
-## 更新与发布信任
+## 当前未签名发布策略
 
-| 平台安装包 | 更新方式 | 发布验证 |
+> [!IMPORTANT]
+> 项目目前没有 Windows Authenticode 证书/PFX，也没有 Apple Developer ID 和公证凭据；测试 Release 同样不配置 Tauri 自动更新私钥。安装包是 GitHub Actions 从公开源码构建的**未签名测试包**，因此 Windows 和 macOS 的安全提示属于预期行为，不代表已经完成系统签名验证。
+
+| 平台安装包 | 当前更新方式 | 安装时可能出现的提示 |
 | --- | --- | --- |
-| Windows x64 NSIS | 应用内检查、下载，用户确认后安装并重启 | Authenticode 固定证书指纹签名并通过 `signtool verify`；更新包另有 Tauri 签名 |
-| Linux x64 AppImage | 应用内检查、下载，用户确认后安装并重启 | Tauri 签名更新；Release 同时提供 SHA-256 清单 |
-| Linux x64 DEB | 从 Release 页面或发行版包管理器手动更新 | 不进入自动更新清单；按 `SHA256SUMS.txt` 校验 |
-| macOS 通用 DMG | 从 Release 页面手动更新 | 尚无 Developer ID 签名与 Apple 公证，不进入自动更新清单；按 `SHA256SUMS.txt` 校验 |
+| Windows x64 NSIS | 从 GitHub Release 手动下载并安装 | SmartScreen“Windows 已保护你的电脑”、下载量较少或 UAC“未知发布者” |
+| macOS 通用 DMG | 从 GitHub Release 手动下载，拖入“应用程序” | Gatekeeper“无法验证开发者”或“Apple 无法检查是否包含恶意软件” |
+| Linux x64 AppImage | 手动下载、校验并赋予执行权限 | 文件管理器可能提示文件不可执行或来源未知 |
+| Linux x64 DEB | 使用系统包管理器手动安装 | 软件中心可能提示第三方/非仓库软件包 |
 
-- 唯一受支持的正式发布通道是带 `vX.Y.Z` 标签的官方 GitHub Release。普通分支与 PR 的 Actions Artifacts 只用于测试，是未签名开发包，不能视为正式版本，也不会进入自动更新。
-- `vX.Y.Z-test.N` 标签只发布未签名测试预发布版：提供安装包与 `SHA256SUMS.txt` 供手动下载，不生成 `.sig` 或 `latest.json`，不会被应用内自动更新发现。Windows SmartScreen 和 macOS Gatekeeper 可能显示未知发布者警告。
-- Windows 和 Linux AppImage 的更新包会先完成签名验证。应用允许在发车或上车期间下载更新，但 Rust 后端会拒绝安装和重启；结束拼车后才能继续安装。
-- 签名、下载或安装失败都不会替换当前版本。手动下载时，请用 `shasum -a 256 <文件>`（macOS/Linux）或 `certutil -hashfile <文件> SHA256`（Windows）计算摘要，并与 `SHA256SUMS.txt` 中对应文件名的一行比较。
-- 发布密钥、平台状态、CI 门禁和完整检查清单见 [发布指南](docs/RELEASE.md)。当前正式版说明见 [v0.0.5 Release Notes](docs/releases/v0.0.5.md)，最新未签名测试版说明见 [v0.0.6-test.1](docs/releases/v0.0.6-test.1.md)。
+- 当前只使用 `vX.Y.Z-test.N` 未签名测试预发布通道。Release 包含安装包和 `SHA256SUMS.txt`，不包含 `.sig` 或 `latest.json`，不会被应用内自动更新发现。
+- 仓库保留签名更新代码和正式发布门禁，供未来取得证书与密钥后启用；在此之前它们不是当前分发承诺。
+- 不要从第三方下载所谓“补签名”文件。没有对应私钥时无法事后生成可信签名，手动伪造 `.sig` 也不会通过客户端内置公钥验证。
+
+### Windows：SmartScreen 或未知发布者
+
+1. 只从本仓库的 GitHub Release 下载，并先核对 `SHA256SUMS.txt`：
+
+   ```powershell
+   Get-FileHash .\Trusted-Carpool_*_x64-setup.exe -Algorithm SHA256
+   ```
+
+2. 如果浏览器提示“此文件不常下载”或“可能不安全”，确认下载地址确实是 `github.com/sunjackson/ai-trusted-carpool` 后，在下载列表中选择“保留”；不同浏览器的按钮可能显示为“显示详细信息”或“仍然保留”。
+3. 运行安装器后，如果 SmartScreen 显示“Windows 已保护你的电脑”，点击“更多信息”，确认应用名称与文件名，再点击“仍要运行”。
+4. 如果 UAC 显示“未知发布者”，这是没有 Authenticode 证书的预期结果；校验 SHA-256 无误后可选择“是”继续。
+5. 公司或学校管理的设备可能通过策略隐藏“仍要运行”。这种情况不要关闭 Defender/SmartScreen，也不要修改组织策略；请联系管理员或按下方开发说明从源码自行构建。
+
+Microsoft 对 SmartScreen 的说明见 [Microsoft Learn](https://learn.microsoft.com/windows/security/operating-system-security/virus-and-threat-protection/microsoft-defender-smartscreen/)。
+
+### macOS：无法验证开发者
+
+1. 打开 DMG，把应用拖到“应用程序”，然后从“应用程序”尝试启动一次。
+2. 出现“无法验证开发者”或“Apple 无法检查是否包含恶意软件”时关闭提示，打开“系统设置 → 隐私与安全性”。
+3. 在“安全性”区域找到刚才被阻止的应用，点击“仍要打开”，使用密码或 Touch ID 确认，再在第二次提示中点击“打开”。此按钮通常只会在尝试启动后出现，并保留约一小时。
+4. 如果设备受公司 MDM 管理且没有“仍要打开”，请联系管理员或从源码自行构建。不要全局关闭 Gatekeeper，也不要执行来源不明的 `xattr`/`spctl` 绕过命令。
+
+Apple 的官方步骤见 [Open a Mac app from an unidentified developer](https://support.apple.com/guide/mac-help/open-a-mac-app-from-an-unidentified-developer-mh40616/mac)。
+
+### Linux：手动安装
+
+```bash
+# AppImage
+chmod +x Trusted-Carpool_*_amd64.AppImage
+./Trusted-Carpool_*_amd64.AppImage
+
+# Debian / Ubuntu
+sudo apt install ./Trusted-Carpool_*_amd64.deb
+```
+
+手动下载时，也可以使用 `shasum -a 256 <文件>`（macOS）、`sha256sum <文件>`（Linux）或 `certutil -hashfile <文件> SHA256`（Windows）计算摘要，并与同一 Release 的 `SHA256SUMS.txt` 对照。发布门禁与未来签名方案见 [发布指南](docs/RELEASE.md)。
 
 ## 本地开发
 
@@ -86,7 +124,7 @@ cargo test --manifest-path src-tauri/Cargo.toml --all-targets --all-features
 ./scripts/build-linux-docker.sh
 ```
 
-GitHub Actions 会先执行前后端、发布清单与协调服务自测，再并行生成 macOS 通用 DMG、Windows x64 NSIS、Linux x64 DEB 与 AppImage；每次运行的开发安装包在 Actions Artifacts 保留 30 天。推送与应用版本一致的 `vX.Y.Z` 标签后，签名门禁会生成 Windows/Linux 更新签名、只包含 NSIS 与 AppImage 的 `latest.json`、`SHA256SUMS.txt` 和中英双语 Release Notes。CI 先创建草稿、上传并逐项核对远端资产，全部一致后才公开 Release。
+GitHub Actions 会先执行前后端、发布清单与协调服务自测，再并行生成 macOS 通用 DMG、Windows x64 NSIS、Linux x64 DEB 与 AppImage；每次运行的开发安装包在 Actions Artifacts 保留 30 天。当前使用 `vX.Y.Z-test.N` 标签生成未签名 Pre-release 与 `SHA256SUMS.txt`，CI 先创建草稿、上传并逐项核对远端资产，全部一致后才公开。精确的 `vX.Y.Z` 正式标签会进入签名门禁，但在证书和更新私钥配置完成前不使用该通道。
 
 ## 安全边界
 
