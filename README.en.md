@@ -18,6 +18,7 @@ A desktop app for sharing a locally signed-in Claude Code / Codex account among 
 
 - [Highlights](#highlights)
 - [Install](#install)
+- [Update and release trust](#update-and-release-trust)
 - [Local development](#local-development)
 - [Packaging](#packaging)
 - [Security boundary](#security-boundary)
@@ -46,9 +47,21 @@ A desktop app for sharing a locally signed-in Claude Code / Codex account among 
 
 ## Install
 
-Download the installer for your platform from [GitHub Releases](https://github.com/sunjackson/ai-trusted-carpool/releases) (macOS universal DMG, Windows x64 NSIS, Linux x64 DEB/AppImage) and verify `SHA256SUMS.txt`. Installers from every CI run are also kept as Actions artifacts for 30 days.
+Download the installer for your platform from [GitHub Releases](https://github.com/sunjackson/ai-trusted-carpool/releases) (macOS universal DMG, Windows x64 NSIS, Linux x64 DEB/AppImage), then compare its SHA-256 digest with `SHA256SUMS.txt` from the same release. See the [v0.0.5 release notes](docs/releases/v0.0.5.md) for the current release.
 
-> macOS builds are not yet Apple-notarized and remain manual installs/updates. Tagged Windows releases are signed with a pinned certificate fingerprint and verified with `signtool`; ordinary branch artifacts are unsigned development builds. See [docs/RELEASE.md](docs/RELEASE.md) for status and required Secrets.
+## Update and release trust
+
+| Package | Update path | Release verification |
+| --- | --- | --- |
+| Windows x64 NSIS | In-app check and download, followed by user-confirmed install and restart | Authenticode-signed with a pinned certificate fingerprint and checked by `signtool verify`; the updater package also has a Tauri signature |
+| Linux x64 AppImage | In-app check and download, followed by user-confirmed install and restart | Signed Tauri update; the Release also includes SHA-256 checksums |
+| Linux x64 DEB | Manual update from Releases or through the distribution package manager | Excluded from the automatic update manifest; verify against `SHA256SUMS.txt` |
+| macOS universal DMG | Manual update from Releases | No Developer ID signing or Apple notarization yet, so it is excluded from the automatic update manifest; verify against `SHA256SUMS.txt` |
+
+- The only supported distribution channel is an official GitHub Release with a `vX.Y.Z` tag. Actions artifacts from ordinary branches and pull requests are unsigned development builds: they are not official releases and never enter the automatic update feed.
+- Windows and Linux AppImage updater packages are signature-verified before installation. An active hosted or joined ride may download an update, but the Rust backend refuses installation and restart until the ride ends.
+- Signature, download, or installation failure leaves the current version untouched. For a manual download, calculate the digest with `shasum -a 256 <file>` (macOS/Linux) or `certutil -hashfile <file> SHA256` (Windows), then compare it with the matching filename in `SHA256SUMS.txt`.
+- See the [release guide](docs/RELEASE.md) for signing keys, platform status, CI gates, and the complete checklist. See the [v0.0.5 release notes](docs/releases/v0.0.5.md) for this release.
 
 ## Local development
 
@@ -69,7 +82,7 @@ cargo test --manifest-path src-tauri/Cargo.toml --all-targets --all-features
 ./scripts/build-linux-docker.sh
 ```
 
-GitHub Actions runs frontend, release-manifest, backend, and coordinator tests first, then builds the macOS universal DMG, Windows x64 NSIS, and Linux x64 DEB/AppImage in parallel. A matching `vX.Y.Z` tag enters the signing gate, producing Windows/Linux updater signatures, a `latest.json` containing only NSIS and AppImage targets, `SHA256SUMS.txt`, and bilingual release notes. macOS and DEB updates remain manual.
+GitHub Actions runs frontend, release-manifest, backend, and coordinator tests first, then builds the macOS universal DMG, Windows x64 NSIS, and Linux x64 DEB/AppImage in parallel. Development installers from each run remain in Actions Artifacts for 30 days. A matching `vX.Y.Z` tag enters the signing gate, producing Windows/Linux updater signatures, a `latest.json` containing only NSIS and AppImage targets, `SHA256SUMS.txt`, and bilingual release notes. CI creates a draft, uploads and verifies every remote asset, and publishes the Release only after they all match.
 
 ## Security boundary
 

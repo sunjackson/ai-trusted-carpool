@@ -18,6 +18,7 @@
 
 - [核心能力](#核心能力)
 - [安装](#安装)
+- [更新与发布信任](#更新与发布信任)
 - [本地开发](#本地开发)
 - [打包](#打包)
 - [安全边界](#安全边界)
@@ -46,9 +47,21 @@
 
 ## 安装
 
-从 [GitHub Releases](https://github.com/sunjackson/ai-trusted-carpool/releases) 下载对应平台安装包（macOS 通用 DMG、Windows x64 NSIS、Linux x64 DEB/AppImage），校验 `SHA256SUMS.txt` 后安装。每次 CI 运行的安装包也在 Actions Artifacts 保留 30 天。
+从 [GitHub Releases](https://github.com/sunjackson/ai-trusted-carpool/releases) 下载对应平台安装包（macOS 通用 DMG、Windows x64 NSIS、Linux x64 DEB/AppImage），并按同一 Release 中的 `SHA256SUMS.txt` 核对文件 SHA-256 后安装。正式发布说明见 [v0.0.5 Release Notes](docs/releases/v0.0.5.md)。
 
-> macOS 安装包尚未进行 Apple 公证，仍需手动允许并从 Release 页面更新。正式 tag 的 Windows 安装包会经过固定证书指纹签名与 `signtool` 验证；普通分支的 Actions Artifact 只是未签名开发包。状态与所需 Secrets 见 [docs/RELEASE.md](docs/RELEASE.md)。
+## 更新与发布信任
+
+| 平台安装包 | 更新方式 | 发布验证 |
+| --- | --- | --- |
+| Windows x64 NSIS | 应用内检查、下载，用户确认后安装并重启 | Authenticode 固定证书指纹签名并通过 `signtool verify`；更新包另有 Tauri 签名 |
+| Linux x64 AppImage | 应用内检查、下载，用户确认后安装并重启 | Tauri 签名更新；Release 同时提供 SHA-256 清单 |
+| Linux x64 DEB | 从 Release 页面或发行版包管理器手动更新 | 不进入自动更新清单；按 `SHA256SUMS.txt` 校验 |
+| macOS 通用 DMG | 从 Release 页面手动更新 | 尚无 Developer ID 签名与 Apple 公证，不进入自动更新清单；按 `SHA256SUMS.txt` 校验 |
+
+- 唯一受支持的发布通道是带 `vX.Y.Z` 标签的官方 GitHub Release。普通分支与 PR 的 Actions Artifacts 只用于测试，是未签名开发包，不能视为正式版本，也不会进入自动更新。
+- Windows 和 Linux AppImage 的更新包会先完成签名验证。应用允许在发车或上车期间下载更新，但 Rust 后端会拒绝安装和重启；结束拼车后才能继续安装。
+- 签名、下载或安装失败都不会替换当前版本。手动下载时，请用 `shasum -a 256 <文件>`（macOS/Linux）或 `certutil -hashfile <文件> SHA256`（Windows）计算摘要，并与 `SHA256SUMS.txt` 中对应文件名的一行比较。
+- 发布密钥、平台状态、CI 门禁和完整检查清单见 [发布指南](docs/RELEASE.md)。当前版本变更见 [v0.0.5 Release Notes](docs/releases/v0.0.5.md)。
 
 ## 本地开发
 
@@ -69,7 +82,7 @@ cargo test --manifest-path src-tauri/Cargo.toml --all-targets --all-features
 ./scripts/build-linux-docker.sh
 ```
 
-GitHub Actions 会先执行前后端、发布清单与协调服务自测，再并行生成 macOS 通用 DMG、Windows x64 NSIS、Linux x64 DEB 与 AppImage；每次运行的安装包在 Actions Artifacts 保留 30 天。推送与应用版本一致的 `vX.Y.Z` 标签后，签名门禁会生成 Windows/Linux 更新签名、只包含 NSIS 与 AppImage 的 `latest.json`、`SHA256SUMS.txt` 和中英双语 Release Notes。macOS 与 DEB 保持手动更新。
+GitHub Actions 会先执行前后端、发布清单与协调服务自测，再并行生成 macOS 通用 DMG、Windows x64 NSIS、Linux x64 DEB 与 AppImage；每次运行的开发安装包在 Actions Artifacts 保留 30 天。推送与应用版本一致的 `vX.Y.Z` 标签后，签名门禁会生成 Windows/Linux 更新签名、只包含 NSIS 与 AppImage 的 `latest.json`、`SHA256SUMS.txt` 和中英双语 Release Notes。CI 先创建草稿、上传并逐项核对远端资产，全部一致后才公开 Release。
 
 ## 安全边界
 
