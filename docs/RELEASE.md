@@ -8,6 +8,7 @@
 
 - 三处应用版本仍必须等于 `X.Y.Z`，标签必须精确匹配 `vX.Y.Z-test.N`；
 - CI 仍执行完整源码验证与三平台打包，但不读取任何签名 Secret；
+- 发布构建使用 `tauri.distribution.conf.json` 生成 GitHub 不会改写的 ASCII 资产文件名；应用窗口与界面中的中文名称不受影响；
 - Release 只包含 macOS DMG、Windows NSIS、Linux DEB/AppImage 与 `SHA256SUMS.txt`；
 - CI 会拒绝测试预发布中出现 `.sig` 或 `latest.json`，因此它不会进入应用内自动更新；
 - Windows/macOS 会显示未知发布者或未公证警告。Release Notes 必须明确说明风险，不能将测试包称为正式或可信签名版本。

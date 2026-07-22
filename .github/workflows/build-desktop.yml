@@ -219,8 +219,11 @@ jobs:
             Remove-Item -Force -ErrorAction SilentlyContinue $pfxPath
           }
       - name: Build installer (unsigned development artifact)
-        if: needs.verify.outputs.release_mode != 'signed'
+        if: needs.verify.outputs.release_mode == 'development'
         run: npm run tauri build -- ${{ matrix.build_args }}
+      - name: Build installer (unsigned test prerelease)
+        if: needs.verify.outputs.release_mode == 'test'
+        run: npm run tauri build -- ${{ matrix.build_args }} --config src-tauri/tauri.distribution.conf.json
       - name: Require updater signing key
         if: needs.verify.outputs.release_mode == 'signed'
         shell: bash
@@ -236,7 +239,7 @@ jobs:
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: npm run tauri build -- ${{ matrix.build_args }} --config src-tauri/tauri.release.conf.json ${{ matrix.signing_config }}
+        run: npm run tauri build -- ${{ matrix.build_args }} --config src-tauri/tauri.distribution.conf.json --config src-tauri/tauri.release.conf.json ${{ matrix.signing_config }}
       - name: Verify updater signatures against embedded public key
         if: needs.verify.outputs.release_mode == 'signed'
         run: node scripts/verify-updater-artifacts.mjs --assets-dir "${{ matrix.bundle_dir }}"
@@ -412,8 +415,14 @@ jobs:
           fi
 
           if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            echo "Release ${GITHUB_REF_NAME} already exists; refusing to overwrite it" >&2
-            exit 1
+            if [[ "${RELEASE_MODE}" == "test" ]] \
+              && [[ "$(gh release view "${GITHUB_REF_NAME}" --json isDraft --jq '.isDraft')" == "true" ]] \
+              && [[ "$(gh release view "${GITHUB_REF_NAME}" --json isPrerelease --jq '.isPrerelease')" == "true" ]]; then
+              gh release delete "${GITHUB_REF_NAME}" --yes
+            else
+              echo "Release ${GITHUB_REF_NAME} already exists; refusing to overwrite it" >&2
+              exit 1
+            fi
           fi
           gh release create "${GITHUB_REF_NAME}" \
             --draft \
