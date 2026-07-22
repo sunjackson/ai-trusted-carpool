@@ -47,7 +47,7 @@ A desktop app for sharing a locally signed-in Claude Code / Codex account among 
 
 ## Install
 
-Download the installer for your platform from [GitHub Releases](https://github.com/sunjackson/ai-trusted-carpool/releases) (macOS universal DMG, Windows x64 NSIS, Linux x64 DEB/AppImage), then compare its SHA-256 digest with `SHA256SUMS.txt` from the same release. See the [v0.0.5 release notes](docs/releases/v0.0.5.md) for the current release.
+Download the installer for your platform from [GitHub Releases](https://github.com/sunjackson/ai-trusted-carpool/releases) (macOS universal DMG, Windows x64 NSIS, Linux x64 DEB/AppImage), then compare its SHA-256 digest with `SHA256SUMS.txt` from the same release. See the [v0.0.5 release notes](docs/releases/v0.0.5.md) for the current release. During testing, explicitly marked **Pre-release** entries may also provide unsigned packages for manual download.
 
 ## Update and release trust
 
@@ -58,7 +58,8 @@ Download the installer for your platform from [GitHub Releases](https://github.c
 | Linux x64 DEB | Manual update from Releases or through the distribution package manager | Excluded from the automatic update manifest; verify against `SHA256SUMS.txt` |
 | macOS universal DMG | Manual update from Releases | No Developer ID signing or Apple notarization yet, so it is excluded from the automatic update manifest; verify against `SHA256SUMS.txt` |
 
-- The only supported distribution channel is an official GitHub Release with a `vX.Y.Z` tag. Actions artifacts from ordinary branches and pull requests are unsigned development builds: they are not official releases and never enter the automatic update feed.
+- The only supported production distribution channel is an official GitHub Release with a `vX.Y.Z` tag. Actions artifacts from ordinary branches and pull requests are unsigned development builds: they are not official releases and never enter the automatic update feed.
+- A `vX.Y.Z-test.N` tag publishes an unsigned test prerelease only: it contains installers and `SHA256SUMS.txt` for manual download, but no `.sig` files or `latest.json`, so the in-app updater never discovers it. Windows SmartScreen and macOS Gatekeeper may warn about an unknown publisher.
 - Windows and Linux AppImage updater packages are signature-verified before installation. An active hosted or joined ride may download an update, but the Rust backend refuses installation and restart until the ride ends.
 - Signature, download, or installation failure leaves the current version untouched. For a manual download, calculate the digest with `shasum -a 256 <file>` (macOS/Linux) or `certutil -hashfile <file> SHA256` (Windows), then compare it with the matching filename in `SHA256SUMS.txt`.
 - See the [release guide](docs/RELEASE.md) for signing keys, platform status, CI gates, and the complete checklist. See the [v0.0.5 release notes](docs/releases/v0.0.5.md) for this release.

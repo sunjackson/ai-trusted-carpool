@@ -8,7 +8,7 @@
     "build": "tsc -b && vite build",
     "preview": "vite preview",
     "test": "vitest run",
-    "test:release": "node --test scripts/generate-updater-manifest.test.mjs scripts/verify-updater-artifacts.test.mjs",
+    "test:release": "node --test scripts/classify-release-ref.test.mjs scripts/generate-updater-manifest.test.mjs scripts/verify-updater-artifacts.test.mjs",
     "test:coverage": "vitest run --coverage",
     "test:webrtc:e2e": "node --use-system-ca e2e/run-browser-webrtc.mjs",
     "lint": "eslint . --max-warnings 0",

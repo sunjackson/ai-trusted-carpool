@@ -47,7 +47,7 @@
 
 ## 安装
 
-从 [GitHub Releases](https://github.com/sunjackson/ai-trusted-carpool/releases) 下载对应平台安装包（macOS 通用 DMG、Windows x64 NSIS、Linux x64 DEB/AppImage），并按同一 Release 中的 `SHA256SUMS.txt` 核对文件 SHA-256 后安装。正式发布说明见 [v0.0.5 Release Notes](docs/releases/v0.0.5.md)。
+从 [GitHub Releases](https://github.com/sunjackson/ai-trusted-carpool/releases) 下载对应平台安装包（macOS 通用 DMG、Windows x64 NSIS、Linux x64 DEB/AppImage），并按同一 Release 中的 `SHA256SUMS.txt` 核对文件 SHA-256 后安装。正式发布说明见 [v0.0.5 Release Notes](docs/releases/v0.0.5.md)；测试阶段也会提供明确标记为 **Pre-release** 的未签名手动下载包。
 
 ## 更新与发布信任
 
@@ -58,7 +58,8 @@
 | Linux x64 DEB | 从 Release 页面或发行版包管理器手动更新 | 不进入自动更新清单；按 `SHA256SUMS.txt` 校验 |
 | macOS 通用 DMG | 从 Release 页面手动更新 | 尚无 Developer ID 签名与 Apple 公证，不进入自动更新清单；按 `SHA256SUMS.txt` 校验 |
 
-- 唯一受支持的发布通道是带 `vX.Y.Z` 标签的官方 GitHub Release。普通分支与 PR 的 Actions Artifacts 只用于测试，是未签名开发包，不能视为正式版本，也不会进入自动更新。
+- 唯一受支持的正式发布通道是带 `vX.Y.Z` 标签的官方 GitHub Release。普通分支与 PR 的 Actions Artifacts 只用于测试，是未签名开发包，不能视为正式版本，也不会进入自动更新。
+- `vX.Y.Z-test.N` 标签只发布未签名测试预发布版：提供安装包与 `SHA256SUMS.txt` 供手动下载，不生成 `.sig` 或 `latest.json`，不会被应用内自动更新发现。Windows SmartScreen 和 macOS Gatekeeper 可能显示未知发布者警告。
 - Windows 和 Linux AppImage 的更新包会先完成签名验证。应用允许在发车或上车期间下载更新，但 Rust 后端会拒绝安装和重启；结束拼车后才能继续安装。
 - 签名、下载或安装失败都不会替换当前版本。手动下载时，请用 `shasum -a 256 <文件>`（macOS/Linux）或 `certutil -hashfile <文件> SHA256`（Windows）计算摘要，并与 `SHA256SUMS.txt` 中对应文件名的一行比较。
 - 发布密钥、平台状态、CI 门禁和完整检查清单见 [发布指南](docs/RELEASE.md)。当前版本变更见 [v0.0.5 Release Notes](docs/releases/v0.0.5.md)。

@@ -19,6 +19,8 @@ jobs:
     name: Verify source
     runs-on: ubuntu-22.04
     timeout-minutes: 30
+    outputs:
+      release_mode: ${{ steps.release_mode.outputs.mode }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -28,8 +30,8 @@ jobs:
         with:
           node-version: 20.19.4
           cache: npm
-      - name: Gate release tag before any signing job
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Classify and gate the release channel
+        id: release_mode
         shell: bash
         run: |
           APP_VERSION="$(node -p "require('./src-tauri/tauri.conf.json').version")"
@@ -37,19 +39,23 @@ jobs:
           CARGO_VERSION="$(awk -F ' *= *' '/^version *=/ { gsub(/\"/, "", $2); print $2; exit }' src-tauri/Cargo.toml)"
           test "${APP_VERSION}" = "${PACKAGE_VERSION}"
           test "${APP_VERSION}" = "${CARGO_VERSION}"
-          test "${GITHUB_REF_NAME}" = "v${APP_VERSION}" || {
-            echo "Tag ${GITHUB_REF_NAME} does not match application version v${APP_VERSION}" >&2
-            exit 1
-          }
-          test -s "docs/releases/${GITHUB_REF_NAME}.md" || {
-            echo "Missing bilingual release notes at docs/releases/${GITHUB_REF_NAME}.md" >&2
-            exit 1
-          }
-          git fetch --no-tags origin main:refs/remotes/origin/main
-          git merge-base --is-ancestor HEAD refs/remotes/origin/main || {
-            echo "Release tag must point to a commit reachable from origin/main" >&2
-            exit 1
-          }
+          RELEASE_MODE="$(node scripts/classify-release-ref.mjs \
+            --ref "${GITHUB_REF}" \
+            --ref-name "${GITHUB_REF_NAME}" \
+            --version "${APP_VERSION}")"
+          echo "mode=${RELEASE_MODE}" >> "${GITHUB_OUTPUT}"
+
+          if [[ "${RELEASE_MODE}" != "development" ]]; then
+            test -s "docs/releases/${GITHUB_REF_NAME}.md" || {
+              echo "Missing bilingual release notes at docs/releases/${GITHUB_REF_NAME}.md" >&2
+              exit 1
+            }
+            git fetch --no-tags origin main:refs/remotes/origin/main
+            git merge-base --is-ancestor HEAD refs/remotes/origin/main || {
+              echo "Release tag must point to a commit reachable from origin/main" >&2
+              exit 1
+            }
+          fi
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable 2026-07-22
         with:
           components: rustfmt, clippy
@@ -96,7 +102,7 @@ jobs:
     name: Build ${{ matrix.label }}
     needs: verify
     environment:
-      name: ${{ startsWith(github.ref, 'refs/tags/v') && 'release' || 'continuous-integration' }}
+      name: ${{ needs.verify.outputs.release_mode == 'signed' && 'release' || 'continuous-integration' }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -157,7 +163,7 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
       - name: Import and pin Windows code-signing certificate
-        if: runner.os == 'Windows' && startsWith(github.ref, 'refs/tags/v')
+        if: runner.os == 'Windows' && needs.verify.outputs.release_mode == 'signed'
         shell: pwsh
         env:
           WINDOWS_CERTIFICATE_PFX: ${{ secrets.WINDOWS_CERTIFICATE_PFX }}
@@ -213,10 +219,10 @@ jobs:
             Remove-Item -Force -ErrorAction SilentlyContinue $pfxPath
           }
       - name: Build installer (unsigned development artifact)
-        if: ${{ ! startsWith(github.ref, 'refs/tags/v') }}
+        if: needs.verify.outputs.release_mode != 'signed'
         run: npm run tauri build -- ${{ matrix.build_args }}
       - name: Require updater signing key
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: needs.verify.outputs.release_mode == 'signed'
         shell: bash
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -226,16 +232,16 @@ jobs:
             exit 1
           }
       - name: Build signed release and updater artifacts
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: needs.verify.outputs.release_mode == 'signed'
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: npm run tauri build -- ${{ matrix.build_args }} --config src-tauri/tauri.release.conf.json ${{ matrix.signing_config }}
       - name: Verify updater signatures against embedded public key
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: needs.verify.outputs.release_mode == 'signed'
         run: node scripts/verify-updater-artifacts.mjs --assets-dir "${{ matrix.bundle_dir }}"
       - name: Verify Windows Authenticode signatures
-        if: runner.os == 'Windows' && startsWith(github.ref, 'refs/tags/v')
+        if: runner.os == 'Windows' && needs.verify.outputs.release_mode == 'signed'
         shell: pwsh
         env:
           WINDOWS_CERTIFICATE_THUMBPRINT: ${{ secrets.WINDOWS_CERTIFICATE_THUMBPRINT }}
@@ -270,7 +276,7 @@ jobs:
             }
           }
       - name: Remove imported Windows certificate
-        if: ${{ always() && runner.os == 'Windows' && startsWith(github.ref, 'refs/tags/v') }}
+        if: ${{ always() && runner.os == 'Windows' && needs.verify.outputs.release_mode == 'signed' }}
         shell: pwsh
         env:
           WINDOWS_CERTIFICATE_THUMBPRINT: ${{ secrets.WINDOWS_CERTIFICATE_THUMBPRINT }}
@@ -301,14 +307,16 @@ jobs:
 
   release:
     name: Publish GitHub Release
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    if: needs.verify.outputs.release_mode == 'signed' || needs.verify.outputs.release_mode == 'test'
+    needs: [verify, build]
     runs-on: ubuntu-22.04
     timeout-minutes: 15
     environment:
-      name: release
+      name: ${{ needs.verify.outputs.release_mode == 'signed' && 'release' || 'continuous-integration' }}
     permissions:
       contents: write
+    env:
+      RELEASE_MODE: ${{ needs.verify.outputs.release_mode }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -316,7 +324,7 @@ jobs:
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 20.19.4
-      - name: Verify tag matches application version
+      - name: Verify tag matches its release channel
         shell: bash
         run: |
           APP_VERSION="$(node -p "require('./src-tauri/tauri.conf.json').version")"
@@ -324,10 +332,11 @@ jobs:
           CARGO_VERSION="$(awk -F ' *= *' '/^version *=/ { gsub(/\"/, "", $2); print $2; exit }' src-tauri/Cargo.toml)"
           test "${APP_VERSION}" = "${PACKAGE_VERSION}"
           test "${APP_VERSION}" = "${CARGO_VERSION}"
-          test "${GITHUB_REF_NAME}" = "v${APP_VERSION}" || {
-            echo "Tag ${GITHUB_REF_NAME} does not match application version v${APP_VERSION}" >&2
-            exit 1
-          }
+          ACTUAL_MODE="$(node scripts/classify-release-ref.mjs \
+            --ref "${GITHUB_REF}" \
+            --ref-name "${GITHUB_REF_NAME}" \
+            --version "${APP_VERSION}")"
+          test "${ACTUAL_MODE}" = "${RELEASE_MODE}"
           test -s "docs/releases/${GITHUB_REF_NAME}.md" || {
             echo "Missing bilingual release notes at docs/releases/${GITHUB_REF_NAME}.md" >&2
             exit 1
@@ -339,8 +348,10 @@ jobs:
           path: release-assets
           merge-multiple: true
       - name: Verify downloaded updater signatures
+        if: env.RELEASE_MODE == 'signed'
         run: node scripts/verify-updater-artifacts.mjs --assets-dir release-assets
       - name: Generate updater manifest for signed artifacts
+        if: env.RELEASE_MODE == 'signed'
         shell: bash
         run: |
           APP_VERSION="$(node -p "require('./src-tauri/tauri.conf.json').version")"
@@ -369,7 +380,25 @@ jobs:
         run: |
           set -euo pipefail
           mapfile -d '' assets < <(find release-assets -type f -print0 | sort -z)
-          test "${#assets[@]}" -ge 8
+          minimum_assets=8
+          release_title="可信拼车 ${GITHUB_REF_NAME}"
+          release_flags=()
+          if [[ "${RELEASE_MODE}" == "test" ]]; then
+            minimum_assets=5
+            release_title="可信拼车 ${GITHUB_REF_NAME}（未签名测试版）"
+            release_flags+=(--prerelease)
+            for pattern in '*.dmg' '*.exe' '*.deb' '*.AppImage'; do
+              find release-assets -type f -name "${pattern}" | grep -q . || {
+                echo "Unsigned test release is missing ${pattern}" >&2
+                exit 1
+              }
+            done
+            if find release-assets -type f \( -name '*.sig' -o -name 'latest.json' \) | grep -q .; then
+              echo 'Unsigned test releases must not contain updater signatures or latest.json' >&2
+              exit 1
+            fi
+          fi
+          test "${#assets[@]}" -ge "${minimum_assets}"
 
           expected_assets="$(mktemp)"
           remote_assets="$(mktemp)"
@@ -389,8 +418,9 @@ jobs:
           gh release create "${GITHUB_REF_NAME}" \
             --draft \
             --verify-tag \
+            "${release_flags[@]}" \
             --notes-file "docs/releases/${GITHUB_REF_NAME}.md" \
-            --title "可信拼车 ${GITHUB_REF_NAME}"
+            --title "${release_title}"
           gh release upload "${GITHUB_REF_NAME}" "${assets[@]}"
 
           test "$(gh release view "${GITHUB_REF_NAME}" --json isDraft --jq '.isDraft')" = 'true'
@@ -399,5 +429,12 @@ jobs:
             | sort > "${remote_assets}"
           diff -u "${expected_assets}" "${remote_assets}"
 
-          gh release edit "${GITHUB_REF_NAME}" --draft=false --latest
+          if [[ "${RELEASE_MODE}" == "signed" ]]; then
+            gh release edit "${GITHUB_REF_NAME}" --draft=false --latest
+          else
+            gh release edit "${GITHUB_REF_NAME}" --draft=false
+          fi
           test "$(gh release view "${GITHUB_REF_NAME}" --json isDraft --jq '.isDraft')" = 'false'
+          if [[ "${RELEASE_MODE}" == "test" ]]; then
+            test "$(gh release view "${GITHUB_REF_NAME}" --json isPrerelease --jq '.isPrerelease')" = 'true'
+          fi

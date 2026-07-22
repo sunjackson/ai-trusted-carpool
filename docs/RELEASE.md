@@ -2,6 +2,18 @@
 
 本文档是把「CI 产物」升级为「可信正式分发」的操作清单。v0.0.5 已完成签名更新代码与 fail-closed 发布流水线；仓库 Secrets 和平台证书仍是正式发布的外部前置条件。
 
+## 0. 未签名测试预发布
+
+测试阶段可以推送 `vX.Y.Z-test.N` 标签（`N` 从 1 开始）生成 GitHub **Pre-release**。该通道只用于用户主动下载和自行部署：
+
+- 三处应用版本仍必须等于 `X.Y.Z`，标签必须精确匹配 `vX.Y.Z-test.N`；
+- CI 仍执行完整源码验证与三平台打包，但不读取任何签名 Secret；
+- Release 只包含 macOS DMG、Windows NSIS、Linux DEB/AppImage 与 `SHA256SUMS.txt`；
+- CI 会拒绝测试预发布中出现 `.sig` 或 `latest.json`，因此它不会进入应用内自动更新；
+- Windows/macOS 会显示未知发布者或未公证警告。Release Notes 必须明确说明风险，不能将测试包称为正式或可信签名版本。
+
+正式发布仍使用精确的 `vX.Y.Z` 标签，并继续强制执行后文的全部签名门禁。不得用测试标签替代正式发布。
+
 | 项 | 状态 |
 | --- | --- |
 | macOS Developer ID 签名 + 公证 | 未完成 |
@@ -16,7 +28,7 @@
 2. 在 `CHANGELOG.md` 把 `[Unreleased]` 内容归档为 `[X.Y.Z] - 日期`。
 3. 在 GitHub 仓库创建针对 `refs/tags/v*` 的 tag ruleset：限制 tag 创建者，禁止非管理员更新/删除发布 tag。Environment 的 deployment filter 不会保护 tag 的创建，不能替代该 ruleset。
 4. 创建受保护的 GitHub Environment `release`，只允许 ruleset 保护的 `v*` tag 部署并配置 Required reviewers；把第 3、4 节列出的签名 Secrets 只放在该 Environment，不能保留同名仓库级 Secrets。
-5. 提交进入 `main` 后再打 tag：`git tag vX.Y.Z && git push origin vX.Y.Z`。CI 会在进入签名矩阵前校验 tag、三处版本号、双语 Release Notes 以及提交可从 `origin/main` 到达；签名后再用内置公钥对每个更新产物做密码学验签，最后生成指向已签名产物的 `latest.json`、`SHA256SUMS.txt` 与 GitHub Release。
+5. 提交进入 `main` 后再打 tag：`git tag vX.Y.Z && git push origin vX.Y.Z`。CI 会在进入签名矩阵前校验 tag、三处版本号、双语 Release Notes 以及提交可从 `origin/main` 到达；签名后再用内置公钥对每个更新产物做密码学验签，最后生成指向已签名产物的 `latest.json`、`SHA256SUMS.txt` 与 GitHub Release。测试预发布则使用 `vX.Y.Z-test.N`，并按第 0 节隔离。
 
 ## 2. macOS：Developer ID 签名与公证
 
