@@ -5,14 +5,21 @@ const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
 vi.mock('./tauriInvoke', () => ({ invoke: invokeMock }));
 
 import {
+  cancelAccountImport,
+  cancelAccountRestore,
   closeClientInstance,
+  commitAccountImport,
+  commitAccountRestore,
   deleteAccount,
+  exportAccountBackup,
   focusClientInstance,
   importAccounts,
   importLocalAccounts,
   launchTool,
   listAccounts,
   listClientInstances,
+  previewAccountImport,
+  previewAccountRestore,
   retryAccountRoute,
   serverJoinUrl,
   updateAccount,
@@ -138,5 +145,125 @@ describe('local account commands', () => {
     });
     expect(invokeMock).toHaveBeenNthCalledWith(5, 'delete_account', { id: account.id });
     expect(invokeMock).toHaveBeenNthCalledWith(6, 'retry_account_route', { id: account.id });
+  });
+
+  it('keeps preview credentials in Rust and uses explicit one-time commit contracts', async () => {
+    Object.defineProperty(window, '__TAURI_INTERNALS__', { configurable: true, value: {} });
+    invokeMock
+      .mockResolvedValueOnce({
+        session_id: 'import-session',
+        expires_at_ms: 1234,
+        items: [
+          {
+            item_id: 'item-1',
+            tool: 'claude',
+            auth_kind: 'oauth',
+            name: 'Claude 导入账号',
+            source: 'file',
+            action: 'new',
+          },
+        ],
+      })
+      .mockResolvedValueOnce({ imported: 1, updated: 0, accounts: [account] })
+      .mockResolvedValueOnce(true)
+      .mockResolvedValueOnce('/tmp/accounts.tcarpool-backup')
+      .mockResolvedValueOnce({
+        sessionId: 'restore-session',
+        expiresAtMs: 5678,
+        mode: 'replace',
+        remove_count: 1,
+        items: [
+          {
+            itemId: 'item-2',
+            tool: 'codex',
+            authKind: 'apiKey',
+            name: 'Codex 备份账号',
+            source: 'file',
+            action: 'update',
+          },
+        ],
+      })
+      .mockResolvedValueOnce({
+        imported: 0,
+        updated: 1,
+        removed: 1,
+        accounts: [account],
+      })
+      .mockResolvedValueOnce(true);
+
+    await expect(
+      previewAccountImport({ contents: ['{}'], source: 'file' })
+    ).resolves.toEqual({
+      sessionId: 'import-session',
+      expiresAtMs: 1234,
+      items: [
+        {
+          itemId: 'item-1',
+          tool: 'claude',
+          authKind: 'oauth',
+          name: 'Claude 导入账号',
+          source: 'file',
+          action: 'new',
+        },
+      ],
+    });
+    await expect(commitAccountImport('import-session')).resolves.toEqual({
+      imported: 1,
+      updated: 0,
+      accounts: [account],
+    });
+    await expect(cancelAccountImport('import-session')).resolves.toBe(true);
+    await expect(exportAccountBackup('long-secret')).resolves.toBe(
+      '/tmp/accounts.tcarpool-backup'
+    );
+    await expect(
+      previewAccountRestore({
+        content: 'encrypted-backup',
+        passphrase: 'long-secret',
+        mode: 'replace',
+      })
+    ).resolves.toMatchObject({
+      sessionId: 'restore-session',
+      expiresAtMs: 5678,
+      mode: 'replace',
+      removeCount: 1,
+    });
+    await expect(
+      commitAccountRestore('restore-session', 'replace', true)
+    ).resolves.toEqual({
+      imported: 0,
+      updated: 1,
+      removed: 1,
+      accounts: [account],
+    });
+    await expect(cancelAccountRestore('restore-session')).resolves.toBe(true);
+
+    expect(invokeMock).toHaveBeenNthCalledWith(1, 'preview_account_import', {
+      input: { contents: ['{}'], source: 'file' },
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(2, 'commit_account_import', {
+      sessionId: 'import-session',
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(3, 'cancel_account_import', {
+      sessionId: 'import-session',
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(4, 'export_account_backup', {
+      passphrase: 'long-secret',
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(5, 'preview_account_restore', {
+      input: {
+        content: 'encrypted-backup',
+        passphrase: 'long-secret',
+        mode: 'replace',
+      },
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(6, 'commit_account_restore', {
+      sessionId: 'restore-session',
+      mode: 'replace',
+      confirmReplace: true,
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(7, 'cancel_account_restore', {
+      sessionId: 'restore-session',
+    });
   });
 });

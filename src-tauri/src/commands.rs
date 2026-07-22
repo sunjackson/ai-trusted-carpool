@@ -3,6 +3,9 @@ use crate::account_pool::{
     ImportResult, LocalRefreshResult, UpdateAccountInput,
 };
 use crate::account_router::RouteFailure;
+use crate::account_transfer::{
+    AccountImportPreview, AccountRestorePreview, AccountRestoreResult, RestoreMode,
+};
 use crate::coordinator::{CoordinatorClient, CoordinatorMessage, IceServer, PublicInvitePayload};
 use crate::crypto::{decrypt_access, encrypt_access, EncryptedEnvelope};
 use crate::identity::{load_or_create, DeviceIdentity, PublicIdentity};
@@ -62,6 +65,36 @@ pub struct ImportAccountsInput {
     pub enabled: Option<bool>,
     #[serde(default)]
     pub source: Option<ManualAccountSource>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PreviewAccountImportInput {
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub contents: Vec<String>,
+    #[serde(default)]
+    pub local: bool,
+    #[serde(default)]
+    pub tool: Option<ToolKind>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub priority: Option<i32>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub source: Option<ManualAccountSource>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PreviewAccountRestoreInput {
+    pub content: String,
+    pub passphrase: String,
+    #[serde(default)]
+    pub mode: RestoreMode,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -877,9 +910,80 @@ pub fn list_accounts(state: State<'_, RuntimeState>) -> Result<Vec<AccountSummar
     Ok(accounts)
 }
 
+fn prepare_account_import_input(
+    pool: &AccountPool,
+    input: PreviewAccountImportInput,
+) -> Result<crate::account_pool::PreparedAccountImport, String> {
+    let selectors = usize::from(input.local)
+        + usize::from(input.content.is_some())
+        + usize::from(!input.contents.is_empty());
+    if selectors != 1 {
+        return Err("导入预览必须且只能选择本机配置、粘贴内容或文件内容之一".to_string());
+    }
+    if input.local {
+        return pool.prepare_local_import();
+    }
+    let source = input
+        .source
+        .map(AccountSource::from)
+        .unwrap_or(if input.contents.is_empty() {
+            AccountSource::Json
+        } else {
+            AccountSource::File
+        });
+    let options = ImportOptions {
+        tool: input.tool,
+        name: input.name,
+        priority: input.priority,
+        enabled: input.enabled,
+        source: Some(source),
+    };
+    if let Some(content) = input.content.as_deref() {
+        pool.prepare_import_content(content, options, source)
+    } else {
+        pool.prepare_import_contents(&input.contents, options, source)
+    }
+}
+
+#[tauri::command]
+pub fn preview_account_import(
+    input: PreviewAccountImportInput,
+    state: State<'_, RuntimeState>,
+) -> Result<AccountImportPreview, String> {
+    let pool = account_pool(&state)?;
+    let prepared = prepare_account_import_input(&pool, input)?;
+    crate::account_transfer::preview_import(&pool, prepared)
+}
+
+#[tauri::command]
+pub fn commit_account_import(
+    session_id: String,
+    state: State<'_, RuntimeState>,
+) -> Result<ImportResult, String> {
+    let pool = account_pool(&state)?;
+    let mut result = crate::account_transfer::commit_import(&pool, &session_id)?;
+    clear_managed_account_routes(
+        &state,
+        result.accounts.iter().map(|account| account.id.as_str()),
+    );
+    apply_account_route_health(&state, &mut result.accounts);
+    Ok(result)
+}
+
+#[tauri::command]
+pub fn cancel_account_import(
+    session_id: String,
+    state: State<'_, RuntimeState>,
+) -> Result<bool, String> {
+    crate::account_transfer::cancel_session(&account_pool(&state)?, &session_id)
+}
+
 #[tauri::command]
 pub fn import_local_accounts(state: State<'_, RuntimeState>) -> Result<ImportResult, String> {
-    let mut result = account_pool(&state)?.import_local()?;
+    let pool = account_pool(&state)?;
+    let prepared = pool.prepare_local_import()?;
+    let preview = crate::account_transfer::preview_import(&pool, prepared)?;
+    let mut result = crate::account_transfer::commit_import(&pool, &preview.session_id)?;
     clear_managed_account_routes(
         &state,
         result.accounts.iter().map(|account| account.id.as_str()),
@@ -901,16 +1005,24 @@ pub fn import_accounts(
     input: ImportAccountsInput,
     state: State<'_, RuntimeState>,
 ) -> Result<ImportResult, String> {
-    let mut result = account_pool(&state)?.import_content(
+    let pool = account_pool(&state)?;
+    let source = input
+        .source
+        .map(AccountSource::from)
+        .unwrap_or(AccountSource::Json);
+    let prepared = pool.prepare_import_content(
         &input.content,
         ImportOptions {
             tool: input.tool,
             name: input.name,
             priority: input.priority,
             enabled: input.enabled,
-            source: input.source.map(AccountSource::from),
+            source: Some(source),
         },
+        source,
     )?;
+    let preview = crate::account_transfer::preview_import(&pool, prepared)?;
+    let mut result = crate::account_transfer::commit_import(&pool, &preview.session_id)?;
     clear_managed_account_routes(
         &state,
         result.accounts.iter().map(|account| account.id.as_str()),
@@ -925,6 +1037,79 @@ pub fn import_accounts(
     );
     apply_account_route_health(&state, &mut result.accounts);
     Ok(result)
+}
+
+#[tauri::command]
+pub fn export_account_backup(
+    passphrase: String,
+    app: AppHandle,
+    state: State<'_, RuntimeState>,
+) -> Result<String, String> {
+    let bytes = crate::account_transfer::export_backup_bytes(&account_pool(&state)?, &passphrase)?;
+    let fallback = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("无法定位账号备份目录: {error}"))?
+        .join("account-backups");
+    let directory = dirs::download_dir().unwrap_or(fallback);
+    let file_name = format!(
+        "trusted-carpool-accounts-{}-{}.tcarpool-backup",
+        now_ms(),
+        &Uuid::new_v4().simple().to_string()[..8]
+    );
+    let path = directory.join(file_name);
+    crate::account_transfer::write_backup_file(&path, &bytes)?;
+    crate::diagnostics::record("info", "account-pool", "encrypted account backup exported");
+    Ok(path.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+pub fn preview_account_restore(
+    input: PreviewAccountRestoreInput,
+    state: State<'_, RuntimeState>,
+) -> Result<AccountRestorePreview, String> {
+    crate::account_transfer::preview_restore(
+        &account_pool(&state)?,
+        input.content.as_bytes(),
+        &input.passphrase,
+        input.mode,
+    )
+}
+
+#[tauri::command]
+pub fn commit_account_restore(
+    session_id: String,
+    mode: RestoreMode,
+    confirm_replace: bool,
+    state: State<'_, RuntimeState>,
+) -> Result<AccountRestoreResult, String> {
+    let pool = account_pool(&state)?;
+    let before = pool.list()?;
+    let mut result =
+        crate::account_transfer::commit_restore(&pool, &session_id, mode, confirm_replace)?;
+    let route_ids = before
+        .iter()
+        .map(|account| account.id.as_str())
+        .chain(result.accounts.iter().map(|account| account.id.as_str()));
+    clear_managed_account_routes(&state, route_ids);
+    apply_account_route_health(&state, &mut result.accounts);
+    crate::diagnostics::record(
+        "info",
+        "account-pool",
+        format!(
+            "account restore completed: {} imported, {} updated, {} removed",
+            result.imported, result.updated, result.removed
+        ),
+    );
+    Ok(result)
+}
+
+#[tauri::command]
+pub fn cancel_account_restore(
+    session_id: String,
+    state: State<'_, RuntimeState>,
+) -> Result<bool, String> {
+    crate::account_transfer::cancel_session(&account_pool(&state)?, &session_id)
 }
 
 #[tauri::command]

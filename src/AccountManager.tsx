@@ -1,10 +1,12 @@
 import {
+  ArchiveRestore,
   Check,
   Code2,
   FileJson,
   HardDriveDownload,
   KeyRound,
   LoaderCircle,
+  LockKeyhole,
   RotateCcw,
   Save,
   ShieldCheck,
@@ -15,20 +17,33 @@ import {
 } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  cancelAccountImport,
+  cancelAccountRestore,
+  commitAccountImport,
+  commitAccountRestore,
   deleteAccount,
-  importAccounts,
-  importLocalAccounts,
+  exportAccountBackup,
   listAccounts,
+  previewAccountImport,
+  previewAccountRestore,
   retryAccountRoute,
   updateAccount,
 } from './api';
-import type { AccountImportResult, LocalAccountSummary, ToolKind } from './types';
+import type {
+  AccountImportPreview,
+  AccountImportResult,
+  AccountRestoreMode,
+  AccountRestorePreview,
+  LocalAccountSummary,
+  ToolKind,
+} from './types';
 
 type ImportTool = ToolKind | 'auto';
 type AccountDraft = { name: string; priority: string };
 
 const MAX_ACCOUNT_PRIORITY = 1_000_000;
 const MAX_IMPORT_BYTES = 8 * 1024 * 1024;
+const MAX_BACKUP_BYTES = 24 * 1024 * 1024;
 
 const TOOL_LABEL: Record<ToolKind, string> = { claude: 'Claude', codex: 'Codex' };
 const AUTH_LABEL: Record<LocalAccountSummary['authKind'], string> = {
@@ -48,6 +63,11 @@ const HEALTH_REASON_LABEL: Record<NonNullable<LocalAccountSummary['routeHealth']
   upstream: '官方服务异常',
   expired: '凭据已过期',
 };
+const PREVIEW_ACTION_LABEL = {
+  new: '新增',
+  update: '更新',
+  conflict: '冲突',
+} as const;
 
 const accountHealth = (account: LocalAccountSummary) => {
   if (account.credentialState === 'reimportRequired') {
@@ -90,7 +110,14 @@ export function AccountManager({ onClose }: { onClose: () => void }) {
   const [content, setContent] = useState('');
   const [importName, setImportName] = useState('');
   const [importTool, setImportTool] = useState<ImportTool>('auto');
+  const [importPreview, setImportPreview] = useState<AccountImportPreview | null>(null);
+  const [backupPassphrase, setBackupPassphrase] = useState('');
+  const [backupPassphraseConfirm, setBackupPassphraseConfirm] = useState('');
+  const [restorePassphrase, setRestorePassphrase] = useState('');
+  const [restoreMode, setRestoreMode] = useState<AccountRestoreMode>('merge');
+  const [restorePreview, setRestorePreview] = useState<AccountRestorePreview | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const backupFileInputRef = useRef<HTMLInputElement>(null);
   const dirtyDraftIdsRef = useRef(new Set<string>());
   const loadRequestIdRef = useRef(0);
 
@@ -143,11 +170,11 @@ export function AccountManager({ onClose }: { onClose: () => void }) {
 
   useEffect(() => {
     const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === 'Escape' && busy === null) onClose();
+      if (event.key === 'Escape' && busy === null && !importPreview && !restorePreview) onClose();
     };
     window.addEventListener('keydown', closeOnEscape);
     return () => window.removeEventListener('keydown', closeOnEscape);
-  }, [busy, onClose]);
+  }, [busy, importPreview, onClose, restorePreview]);
 
   const run = async (key: string, operation: () => Promise<string>) => {
     if (loading || busy !== null) return;
@@ -165,62 +192,172 @@ export function AccountManager({ onClose }: { onClose: () => void }) {
     }
   };
 
-  const importLocal = () =>
-    void run('local', async () => {
-      const result = await importLocalAccounts();
-      return `本机配置导入完成：${summarizeImport(result)}`;
-    });
+  const beginImportPreview = async (
+    key: string,
+    input: Parameters<typeof previewAccountImport>[0]
+  ) => {
+    if (loading || busy !== null) return false;
+    setBusy(key);
+    setError(null);
+    setNotice(null);
+    try {
+      const preview = await previewAccountImport(input);
+      setImportPreview(preview);
+      return true;
+    } catch (reason) {
+      setError(messageFrom(reason));
+      return false;
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const importLocal = () => void beginImportPreview('local', { local: true });
 
   const importContent = () => {
     if (!content.trim()) {
       setError('请输入 API Key 或账号 JSON');
       return;
     }
-    void run('paste', async () => {
-      const result = await importAccounts({
-        content: content.trim(),
-        source: 'json',
-        ...(importTool === 'auto' ? {} : { tool: importTool }),
-        ...(importName.trim() ? { name: importName.trim() } : {}),
-      });
+    const pasted = content.trim();
+    void beginImportPreview('paste', {
+      content: pasted,
+      source: 'json',
+      ...(importTool === 'auto' ? {} : { tool: importTool }),
+      ...(importName.trim() ? { name: importName.trim() } : {}),
+    }).then(created => {
+      if (!created) return;
+      // Once Rust owns the short-lived preview session, do not retain the
+      // credential text in React state.
       setContent('');
       setImportName('');
-      return `账号导入完成：${summarizeImport(result)}`;
     });
   };
 
   const importFiles = (files: FileList | null) => {
     if (!files?.length) return;
-    void run('files', async () => {
-      let importedCount = 0;
-      let updatedCount = 0;
-      let completedFiles = 0;
+    void (async () => {
+      if (loading || busy !== null) return;
+      setBusy('files');
+      setError(null);
+      setNotice(null);
       const selectedFiles = Array.from(files);
-      const failures: string[] = [];
       try {
-        for (const file of selectedFiles) {
-          try {
-            if (file.size > MAX_IMPORT_BYTES) {
-              throw new Error('文件过大（最大 8 MiB）');
-            }
-            const result = await importAccounts({ content: await file.text(), source: 'file' });
-            importedCount += result.imported;
-            updatedCount += result.updated;
-            completedFiles += 1;
-          } catch (reason) {
-            failures.push(`${file.name}：${messageFrom(reason)}`);
-          }
+        const totalBytes = selectedFiles.reduce((total, file) => total + file.size, 0);
+        if (totalBytes > MAX_IMPORT_BYTES) {
+          throw new Error('所选文件合计过大（最大 8 MiB）');
         }
-        if (failures.length > 0) {
-          if (completedFiles > 0) await load(false);
-          throw new Error(
-            `已处理 ${completedFiles} 个文件：${summarizeImport({ imported: importedCount, updated: updatedCount })}；${failures.length} 个文件导入失败：${failures.join('；')}`
-          );
-        }
+        const contents = await Promise.all(selectedFiles.map(file => file.text()));
+        const preview = await previewAccountImport({ contents, source: 'file' });
+        setImportPreview(preview);
+      } catch (reason) {
+        setError(messageFrom(reason));
       } finally {
+        setBusy(null);
         if (fileInputRef.current) fileInputRef.current.value = '';
       }
-      return `已处理 ${selectedFiles.length} 个文件：${summarizeImport({ imported: importedCount, updated: updatedCount })}`;
+    })();
+  };
+
+  const confirmImport = () => {
+    const preview = importPreview;
+    if (!preview || preview.items.some(item => item.action === 'conflict')) return;
+    void run('commit-import', async () => {
+      const result = await commitAccountImport(preview.sessionId);
+      setImportPreview(null);
+      return `账号导入完成：${summarizeImport(result)}`;
+    });
+  };
+
+  const cancelImportPreview = () => {
+    const preview = importPreview;
+    if (!preview || busy !== null) return;
+    setImportPreview(null);
+    void cancelAccountImport(preview.sessionId).catch(reason => {
+      setError(messageFrom(reason));
+    });
+  };
+
+  const exportBackup = () => {
+    if (backupPassphrase.length < 8) {
+      setError('备份口令至少需要 8 个字符');
+      return;
+    }
+    if (backupPassphrase !== backupPassphraseConfirm) {
+      setError('两次输入的备份口令不一致');
+      return;
+    }
+    const passphrase = backupPassphrase;
+    setBackupPassphrase('');
+    setBackupPassphraseConfirm('');
+    void run('export-backup', async () => {
+      const path = await exportAccountBackup(passphrase);
+      return `加密备份已导出：${path}`;
+    });
+  };
+
+  const previewRestoreFile = (files: FileList | null) => {
+    const file = files?.[0];
+    if (!file) return;
+    if (restorePassphrase.length < 8) {
+      setError('请输入至少 8 个字符的备份口令');
+      if (backupFileInputRef.current) backupFileInputRef.current.value = '';
+      return;
+    }
+    if (file.size > MAX_BACKUP_BYTES) {
+      setError('备份文件过大（最大 24 MiB）');
+      if (backupFileInputRef.current) backupFileInputRef.current.value = '';
+      return;
+    }
+    const passphrase = restorePassphrase;
+    setRestorePassphrase('');
+    void (async () => {
+      if (loading || busy !== null) return;
+      setBusy('preview-restore');
+      setError(null);
+      setNotice(null);
+      try {
+        const preview = await previewAccountRestore({
+          content: await file.text(),
+          passphrase,
+          mode: restoreMode,
+        });
+        setRestorePreview(preview);
+      } catch (reason) {
+        setError(messageFrom(reason));
+      } finally {
+        setBusy(null);
+        if (backupFileInputRef.current) backupFileInputRef.current.value = '';
+      }
+    })();
+  };
+
+  const confirmRestore = () => {
+    const preview = restorePreview;
+    if (!preview || preview.items.some(item => item.action === 'conflict')) return;
+    let confirmReplace = false;
+    if (preview.mode === 'replace') {
+      if (!window.confirm('替换恢复会删除备份中不存在的本机账号，是否继续？')) return;
+      if (!window.confirm('再次确认：将先创建回滚快照，然后替换整个本机账号池。')) return;
+      confirmReplace = true;
+    }
+    void run('commit-restore', async () => {
+      const result = await commitAccountRestore(
+        preview.sessionId,
+        preview.mode,
+        confirmReplace
+      );
+      setRestorePreview(null);
+      return `账号恢复完成：${summarizeImport(result)}${result.removed ? `，移除 ${result.removed} 个账号` : ''}`;
+    });
+  };
+
+  const cancelRestorePreview = () => {
+    const preview = restorePreview;
+    if (!preview || busy !== null) return;
+    setRestorePreview(null);
+    void cancelAccountRestore(preview.sessionId).catch(reason => {
+      setError(messageFrom(reason));
     });
   };
 
@@ -290,13 +427,14 @@ export function AccountManager({ onClose }: { onClose: () => void }) {
   };
 
   const isBusy = busy !== null;
-  const isLocked = loading || isBusy;
+  const hasPreview = importPreview !== null || restorePreview !== null;
+  const isLocked = loading || isBusy || hasPreview;
 
   return (
     <div
       className="account-manager-backdrop"
       role="presentation"
-      onMouseDown={event => event.target === event.currentTarget && !isBusy && onClose()}
+      onMouseDown={event => event.target === event.currentTarget && !isBusy && !hasPreview && onClose()}
     >
       <section
         className="account-manager"
@@ -310,7 +448,7 @@ export function AccountManager({ onClose }: { onClose: () => void }) {
             <h2 id="account-manager-title">本机账号管理</h2>
             <span>优先级数值越小，动态路由时越优先</span>
           </div>
-          <button className="dialog-close" onClick={onClose} disabled={isBusy} aria-label="关闭账号管理">
+          <button className="dialog-close" onClick={onClose} disabled={isBusy || hasPreview} aria-label="关闭账号管理">
             <X size={18} />
           </button>
         </header>
@@ -383,8 +521,85 @@ export function AccountManager({ onClose }: { onClose: () => void }) {
             </label>
             <button className="account-primary-button" onClick={importContent} disabled={isLocked || !content.trim()}>
               {busy === 'paste' ? <LoaderCircle className="spin" size={17} /> : <Upload size={17} />}
-              导入账号
+              预览导入
             </button>
+
+            <details className="account-backup-section">
+              <summary><LockKeyhole size={15} /> 加密备份与恢复</summary>
+              <p>只备份账号凭据和账号设置，不包含设备身份、拼车会话、日志或客户端 profile。</p>
+              <label className="account-field">
+                <span>备份口令</span>
+                <input
+                  type="password"
+                  value={backupPassphrase}
+                  onChange={event => setBackupPassphrase(event.target.value)}
+                  autoComplete="new-password"
+                  aria-label="备份口令"
+                  disabled={isLocked}
+                />
+              </label>
+              <label className="account-field">
+                <span>再次输入口令</span>
+                <input
+                  type="password"
+                  value={backupPassphraseConfirm}
+                  onChange={event => setBackupPassphraseConfirm(event.target.value)}
+                  autoComplete="new-password"
+                  aria-label="确认备份口令"
+                  disabled={isLocked}
+                />
+              </label>
+              <button
+                className="account-secondary-button"
+                onClick={exportBackup}
+                disabled={isLocked || !backupPassphrase || !backupPassphraseConfirm}
+              >
+                {busy === 'export-backup' ? <LoaderCircle className="spin" size={15} /> : <HardDriveDownload size={15} />}
+                导出加密备份
+              </button>
+
+              <div className="account-import-divider"><span>恢复</span></div>
+              <label className="account-field">
+                <span>备份口令</span>
+                <input
+                  type="password"
+                  value={restorePassphrase}
+                  onChange={event => setRestorePassphrase(event.target.value)}
+                  autoComplete="current-password"
+                  aria-label="恢复备份口令"
+                  disabled={isLocked}
+                />
+              </label>
+              <label className="account-field">
+                <span>恢复方式</span>
+                <select
+                  value={restoreMode}
+                  onChange={event => setRestoreMode(event.target.value as AccountRestoreMode)}
+                  aria-label="恢复方式"
+                  disabled={isLocked}
+                >
+                  <option value="merge">合并（默认，保留本机名称和优先级）</option>
+                  <option value="replace">替换整个账号池</option>
+                </select>
+              </label>
+              <input
+                ref={backupFileInputRef}
+                className="visually-hidden"
+                type="file"
+                accept=".tcarpool-backup,application/json"
+                aria-label="选择账号备份文件"
+                onChange={event => previewRestoreFile(event.target.files)}
+                disabled={isLocked}
+              />
+              <button
+                className="account-secondary-button"
+                onClick={() => backupFileInputRef.current?.click()}
+                disabled={isLocked || restorePassphrase.length < 8}
+              >
+                {busy === 'preview-restore' ? <LoaderCircle className="spin" size={15} /> : <ArchiveRestore size={15} />}
+                选择备份并预览
+              </button>
+            </details>
           </aside>
 
           <section className="account-list-panel" aria-label="本机账号列表">
@@ -476,6 +691,81 @@ export function AccountManager({ onClose }: { onClose: () => void }) {
             )}
           </section>
         </div>
+
+        {importPreview && (
+          <div className="account-preview-backdrop" role="presentation">
+            <section className="account-preview" role="dialog" aria-modal="true" aria-labelledby="account-import-preview-title">
+              <header>
+                <div>
+                  <strong id="account-import-preview-title">确认导入预览</strong>
+                  <span>凭据已留在 Rust，下面只显示脱敏账号信息</span>
+                </div>
+              </header>
+              <div className="account-preview-list">
+                {importPreview.items.map(item => (
+                  <article key={item.itemId}>
+                    <AccountToolIcon tool={item.tool} />
+                    <div><strong>{item.name}</strong><span>{TOOL_LABEL[item.tool]} · {AUTH_LABEL[item.authKind]} · {SOURCE_LABEL[item.source]}</span></div>
+                    <b className={`is-${item.action}`}>{PREVIEW_ACTION_LABEL[item.action]}</b>
+                  </article>
+                ))}
+              </div>
+              {importPreview.items.some(item => item.action === 'conflict') && (
+                <p className="account-preview-warning" role="alert">存在身份或来源冲突，账号池不会被修改。请取消后先处理现有账号。</p>
+              )}
+              <footer>
+                <button onClick={cancelImportPreview} disabled={isBusy}>取消</button>
+                <button
+                  className="account-primary-button"
+                  onClick={confirmImport}
+                  disabled={isBusy || importPreview.items.some(item => item.action === 'conflict')}
+                >
+                  {busy === 'commit-import' && <LoaderCircle className="spin" size={15} />}
+                  确认导入
+                </button>
+              </footer>
+            </section>
+          </div>
+        )}
+
+        {restorePreview && (
+          <div className="account-preview-backdrop" role="presentation">
+            <section className="account-preview" role="dialog" aria-modal="true" aria-labelledby="account-restore-preview-title">
+              <header>
+                <div>
+                  <strong id="account-restore-preview-title">确认备份恢复</strong>
+                  <span>{restorePreview.mode === 'merge' ? '合并恢复会保留本机名称、优先级和启用状态' : '替换恢复会先创建本机回滚快照'}</span>
+                </div>
+              </header>
+              <div className="account-preview-list">
+                {restorePreview.items.map(item => (
+                  <article key={item.itemId}>
+                    <AccountToolIcon tool={item.tool} />
+                    <div><strong>{item.name}</strong><span>{TOOL_LABEL[item.tool]} · {AUTH_LABEL[item.authKind]} · {SOURCE_LABEL[item.source]}</span></div>
+                    <b className={`is-${item.action}`}>{PREVIEW_ACTION_LABEL[item.action]}</b>
+                  </article>
+                ))}
+              </div>
+              {restorePreview.mode === 'replace' && restorePreview.removeCount > 0 && (
+                <p className="account-preview-warning">替换后将移除备份中不存在的 {restorePreview.removeCount} 个本机账号。</p>
+              )}
+              {restorePreview.items.some(item => item.action === 'conflict') && (
+                <p className="account-preview-warning" role="alert">备份与本机账号身份冲突，当前账号池不会被修改。</p>
+              )}
+              <footer>
+                <button onClick={cancelRestorePreview} disabled={isBusy}>取消</button>
+                <button
+                  className="account-primary-button"
+                  onClick={confirmRestore}
+                  disabled={isBusy || restorePreview.items.some(item => item.action === 'conflict')}
+                >
+                  {busy === 'commit-restore' && <LoaderCircle className="spin" size={15} />}
+                  {restorePreview.mode === 'replace' ? '确认替换恢复' : '确认合并恢复'}
+                </button>
+              </footer>
+            </section>
+          </div>
+        )}
       </section>
     </div>
   );

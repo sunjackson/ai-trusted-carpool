@@ -59,6 +59,45 @@ export type AccountImportResult = {
   accounts: LocalAccountSummary[];
 };
 
+export type AccountPreviewAction = 'new' | 'update' | 'conflict';
+
+export type AccountPreviewItem = {
+  itemId: string;
+  tool: ToolKind;
+  authKind: AccountAuthKind;
+  name: string;
+  source: 'local' | 'json' | 'file';
+  action: AccountPreviewAction;
+};
+
+export type AccountImportPreview = {
+  sessionId: string;
+  expiresAtMs: number;
+  items: AccountPreviewItem[];
+};
+
+export type AccountImportPreviewInput = {
+  content?: string;
+  contents?: string[];
+  local?: boolean;
+  tool?: ToolKind;
+  name?: string;
+  priority?: number;
+  enabled?: boolean;
+  source?: 'json' | 'file';
+};
+
+export type AccountRestoreMode = 'merge' | 'replace';
+
+export type AccountRestorePreview = AccountImportPreview & {
+  mode: AccountRestoreMode;
+  removeCount: number;
+};
+
+export type AccountRestoreResult = AccountImportResult & {
+  removed: number;
+};
+
 export type LocalAccountRefreshNotice = {
   updated: number;
   discovered: number;

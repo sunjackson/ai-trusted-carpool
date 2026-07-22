@@ -2,7 +2,14 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { invoke } from './tauriInvoke';
 import type {
   AccountImportInput,
+  AccountImportPreview,
+  AccountImportPreviewInput,
   AccountImportResult,
+  AccountPreviewAction,
+  AccountPreviewItem,
+  AccountRestoreMode,
+  AccountRestorePreview,
+  AccountRestoreResult,
   AccountUpdateInput,
   AppUpdateInfo,
   CarSession,
@@ -283,6 +290,7 @@ const demoCar = (
 
 let demoActiveCar: CarSession | null = null;
 let demoAccounts: LocalAccountSummary[] = [];
+const demoImportPreviews = new Map<string, LocalAccountSummary[]>();
 
 const EMPTY_ROUTE_HEALTH: AccountRouteHealth = {
   status: 'normal',
@@ -372,6 +380,51 @@ const normalizeAccountImportResult = (value: unknown): AccountImportResult => {
     imported: normalizeImportCount(record.imported, accounts.length),
     updated: normalizeImportCount(record.updated, 0),
     accounts,
+  };
+};
+
+const normalizeAccountPreviewItem = (value: unknown, index: number): AccountPreviewItem => {
+  const record = (value && typeof value === 'object' ? value : {}) as Record<string, unknown>;
+  const rawAction = String(record.action ?? 'conflict');
+  const action: AccountPreviewAction =
+    rawAction === 'new' || rawAction === 'update' ? rawAction : 'conflict';
+  const rawSource = String(record.source ?? 'json');
+  return {
+    itemId: String(record.itemId ?? record.item_id ?? `item-${index + 1}`),
+    tool: record.tool === 'claude' ? 'claude' : 'codex',
+    authKind: record.authKind === 'oauth' || record.auth_kind === 'oauth' ? 'oauth' : 'apiKey',
+    name: String(record.name ?? '未命名账号'),
+    source: rawSource === 'local' || rawSource === 'file' ? rawSource : 'json',
+    action,
+  };
+};
+
+const normalizeAccountImportPreview = (value: unknown): AccountImportPreview => {
+  const record = (value && typeof value === 'object' ? value : {}) as Record<string, unknown>;
+  const items = Array.isArray(record.items)
+    ? record.items.map(normalizeAccountPreviewItem)
+    : [];
+  return {
+    sessionId: String(record.sessionId ?? record.session_id ?? ''),
+    expiresAtMs: Number(record.expiresAtMs ?? record.expires_at_ms ?? Date.now()),
+    items,
+  };
+};
+
+const normalizeAccountRestorePreview = (value: unknown): AccountRestorePreview => {
+  const record = (value && typeof value === 'object' ? value : {}) as Record<string, unknown>;
+  return {
+    ...normalizeAccountImportPreview(value),
+    mode: record.mode === 'replace' ? 'replace' : 'merge',
+    removeCount: normalizeImportCount(record.removeCount ?? record.remove_count, 0),
+  };
+};
+
+const normalizeAccountRestoreResult = (value: unknown): AccountRestoreResult => {
+  const record = (value && typeof value === 'object' ? value : {}) as Record<string, unknown>;
+  return {
+    ...normalizeAccountImportResult(value),
+    removed: normalizeImportCount(record.removed, 0),
   };
 };
 
@@ -468,6 +521,89 @@ export async function importAccounts(
   const imported = demoImportItems(commandInput);
   demoAccounts = [...demoAccounts, ...imported];
   return { imported: imported.length, updated: 0, accounts: structuredClone(imported) };
+}
+
+export async function previewAccountImport(
+  input: AccountImportPreviewInput
+): Promise<AccountImportPreview> {
+  if (inTauri()) {
+    return invoke<unknown>('preview_account_import', { input }).then(normalizeAccountImportPreview);
+  }
+  const accounts = input.local
+    ? []
+    : (input.contents?.length ? input.contents : [input.content ?? ''])
+        .flatMap(content =>
+          demoImportItems({
+            content,
+            tool: input.tool,
+            name: input.name,
+            source: input.source,
+          })
+        );
+  const sessionId = crypto.randomUUID();
+  demoImportPreviews.set(sessionId, accounts);
+  return {
+    sessionId,
+    expiresAtMs: Date.now() + 10 * 60_000,
+    items: accounts.map((account, index) => ({
+      itemId: `item-${index + 1}`,
+      tool: account.tool,
+      authKind: account.authKind,
+      name: account.name,
+      source: input.local ? 'local' : input.source === 'file' ? 'file' : 'json',
+      action: 'new',
+    })),
+  };
+}
+
+export async function commitAccountImport(sessionId: string): Promise<AccountImportResult> {
+  if (inTauri()) {
+    return invoke<unknown>('commit_account_import', { sessionId }).then(
+      normalizeAccountImportResult
+    );
+  }
+  const accounts = demoImportPreviews.get(sessionId);
+  if (!accounts) throw new Error('账号预览已过期或不存在，请重新预览');
+  demoImportPreviews.delete(sessionId);
+  demoAccounts = [...demoAccounts, ...accounts];
+  return { imported: accounts.length, updated: 0, accounts: structuredClone(accounts) };
+}
+
+export async function cancelAccountImport(sessionId: string): Promise<boolean> {
+  if (inTauri()) return invoke<boolean>('cancel_account_import', { sessionId });
+  return demoImportPreviews.delete(sessionId);
+}
+
+export async function exportAccountBackup(passphrase: string): Promise<string> {
+  if (!inTauri()) throw new Error('加密账号备份仅在桌面应用中可用');
+  return invoke<string>('export_account_backup', { passphrase });
+}
+
+export async function previewAccountRestore(input: {
+  content: string;
+  passphrase: string;
+  mode: AccountRestoreMode;
+}): Promise<AccountRestorePreview> {
+  if (!inTauri()) throw new Error('账号备份恢复仅在桌面应用中可用');
+  return invoke<unknown>('preview_account_restore', { input }).then(
+    normalizeAccountRestorePreview
+  );
+}
+
+export async function commitAccountRestore(
+  sessionId: string,
+  mode: AccountRestoreMode,
+  confirmReplace: boolean
+): Promise<AccountRestoreResult> {
+  if (!inTauri()) throw new Error('账号备份恢复仅在桌面应用中可用');
+  return invoke<unknown>('commit_account_restore', { sessionId, mode, confirmReplace }).then(
+    normalizeAccountRestoreResult
+  );
+}
+
+export async function cancelAccountRestore(sessionId: string): Promise<boolean> {
+  if (!inTauri()) return false;
+  return invoke<boolean>('cancel_account_restore', { sessionId });
 }
 
 export async function updateAccount(input: AccountUpdateInput): Promise<LocalAccountSummary> {

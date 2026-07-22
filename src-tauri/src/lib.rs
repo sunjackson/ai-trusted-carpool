@@ -1,6 +1,7 @@
 mod account_pool;
 mod account_quota;
 mod account_router;
+mod account_transfer;
 mod client_launcher;
 mod client_process;
 mod commands;
@@ -24,11 +25,13 @@ mod usage;
 mod usage_history;
 
 use commands::{
-    cancel_tool_install, check_app_update, close_client_instance, confirm_passenger_link,
-    delete_account, detect_tools, execute_relay_request, focus_client_instance, get_active_car,
-    get_ice_servers, get_shared_car_status, import_accounts, import_local_accounts, install_tool,
-    join_car, launch_tool, leave_car, list_accounts, list_client_instances, open_releases_page,
-    poll_webrtc_signals, preview_invite, refresh_account_quotas, retry_account_route,
+    cancel_account_import, cancel_account_restore, cancel_tool_install, check_app_update,
+    close_client_instance, commit_account_import, commit_account_restore, confirm_passenger_link,
+    delete_account, detect_tools, execute_relay_request, export_account_backup,
+    focus_client_instance, get_active_car, get_ice_servers, get_shared_car_status, import_accounts,
+    import_local_accounts, install_tool, join_car, launch_tool, leave_car, list_accounts,
+    list_client_instances, open_releases_page, poll_webrtc_signals, preview_account_import,
+    preview_account_restore, preview_invite, refresh_account_quotas, retry_account_route,
     send_webrtc_signal, start_car, start_relay_request, stop_car, submit_relay_response,
     submit_relay_stream_event, update_account, update_member_token_limits,
 };
@@ -177,6 +180,13 @@ pub fn run() {
             list_accounts,
             import_local_accounts,
             import_accounts,
+            preview_account_import,
+            commit_account_import,
+            cancel_account_import,
+            export_account_backup,
+            preview_account_restore,
+            commit_account_restore,
+            cancel_account_restore,
             update_account,
             retry_account_route,
             delete_account,

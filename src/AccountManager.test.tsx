@@ -1,13 +1,25 @@
 import '@testing-library/jest-dom/vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { AccountImportResult, LocalAccountSummary } from './types';
+import type {
+  AccountImportPreview,
+  AccountImportResult,
+  AccountRestorePreview,
+  LocalAccountSummary,
+} from './types';
 
 const apiMocks = vi.hoisted(() => ({
+  cancelAccountImport: vi.fn(),
+  cancelAccountRestore: vi.fn(),
+  commitAccountImport: vi.fn(),
+  commitAccountRestore: vi.fn(),
   deleteAccount: vi.fn(),
+  exportAccountBackup: vi.fn(),
   importAccounts: vi.fn(),
   importLocalAccounts: vi.fn(),
   listAccounts: vi.fn(),
+  previewAccountImport: vi.fn(),
+  previewAccountRestore: vi.fn(),
   retryAccountRoute: vi.fn(),
   updateAccount: vi.fn(),
 }));
@@ -67,11 +79,49 @@ const importResult = (
   updated = 0
 ): AccountImportResult => ({ imported, updated, accounts: affected });
 
+const importPreview = (
+  overrides: Partial<AccountImportPreview> = {}
+): AccountImportPreview => ({
+  sessionId: 'import-session',
+  expiresAtMs: Date.now() + 10 * 60_000,
+  items: [
+    {
+      itemId: 'preview-item-1',
+      tool: 'claude',
+      authKind: 'oauth',
+      name: 'Claude 预览账号',
+      source: 'local',
+      action: 'new',
+    },
+  ],
+  ...overrides,
+});
+
+const restorePreview = (
+  overrides: Partial<AccountRestorePreview> = {}
+): AccountRestorePreview => ({
+  ...importPreview({ sessionId: 'restore-session' }),
+  mode: 'merge',
+  removeCount: 0,
+  ...overrides,
+});
+
 describe('AccountManager', () => {
   beforeEach(() => {
+    vi.resetAllMocks();
     apiMocks.listAccounts.mockResolvedValue(accounts);
     apiMocks.importLocalAccounts.mockResolvedValue(importResult([accounts[0]]));
     apiMocks.importAccounts.mockResolvedValue(importResult([accounts[0]]));
+    apiMocks.previewAccountImport.mockResolvedValue(importPreview());
+    apiMocks.commitAccountImport.mockResolvedValue(importResult([accounts[0]]));
+    apiMocks.cancelAccountImport.mockResolvedValue(true);
+    apiMocks.exportAccountBackup.mockResolvedValue('/tmp/accounts.tcarpool-backup');
+    apiMocks.previewAccountRestore.mockResolvedValue(restorePreview());
+    apiMocks.commitAccountRestore.mockResolvedValue({
+      ...importResult([accounts[0]], 0, 1),
+      removed: 0,
+    });
+    apiMocks.cancelAccountRestore.mockResolvedValue(true);
     apiMocks.updateAccount.mockResolvedValue(accounts[0]);
     apiMocks.retryAccountRoute.mockResolvedValue(accounts[0]);
     apiMocks.deleteAccount.mockResolvedValue(undefined);
@@ -147,13 +197,16 @@ describe('AccountManager', () => {
     expect(screen.queryByRole('button', { name: '立即重试 Codex 备用账号' })).not.toBeInTheDocument();
   });
 
-  it('imports pasted credentials, local configs, and multiple JSON files', async () => {
+  it('previews and atomically commits local, pasted, and multi-file imports', async () => {
     render(<AccountManager onClose={vi.fn()} />);
     await screen.findByText('Claude 主账号');
 
     fireEvent.click(screen.getByRole('button', { name: /导入本机配置/ }));
-    await waitFor(() => expect(apiMocks.importLocalAccounts).toHaveBeenCalledTimes(1));
-    expect(await screen.findByText('本机配置导入完成：新增 1 个账号')).toBeInTheDocument();
+    await waitFor(() => expect(apiMocks.previewAccountImport).toHaveBeenCalledWith({ local: true }));
+    expect(await screen.findByText('确认导入预览')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '确认导入' }));
+    await waitFor(() => expect(apiMocks.commitAccountImport).toHaveBeenCalledWith('import-session'));
+    expect(await screen.findByText('账号导入完成：新增 1 个账号')).toBeInTheDocument();
 
     fireEvent.change(screen.getByLabelText('账号类型'), { target: { value: 'claude' } });
     fireEvent.change(screen.getByLabelText('账号名称（可选）'), {
@@ -162,17 +215,19 @@ describe('AccountManager', () => {
     fireEvent.change(screen.getByLabelText('API Key 或 JSON'), {
       target: { value: 'sk-ant-secret-value' },
     });
-    fireEvent.click(screen.getByRole('button', { name: '导入账号' }));
+    fireEvent.click(screen.getByRole('button', { name: '预览导入' }));
     await waitFor(() =>
-      expect(apiMocks.importAccounts).toHaveBeenCalledWith({
+      expect(apiMocks.previewAccountImport).toHaveBeenCalledWith({
         content: 'sk-ant-secret-value',
         tool: 'claude',
         name: 'Claude 新账号',
         source: 'json',
       })
     );
-    expect(await screen.findByText('账号导入完成：新增 1 个账号')).toBeInTheDocument();
     expect(screen.queryByText('sk-ant-secret-value')).not.toBeInTheDocument();
+    expect(screen.getByLabelText('API Key 或 JSON')).toHaveValue('');
+    fireEvent.click(screen.getByRole('button', { name: '确认导入' }));
+    await waitFor(() => expect(apiMocks.commitAccountImport).toHaveBeenCalledTimes(2));
 
     const first = new File(['{"OPENAI_API_KEY":"first"}'], 'first.json', { type: 'application/json' });
     const second = new File(['{"OPENAI_API_KEY":"second"}'], 'second.json', { type: 'application/json' });
@@ -181,14 +236,21 @@ describe('AccountManager', () => {
     fireEvent.change(screen.getByLabelText('选择 JSON 文件'), {
       target: { files: [first, second] },
     });
-    await waitFor(() => expect(apiMocks.importAccounts).toHaveBeenCalledTimes(3));
+    await waitFor(() =>
+      expect(apiMocks.previewAccountImport).toHaveBeenLastCalledWith({
+        contents: ['{"OPENAI_API_KEY":"first"}', '{"OPENAI_API_KEY":"second"}'],
+        source: 'file',
+      })
+    );
+    expect(apiMocks.previewAccountImport).toHaveBeenCalledTimes(3);
+    fireEvent.click(screen.getByRole('button', { name: '确认导入' }));
+    await waitFor(() => expect(apiMocks.commitAccountImport).toHaveBeenCalledTimes(3));
+    expect(apiMocks.importAccounts).not.toHaveBeenCalled();
+    expect(apiMocks.importLocalAccounts).not.toHaveBeenCalled();
   });
 
-  it('refreshes the account list and reports partial success when a later file fails', async () => {
-    apiMocks.importAccounts
-      .mockResolvedValueOnce(importResult([accounts[0]], 1, 0))
-      .mockRejectedValueOnce(new Error('第二个文件格式无效'))
-      .mockResolvedValueOnce(importResult([accounts[1]], 0, 1));
+  it('rejects a failed multi-file preview without partially committing or refreshing', async () => {
+    apiMocks.previewAccountImport.mockRejectedValueOnce(new Error('第二个文件格式无效'));
     render(<AccountManager onClose={vi.fn()} />);
     await screen.findByText('Claude 主账号');
 
@@ -202,14 +264,16 @@ describe('AccountManager', () => {
       target: { files: [first, second, third] },
     });
 
-    expect(
-      await screen.findByText('已处理 2 个文件：新增 1 个账号，更新 1 个账号；1 个文件导入失败：second.json：第二个文件格式无效')
-    ).toBeInTheDocument();
-    expect(apiMocks.importAccounts).toHaveBeenCalledTimes(3);
-    expect(apiMocks.listAccounts).toHaveBeenCalledTimes(2);
+    expect(await screen.findByRole('alert')).toHaveTextContent('第二个文件格式无效');
+    expect(apiMocks.previewAccountImport).toHaveBeenCalledWith({
+      contents: ['{}', '{}', '{}'],
+      source: 'file',
+    });
+    expect(apiMocks.commitAccountImport).not.toHaveBeenCalled();
+    expect(apiMocks.listAccounts).toHaveBeenCalledTimes(1);
   });
 
-  it('rejects oversized files before reading them and continues with later files', async () => {
+  it('rejects an oversized file batch before reading or previewing any file', async () => {
     render(<AccountManager onClose={vi.fn()} />);
     await screen.findByText('Claude 主账号');
 
@@ -225,13 +289,156 @@ describe('AccountManager', () => {
       target: { files: [oversized, small] },
     });
 
-    expect(
-      await screen.findByText('已处理 1 个文件：新增 1 个账号；1 个文件导入失败：oversized.json：文件过大（最大 8 MiB）')
-    ).toBeInTheDocument();
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      '所选文件合计过大（最大 8 MiB）'
+    );
     expect(oversizedText).not.toHaveBeenCalled();
-    expect(smallText).toHaveBeenCalledTimes(1);
-    expect(apiMocks.importAccounts).toHaveBeenCalledTimes(1);
-    expect(apiMocks.importAccounts).toHaveBeenCalledWith({ content: '{}', source: 'file' });
+    expect(smallText).not.toHaveBeenCalled();
+    expect(apiMocks.previewAccountImport).not.toHaveBeenCalled();
+    expect(apiMocks.commitAccountImport).not.toHaveBeenCalled();
+  });
+
+  it('exports an encrypted backup without retaining its passphrase', async () => {
+    render(<AccountManager onClose={vi.fn()} />);
+    await screen.findByText('Claude 主账号');
+
+    fireEvent.click(screen.getByText('加密备份与恢复'));
+    const exportPassphrase = document.querySelector<HTMLInputElement>(
+      'input[aria-label="备份口令"]'
+    );
+    expect(exportPassphrase).not.toBeNull();
+    fireEvent.change(exportPassphrase!, {
+      target: { value: 'correct horse battery staple' },
+    });
+    fireEvent.change(screen.getByLabelText('确认备份口令'), {
+      target: { value: 'correct horse battery staple' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '导出加密备份' }));
+
+    await waitFor(() =>
+      expect(apiMocks.exportAccountBackup).toHaveBeenCalledWith(
+        'correct horse battery staple'
+      )
+    );
+    expect(await screen.findByRole('status')).toHaveTextContent(
+      '加密备份已导出：/tmp/accounts.tcarpool-backup'
+    );
+    expect(exportPassphrase).toHaveValue('');
+    expect(screen.getByLabelText('确认备份口令')).toHaveValue('');
+  });
+
+  it('previews and commits a merge restore as one backend transaction', async () => {
+    render(<AccountManager onClose={vi.fn()} />);
+    await screen.findByText('Claude 主账号');
+    fireEvent.click(screen.getByText('加密备份与恢复'));
+
+    fireEvent.change(screen.getByLabelText('恢复备份口令'), {
+      target: { value: 'restore-passphrase' },
+    });
+    const backup = new File(['encrypted-backup'], 'accounts.tcarpool-backup', {
+      type: 'application/json',
+    });
+    Object.defineProperty(backup, 'text', {
+      value: vi.fn().mockResolvedValue('encrypted-backup'),
+    });
+    fireEvent.change(screen.getByLabelText('选择账号备份文件'), {
+      target: { files: [backup] },
+    });
+
+    await waitFor(() =>
+      expect(apiMocks.previewAccountRestore).toHaveBeenCalledWith({
+        content: 'encrypted-backup',
+        passphrase: 'restore-passphrase',
+        mode: 'merge',
+      })
+    );
+    expect(screen.getByLabelText('恢复备份口令')).toHaveValue('');
+    fireEvent.click(screen.getByRole('button', { name: '确认合并恢复' }));
+    await waitFor(() =>
+      expect(apiMocks.commitAccountRestore).toHaveBeenCalledWith(
+        'restore-session',
+        'merge',
+        false
+      )
+    );
+    expect(await screen.findByRole('status')).toHaveTextContent(
+      '账号恢复完成：更新 1 个账号'
+    );
+  });
+
+  it('requires two confirmations before a replace restore', async () => {
+    apiMocks.previewAccountRestore.mockResolvedValueOnce(
+      restorePreview({ mode: 'replace', removeCount: 1 })
+    );
+    const confirm = vi
+      .spyOn(window, 'confirm')
+      .mockReturnValueOnce(true)
+      .mockReturnValueOnce(true);
+    render(<AccountManager onClose={vi.fn()} />);
+    await screen.findByText('Claude 主账号');
+    fireEvent.click(screen.getByText('加密备份与恢复'));
+
+    fireEvent.change(screen.getByLabelText('恢复备份口令'), {
+      target: { value: 'restore-passphrase' },
+    });
+    fireEvent.change(screen.getByLabelText('恢复方式'), {
+      target: { value: 'replace' },
+    });
+    const backup = new File(['encrypted-backup'], 'accounts.tcarpool-backup');
+    Object.defineProperty(backup, 'text', {
+      value: vi.fn().mockResolvedValue('encrypted-backup'),
+    });
+    fireEvent.change(screen.getByLabelText('选择账号备份文件'), {
+      target: { files: [backup] },
+    });
+    await screen.findByText('替换后将移除备份中不存在的 1 个本机账号。');
+
+    fireEvent.click(screen.getByRole('button', { name: '确认替换恢复' }));
+    expect(confirm).toHaveBeenNthCalledWith(
+      1,
+      '替换恢复会删除备份中不存在的本机账号，是否继续？'
+    );
+    expect(confirm).toHaveBeenNthCalledWith(
+      2,
+      '再次确认：将先创建回滚快照，然后替换整个本机账号池。'
+    );
+    await waitFor(() =>
+      expect(apiMocks.commitAccountRestore).toHaveBeenCalledWith(
+        'restore-session',
+        'replace',
+        true
+      )
+    );
+  });
+
+  it('blocks a conflicted preview and cancels the one-time session', async () => {
+    apiMocks.previewAccountImport.mockResolvedValueOnce(
+      importPreview({
+        items: [
+          {
+            itemId: 'conflict-item',
+            tool: 'codex',
+            authKind: 'oauth',
+            name: '冲突账号',
+            source: 'local',
+            action: 'conflict',
+          },
+        ],
+      })
+    );
+    render(<AccountManager onClose={vi.fn()} />);
+    await screen.findByText('Claude 主账号');
+
+    fireEvent.click(screen.getByRole('button', { name: /导入本机配置/ }));
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      '存在身份或来源冲突，账号池不会被修改'
+    );
+    expect(screen.getByRole('button', { name: '确认导入' })).toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: '取消' }));
+    await waitFor(() =>
+      expect(apiMocks.cancelAccountImport).toHaveBeenCalledWith('import-session')
+    );
+    expect(apiMocks.commitAccountImport).not.toHaveBeenCalled();
   });
 
   it('accepts the backend maximum account priority', async () => {

@@ -1,4 +1,7 @@
 use crate::account_router::RouteHealthSummary;
+use crate::account_transfer::{
+    AccountPreviewAction, AccountPreviewItem, AccountRestoreResult, RestoreMode,
+};
 use crate::models::ToolKind;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ring::{
@@ -16,7 +19,8 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
-const STORE_VERSION: u32 = 1;
+const STORE_VERSION: u32 = 2;
+const LEGACY_STORE_VERSION: u32 = 1;
 const ENVELOPE_VERSION: u32 = 1;
 const ACCOUNT_KEY_BYTES: usize = 32;
 const ACCOUNT_NONCE_BYTES: usize = 12;
@@ -26,7 +30,9 @@ const MAX_IMPORT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ACCOUNTS: usize = 1_000;
 const MAX_SECRET_BYTES: usize = 32 * 1024;
 const MAX_NAME_CHARS: usize = 80;
+const MAX_SOURCE_ID_CHARS: usize = 160;
 const MAX_PRIORITY: i32 = 1_000_000;
+const BACKUP_PAYLOAD_VERSION: u32 = 1;
 
 // AccountPool instances are short-lived in Tauri commands. A process-wide lock
 // prevents two independently constructed instances from racing key creation or
@@ -176,6 +182,24 @@ pub struct AccountPool {
     path: PathBuf,
 }
 
+pub(crate) struct PreparedAccountImport {
+    parsed: Vec<ParsedAccount>,
+    options: ImportOptions,
+    default_source: AccountSource,
+}
+
+pub(crate) struct PreparedAccountRestore {
+    store: AccountStore,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AccountBackupPayload {
+    version: u32,
+    exported_at_ms: i64,
+    accounts: Vec<StoredAccount>,
+}
+
 impl AccountPool {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self { path: path.into() }
@@ -232,6 +256,167 @@ impl AccountPool {
         Ok(accounts.into_iter().map(StoredAccount::candidate).collect())
     }
 
+    pub(crate) fn prepare_import_content(
+        &self,
+        content: &str,
+        options: ImportOptions,
+        default_source: AccountSource,
+    ) -> Result<PreparedAccountImport, String> {
+        let parsed = parse_import_content(content, options.tool)?;
+        prepare_account_import(parsed, options, default_source)
+    }
+
+    pub(crate) fn prepare_import_contents(
+        &self,
+        contents: &[String],
+        mut options: ImportOptions,
+        default_source: AccountSource,
+    ) -> Result<PreparedAccountImport, String> {
+        if contents.is_empty() {
+            return Err("请选择至少一个账号文件".to_string());
+        }
+        let total_bytes = contents
+            .iter()
+            .try_fold(0usize, |total, content| total.checked_add(content.len()))
+            .ok_or_else(|| "导入内容过大".to_string())?;
+        if total_bytes > MAX_IMPORT_BYTES {
+            return Err("导入内容过大".to_string());
+        }
+        let mut parsed = Vec::new();
+        for (index, content) in contents.iter().enumerate() {
+            parsed.extend(
+                parse_import_content(content, options.tool)
+                    .map_err(|error| format!("第 {} 个账号文件无法导入: {error}", index + 1))?,
+            );
+        }
+        options.source = Some(default_source);
+        prepare_account_import(parsed, options, default_source)
+    }
+
+    pub(crate) fn prepare_local_import(&self) -> Result<PreparedAccountImport, String> {
+        let home = dirs::home_dir().ok_or_else(|| "无法获取用户主目录".to_string())?;
+        #[cfg(target_os = "macos")]
+        let keychain_json = read_claude_keychain_credentials();
+        #[cfg(not(target_os = "macos"))]
+        let keychain_json: Option<String> = None;
+        let parsed = collect_local_accounts(&home, keychain_json.as_deref())?;
+        prepare_account_import(
+            parsed,
+            ImportOptions {
+                source: Some(AccountSource::Local),
+                ..ImportOptions::default()
+            },
+            AccountSource::Local,
+        )
+    }
+
+    pub(crate) fn preview_prepared_import(
+        &self,
+        prepared: &PreparedAccountImport,
+    ) -> Result<Vec<AccountPreviewItem>, String> {
+        let _guard = ACCOUNT_STORE_LOCK
+            .lock()
+            .map_err(|_| "账号存储暂时不可用".to_string())?;
+        let store = load_store(&self.path)?;
+        preview_import_items(&store, prepared)
+    }
+
+    pub(crate) fn commit_prepared_import(
+        &self,
+        prepared: PreparedAccountImport,
+    ) -> Result<ImportResult, String> {
+        self.import_parsed(prepared.parsed, prepared.options, prepared.default_source)
+    }
+
+    pub(crate) fn backup_plaintext(&self) -> Result<Vec<u8>, String> {
+        let _guard = ACCOUNT_STORE_LOCK
+            .lock()
+            .map_err(|_| "账号存储暂时不可用".to_string())?;
+        let store = load_store(&self.path)?;
+        serde_json::to_vec(&AccountBackupPayload {
+            version: BACKUP_PAYLOAD_VERSION,
+            exported_at_ms: now_ms(),
+            accounts: store.accounts,
+        })
+        .map_err(|error| format!("无法编码账号备份内容: {error}"))
+    }
+
+    pub(crate) fn parse_backup_plaintext(
+        &self,
+        plaintext: &[u8],
+    ) -> Result<PreparedAccountRestore, String> {
+        let payload: AccountBackupPayload =
+            serde_json::from_slice(plaintext).map_err(|_| "账号备份解密内容已损坏".to_string())?;
+        if payload.version != BACKUP_PAYLOAD_VERSION {
+            return Err(format!("不支持的账号备份内容版本: {}", payload.version));
+        }
+        let store = AccountStore {
+            version: STORE_VERSION,
+            accounts: payload.accounts,
+        };
+        validate_store(&store)?;
+        Ok(PreparedAccountRestore { store })
+    }
+
+    pub(crate) fn preview_prepared_restore(
+        &self,
+        prepared: &PreparedAccountRestore,
+        mode: RestoreMode,
+    ) -> Result<(Vec<AccountPreviewItem>, usize), String> {
+        let _guard = ACCOUNT_STORE_LOCK
+            .lock()
+            .map_err(|_| "账号存储暂时不可用".to_string())?;
+        let current = load_store(&self.path)?;
+        preview_restore_items(&current, &prepared.store, mode)
+    }
+
+    pub(crate) fn commit_prepared_restore(
+        &self,
+        prepared: PreparedAccountRestore,
+        mode: RestoreMode,
+    ) -> Result<AccountRestoreResult, String> {
+        let _guard = ACCOUNT_STORE_LOCK
+            .lock()
+            .map_err(|_| "账号存储暂时不可用".to_string())?;
+        let current = load_store(&self.path)?;
+        let (mut proposed, imported, updated, removed, affected_ids) =
+            build_restored_store(&current, prepared.store, mode)?;
+        proposed.version = STORE_VERSION;
+        validate_store(&proposed)?;
+
+        if mode == RestoreMode::Replace {
+            write_restore_snapshot(&self.path, &current)?;
+        }
+        if let Err(error) = save_store(&self.path, &proposed) {
+            if mode == RestoreMode::Replace {
+                let _ = rollback_restore_snapshot(&self.path);
+            }
+            return Err(error);
+        }
+        if let Err(error) = read_store_file(&self.path, &self.path) {
+            if mode == RestoreMode::Replace {
+                rollback_restore_snapshot(&self.path)?;
+            }
+            return Err(format!("恢复后的账号存储校验失败，已自动回滚: {error}"));
+        }
+
+        let affected = affected_ids.into_iter().collect::<HashSet<_>>();
+        let mut accounts = proposed
+            .accounts
+            .iter()
+            .filter(|account| mode == RestoreMode::Replace || affected.contains(&account.id))
+            .map(StoredAccount::summary)
+            .collect::<Vec<_>>();
+        sort_summaries(&mut accounts);
+        Ok(AccountRestoreResult {
+            imported,
+            updated,
+            removed,
+            accounts,
+        })
+    }
+
+    #[allow(dead_code)] // Legacy native API; Tauri now routes through preview + commit.
     pub fn import_content(
         &self,
         content: &str,
@@ -269,6 +454,7 @@ impl AccountPool {
         self.import_parsed(parsed, options, AccountSource::File)
     }
 
+    #[allow(dead_code)] // Legacy native API; Tauri now routes through preview + commit.
     pub fn import_local(&self) -> Result<ImportResult, String> {
         let home = dirs::home_dir().ok_or_else(|| "无法获取用户主目录".to_string())?;
         #[cfg(target_os = "macos")]
@@ -324,21 +510,22 @@ impl AccountPool {
         let mut unmatched: Vec<ParsedAccount> = Vec::new();
 
         for candidate in parsed {
-            if let Some(account) = store.accounts.iter_mut().find(|account| {
-                account.tool == candidate.tool
-                    && account.credential.same_identity(&candidate.credential)
-            }) {
+            if let Ok(Some(index)) = matching_account_index(&store.accounts, &candidate) {
+                let account = &mut store.accounts[index];
                 if account.credential != candidate.credential {
                     account.credential = candidate.credential;
+                    if candidate.source_id.is_some() {
+                        account.source_id = candidate.source_id;
+                    }
                     account.updated_at_ms = now;
                     if !updated_ids.contains(&account.id) {
                         updated_ids.push(account.id.clone());
                     }
                 }
-            } else if !unmatched.iter().any(|other| {
-                other.tool == candidate.tool
-                    && other.credential.same_identity(&candidate.credential)
-            }) {
+            } else if !unmatched
+                .iter()
+                .any(|other| parsed_accounts_match(other, &candidate))
+            {
                 unmatched.push(candidate);
             }
         }
@@ -444,26 +631,17 @@ impl AccountPool {
                 .map(normalize_name)
                 .transpose()?
                 .filter(|name| !candidate.credential.contains_secret(name));
-            let existing = store.accounts.iter_mut().find(|account| {
-                account.tool == candidate.tool
-                    && account.credential.same_identity(&candidate.credential)
-            });
+            let existing = matching_account_index(&store.accounts, &candidate)?;
 
-            let id = if let Some(account) = existing {
+            let id = if let Some(index) = existing {
+                let account = &mut store.accounts[index];
                 account.credential = candidate.credential;
-                if apply_explicit_name {
-                    if let Some(name) = explicit_name.as_ref() {
-                        if !account.credential.contains_secret(name) {
-                            account.name = name.clone();
-                        }
-                    }
+                if candidate.source_id.is_some() {
+                    account.source_id = candidate.source_id;
                 }
-                if let Some(priority) = priority.or(parsed_priority) {
-                    account.priority = priority;
-                }
-                if let Some(enabled) = options.enabled.or(candidate.enabled) {
-                    account.enabled = enabled;
-                }
+                // Credential rotation must not silently undo local account
+                // management choices. Name, priority, and enabled state are
+                // changed only through the explicit update command.
                 account.updated_at_ms = now;
                 updated += 1;
                 account.id.clone()
@@ -491,6 +669,7 @@ impl AccountPool {
                     source,
                     created_at_ms: now,
                     updated_at_ms: now,
+                    source_id: candidate.source_id,
                     credential: candidate.credential,
                 });
                 imported += 1;
@@ -525,17 +704,29 @@ fn collect_local_accounts(
 ) -> Result<Vec<ParsedAccount>, String> {
     let allow_codex_api_keys = codex_local_config_allows_official_api(home);
     let sources = [
-        (home.join(".claude/.credentials.json"), ToolKind::Claude),
-        (home.join(".claude/settings.json"), ToolKind::Claude),
-        (home.join(".claude/settings.local.json"), ToolKind::Claude),
-        (home.join(".claude.json"), ToolKind::Claude),
-        (home.join(".codex/auth.json"), ToolKind::Codex),
+        (
+            home.join(".claude/.credentials.json"),
+            ToolKind::Claude,
+            "credentials",
+        ),
+        (
+            home.join(".claude/settings.json"),
+            ToolKind::Claude,
+            "settings",
+        ),
+        (
+            home.join(".claude/settings.local.json"),
+            ToolKind::Claude,
+            "settings-local",
+        ),
+        (home.join(".claude.json"), ToolKind::Claude, "profile"),
+        (home.join(".codex/auth.json"), ToolKind::Codex, "auth"),
     ];
     let mut parsed = Vec::new();
     let mut found_files = 0usize;
     let mut first_error = None;
 
-    for (path, tool) in sources {
+    for (path, tool, slot) in sources {
         if !path.exists() {
             continue;
         }
@@ -554,6 +745,9 @@ fn collect_local_accounts(
                 if tool == ToolKind::Codex && !allow_codex_api_keys {
                     accounts.retain(|account| account.credential.kind() == AccountAuthKind::OAuth);
                 }
+                for (index, account) in accounts.iter_mut().enumerate() {
+                    account.source_id = Some(local_source_id(tool, slot, index));
+                }
                 parsed.append(&mut accounts);
             }
             Err(error) => {
@@ -567,7 +761,12 @@ fn collect_local_accounts(
     if let Some(content) = keychain_json {
         found_files += 1;
         match parse_import_content(content, Some(ToolKind::Claude)) {
-            Ok(mut accounts) => parsed.append(&mut accounts),
+            Ok(mut accounts) => {
+                for (index, account) in accounts.iter_mut().enumerate() {
+                    account.source_id = Some(local_source_id(ToolKind::Claude, "keychain", index));
+                }
+                parsed.append(&mut accounts)
+            }
             Err(error) => {
                 first_error
                     .get_or_insert_with(|| format!("本机 Claude Keychain 配置无法导入: {error}"));
@@ -586,6 +785,10 @@ fn collect_local_accounts(
         };
     }
     Ok(parsed)
+}
+
+fn local_source_id(tool: ToolKind, slot: &str, index: usize) -> String {
+    format!("local:{}:{slot}:{index}", tool.command())
 }
 
 #[cfg(target_os = "macos")]
@@ -644,6 +847,8 @@ struct StoredAccount {
     source: AccountSource,
     created_at_ms: i64,
     updated_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_id: Option<String>,
     credential: StoredCredential,
 }
 
@@ -720,6 +925,16 @@ impl StoredCredential {
         match self {
             Self::ApiKey { secret } => secret,
             Self::OAuth { access_token, .. } => access_token,
+        }
+    }
+
+    fn account_id(&self) -> Option<&str> {
+        match self {
+            Self::OAuth { account_id, .. } => account_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty()),
+            Self::ApiKey { .. } => None,
         }
     }
 
@@ -829,7 +1044,311 @@ struct ParsedAccount {
     name: Option<String>,
     priority: Option<i32>,
     enabled: Option<bool>,
+    source_id: Option<String>,
     credential: StoredCredential,
+}
+
+fn parsed_accounts_match(left: &ParsedAccount, right: &ParsedAccount) -> bool {
+    if left.tool != right.tool {
+        return false;
+    }
+    if let (Some(left), Some(right)) = (left.credential.account_id(), right.credential.account_id())
+    {
+        return left == right;
+    }
+    if let (Some(left), Some(right)) = (left.source_id.as_deref(), right.source_id.as_deref()) {
+        return left == right;
+    }
+    left.credential.same_identity(&right.credential)
+}
+
+fn matching_account_index(
+    accounts: &[StoredAccount],
+    candidate: &ParsedAccount,
+) -> Result<Option<usize>, String> {
+    let candidate_account_id = candidate.credential.account_id();
+    let account_id_matches = candidate_account_id
+        .map(|account_id| {
+            accounts
+                .iter()
+                .enumerate()
+                .filter(|(_, account)| {
+                    account.tool == candidate.tool
+                        && account.credential.account_id() == Some(account_id)
+                })
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if account_id_matches.len() > 1 {
+        return Err("多个本机账号具有相同的官方账号标识，请先处理冲突".to_string());
+    }
+    if let Some(index) = account_id_matches.first() {
+        return Ok(Some(*index));
+    }
+
+    if let Some(source_id) = candidate.source_id.as_deref() {
+        let source_matches = accounts
+            .iter()
+            .enumerate()
+            .filter(|(_, account)| {
+                account.tool == candidate.tool && account.source_id.as_deref() == Some(source_id)
+            })
+            .collect::<Vec<_>>();
+        if source_matches.len() > 1 {
+            return Err("多个本机账号具有相同的来源标识，请先处理冲突".to_string());
+        }
+        if let Some((index, account)) = source_matches.first() {
+            if let (Some(candidate_id), Some(existing_id)) =
+                (candidate_account_id, account.credential.account_id())
+            {
+                if candidate_id != existing_id {
+                    return Err("官方客户端来源槽位已切换为另一个账号，请先确认冲突".to_string());
+                }
+            }
+            return Ok(Some(*index));
+        }
+    }
+
+    let identity_matches = accounts
+        .iter()
+        .enumerate()
+        .filter(|(_, account)| {
+            account.tool == candidate.tool
+                && account.credential.same_identity(&candidate.credential)
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    match identity_matches.as_slice() {
+        [] => Ok(None),
+        [index] => Ok(Some(*index)),
+        _ => Err("导入凭据与多个现有账号匹配，请先处理冲突".to_string()),
+    }
+}
+
+fn prepare_account_import(
+    parsed: Vec<ParsedAccount>,
+    options: ImportOptions,
+    default_source: AccountSource,
+) -> Result<PreparedAccountImport, String> {
+    if parsed.is_empty() {
+        return Err("未找到可导入的账号凭证".to_string());
+    }
+    if parsed.len() > MAX_ACCOUNTS {
+        return Err(format!("单次最多导入 {MAX_ACCOUNTS} 个账号"));
+    }
+    options.priority.map(validate_priority).transpose()?;
+    options.name.as_deref().map(normalize_name).transpose()?;
+    for candidate in &parsed {
+        validate_parsed_account(candidate)?;
+        candidate.priority.map(validate_priority).transpose()?;
+        if let Some(name) = candidate.name.as_deref() {
+            normalize_name(name)?;
+        }
+        if let Some(source_id) = candidate.source_id.as_deref() {
+            validate_source_id(source_id)?;
+        }
+    }
+    Ok(PreparedAccountImport {
+        parsed,
+        options,
+        default_source,
+    })
+}
+
+fn preview_import_items(
+    store: &AccountStore,
+    prepared: &PreparedAccountImport,
+) -> Result<Vec<AccountPreviewItem>, String> {
+    let mut working = store.clone();
+    let source = prepared.options.source.unwrap_or(prepared.default_source);
+    let explicit_name = prepared
+        .options
+        .name
+        .as_deref()
+        .map(normalize_name)
+        .transpose()?;
+    let apply_explicit_name = prepared.parsed.len() == 1;
+    let mut items = Vec::with_capacity(prepared.parsed.len());
+    for (index, candidate) in prepared.parsed.iter().enumerate() {
+        let proposed_name = candidate_preview_name(
+            candidate,
+            apply_explicit_name
+                .then_some(explicit_name.as_deref())
+                .flatten(),
+        )?;
+        let (action, name) = match matching_account_index(&working.accounts, candidate) {
+            Ok(Some(account_index)) => {
+                let account = &mut working.accounts[account_index];
+                account.credential = candidate.credential.clone();
+                if candidate.source_id.is_some() {
+                    account.source_id = candidate.source_id.clone();
+                }
+                (AccountPreviewAction::Update, account.name.clone())
+            }
+            Ok(None) if working.accounts.len() < MAX_ACCOUNTS => {
+                working.accounts.push(StoredAccount {
+                    id: Uuid::new_v4().to_string(),
+                    tool: candidate.tool,
+                    name: proposed_name.clone(),
+                    enabled: prepared
+                        .options
+                        .enabled
+                        .or(candidate.enabled)
+                        .unwrap_or(true),
+                    priority: prepared
+                        .options
+                        .priority
+                        .or(candidate.priority)
+                        .unwrap_or(DEFAULT_ACCOUNT_PRIORITY),
+                    source,
+                    created_at_ms: now_ms(),
+                    updated_at_ms: now_ms(),
+                    source_id: candidate.source_id.clone(),
+                    credential: candidate.credential.clone(),
+                });
+                (AccountPreviewAction::New, proposed_name)
+            }
+            Ok(None) | Err(_) => (AccountPreviewAction::Conflict, proposed_name),
+        };
+        items.push(AccountPreviewItem {
+            item_id: format!("item-{}", index + 1),
+            tool: candidate.tool,
+            auth_kind: candidate.credential.kind(),
+            name,
+            source,
+            action,
+        });
+    }
+    Ok(items)
+}
+
+fn candidate_preview_name(
+    candidate: &ParsedAccount,
+    explicit_name: Option<&str>,
+) -> Result<String, String> {
+    let explicit = explicit_name
+        .map(normalize_name)
+        .transpose()?
+        .filter(|name| !candidate.credential.contains_secret(name));
+    let candidate_name = candidate
+        .name
+        .as_deref()
+        .map(normalize_name)
+        .transpose()?
+        .filter(|name| !candidate.credential.contains_secret(name));
+    Ok(explicit
+        .or(candidate_name)
+        .unwrap_or_else(|| default_account_name(candidate.tool, candidate.credential.kind())))
+}
+
+fn parsed_from_stored(account: &StoredAccount) -> ParsedAccount {
+    ParsedAccount {
+        tool: account.tool,
+        name: Some(account.name.clone()),
+        priority: Some(account.priority),
+        enabled: Some(account.enabled),
+        source_id: account.source_id.clone(),
+        credential: account.credential.clone(),
+    }
+}
+
+fn preview_restore_items(
+    current: &AccountStore,
+    backup: &AccountStore,
+    mode: RestoreMode,
+) -> Result<(Vec<AccountPreviewItem>, usize), String> {
+    let mut matched_current_ids = HashSet::new();
+    let mut items = Vec::with_capacity(backup.accounts.len());
+    for (index, account) in backup.accounts.iter().enumerate() {
+        let candidate = parsed_from_stored(account);
+        let action = match matching_account_index(&current.accounts, &candidate) {
+            Ok(Some(current_index)) => {
+                matched_current_ids.insert(current.accounts[current_index].id.clone());
+                AccountPreviewAction::Update
+            }
+            Ok(None) => AccountPreviewAction::New,
+            Err(_) => AccountPreviewAction::Conflict,
+        };
+        items.push(AccountPreviewItem {
+            item_id: format!("item-{}", index + 1),
+            tool: account.tool,
+            auth_kind: account.credential.kind(),
+            name: account.name.clone(),
+            source: account.source,
+            action,
+        });
+    }
+    let remove_count = if mode == RestoreMode::Replace {
+        current
+            .accounts
+            .iter()
+            .filter(|account| !matched_current_ids.contains(&account.id))
+            .count()
+    } else {
+        0
+    };
+    Ok((items, remove_count))
+}
+
+fn build_restored_store(
+    current: &AccountStore,
+    backup: AccountStore,
+    mode: RestoreMode,
+) -> Result<(AccountStore, usize, usize, usize, Vec<String>), String> {
+    if mode == RestoreMode::Replace {
+        let (_, remove_count) = preview_restore_items(current, &backup, mode)?;
+        let mut imported = 0usize;
+        let mut updated = 0usize;
+        for account in &backup.accounts {
+            let candidate = parsed_from_stored(account);
+            match matching_account_index(&current.accounts, &candidate)? {
+                Some(_) => updated += 1,
+                None => imported += 1,
+            }
+        }
+        let affected_ids = backup
+            .accounts
+            .iter()
+            .map(|account| account.id.clone())
+            .collect();
+        return Ok((backup, imported, updated, remove_count, affected_ids));
+    }
+
+    let mut proposed = current.clone();
+    let mut imported = 0usize;
+    let mut updated = 0usize;
+    let mut affected_ids = Vec::new();
+    let current_ms = now_ms();
+    for backup_account in backup.accounts {
+        let candidate = parsed_from_stored(&backup_account);
+        let id = if let Some(index) = matching_account_index(&proposed.accounts, &candidate)? {
+            let local = &mut proposed.accounts[index];
+            local.credential = backup_account.credential;
+            if backup_account.source_id.is_some() {
+                local.source_id = backup_account.source_id;
+            }
+            local.updated_at_ms = current_ms;
+            updated += 1;
+            local.id.clone()
+        } else {
+            if proposed.accounts.len() >= MAX_ACCOUNTS {
+                return Err(format!("账号数量不能超过 {MAX_ACCOUNTS}"));
+            }
+            let mut added = backup_account;
+            added.id = Uuid::new_v4().to_string();
+            added.created_at_ms = current_ms;
+            added.updated_at_ms = current_ms;
+            let id = added.id.clone();
+            proposed.accounts.push(added);
+            imported += 1;
+            id
+        };
+        if !affected_ids.contains(&id) {
+            affected_ids.push(id);
+        }
+    }
+    Ok((proposed, imported, updated, 0, affected_ids))
 }
 
 fn parse_import_content(
@@ -1623,6 +2142,7 @@ fn parsed_api_key(
         name,
         priority,
         enabled,
+        source_id: None,
         credential: StoredCredential::ApiKey { secret },
     })
 }
@@ -1647,6 +2167,7 @@ fn parsed_oauth(
         name,
         priority,
         enabled,
+        source_id: None,
         credential: StoredCredential::OAuth {
             access_token,
             refresh_token,
@@ -1995,38 +2516,43 @@ fn load_store(path: &Path) -> Result<AccountStore, String> {
     let primary_exists = path_is_present(path, "账号存储")?;
     let backup_exists = path_is_present(&backup_path, "账号存储备份")?;
 
-    if !primary_exists {
+    let mut store = if !primary_exists {
         if !backup_exists {
             return Ok(AccountStore::default());
         }
         let store = read_store_file(&backup_path, path)?;
         recover_store_backup(path, &backup_path, false)?;
-        return Ok(store);
-    }
-
-    match read_store_file(path, path) {
-        Ok(store) => {
-            // A backup can remain when the process exits after replacing the
-            // destination but before cleanup. The primary has already passed
-            // authentication, so the stale copy can be discarded safely.
-            if backup_exists {
-                let _ = discard_store_backup(&backup_path);
+        store
+    } else {
+        match read_store_file(path, path) {
+            Ok(store) => {
+                // A backup can remain when the process exits after replacing the
+                // destination but before cleanup. The primary has already passed
+                // authentication, so the stale copy can be discarded safely.
+                if backup_exists {
+                    let _ = discard_store_backup(&backup_path);
+                }
+                store
             }
-            Ok(store)
+            Err(primary_error) if backup_exists => {
+                // A crash can leave a partially written primary alongside the
+                // last authenticated backup. Validate the backup before replacing
+                // the damaged file and keep the original error if it is unusable.
+                let backup_store = match read_store_file(&backup_path, path) {
+                    Ok(store) => store,
+                    Err(_) => return Err(primary_error),
+                };
+                recover_store_backup(path, &backup_path, true)?;
+                backup_store
+            }
+            Err(error) => return Err(error),
         }
-        Err(primary_error) if backup_exists => {
-            // A crash can leave a partially written primary alongside the
-            // last authenticated backup. Validate the backup before replacing
-            // the damaged file and keep the original error if it is unusable.
-            let backup_store = match read_store_file(&backup_path, path) {
-                Ok(store) => store,
-                Err(_) => return Err(primary_error),
-            };
-            recover_store_backup(path, &backup_path, true)?;
-            Ok(backup_store)
-        }
-        Err(error) => Err(error),
+    };
+
+    if store.version == LEGACY_STORE_VERSION {
+        migrate_store_v1(path, &mut store)?;
     }
+    Ok(store)
 }
 
 fn account_store_backup_path(store_path: &Path) -> PathBuf {
@@ -2036,6 +2562,30 @@ fn account_store_backup_path(store_path: &Path) -> PathBuf {
         .unwrap_or_else(|| "accounts.json".into());
     backup_name.push(".bak");
     store_path.with_file_name(backup_name)
+}
+
+fn account_store_migration_backup_path(store_path: &Path) -> PathBuf {
+    let mut backup_name = store_path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_else(|| "accounts.json".into());
+    backup_name.push(".v1-authenticated.bak");
+    store_path.with_file_name(backup_name)
+}
+
+fn migrate_store_v1(path: &Path, store: &mut AccountStore) -> Result<(), String> {
+    let original = fs::read(path).map_err(|error| format!("无法读取待迁移账号存储: {error}"))?;
+    let migration_backup = account_store_migration_backup_path(path);
+    if !path_is_present(&migration_backup, "账号迁移备份")? {
+        atomic_write_secure(&migration_backup, &original)?;
+    }
+    store.version = STORE_VERSION;
+    if let Err(error) = save_store(path, store) {
+        let _ = atomic_write_secure(path, &original);
+        store.version = LEGACY_STORE_VERSION;
+        return Err(format!("账号存储 v2 迁移失败，已保留原版本: {error}"));
+    }
+    Ok(())
 }
 
 fn path_is_present(path: &Path, label: &str) -> Result<bool, String> {
@@ -2063,7 +2613,7 @@ fn read_store_file(file_path: &Path, key_path: &Path) -> Result<AccountStore, St
     let plaintext = decrypt_store(key_path, envelope)?;
     let store: AccountStore = serde_json::from_slice(&plaintext)
         .map_err(|error| format!("账号存储解密内容已损坏: {error}"))?;
-    if store.version != STORE_VERSION {
+    if !matches!(store.version, LEGACY_STORE_VERSION | STORE_VERSION) {
         return Err(format!("不支持的账号存储版本: {}", store.version));
     }
     validate_store(&store)?;
@@ -2118,6 +2668,9 @@ fn discard_store_backup(backup_path: &Path) -> Result<(), String> {
 }
 
 fn validate_store(store: &AccountStore) -> Result<(), String> {
+    if !matches!(store.version, LEGACY_STORE_VERSION | STORE_VERSION) {
+        return Err(format!("不支持的账号存储版本: {}", store.version));
+    }
     if store.accounts.len() > MAX_ACCOUNTS {
         return Err("账号存储中的账号数量超出限制".to_string());
     }
@@ -2139,22 +2692,63 @@ fn validate_store(store: &AccountStore) -> Result<(), String> {
         if account.credential.contains_secret(&account.name) {
             return Err("账号名称不能包含凭证内容".to_string());
         }
+        if let Some(source_id) = account.source_id.as_deref() {
+            validate_source_id(source_id)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_source_id(source_id: &str) -> Result<(), String> {
+    if source_id.is_empty()
+        || source_id.chars().count() > MAX_SOURCE_ID_CHARS
+        || !source_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || ":._-".contains(character))
+    {
+        return Err("账号来源标识无效".to_string());
     }
     Ok(())
 }
 
 fn save_store(path: &Path, store: &AccountStore) -> Result<(), String> {
+    let bytes = encode_store(path, store)?;
+    atomic_write_secure(path, &bytes)
+}
+
+fn encode_store(key_path: &Path, store: &AccountStore) -> Result<Vec<u8>, String> {
     validate_store(store)?;
     let plaintext =
         serde_json::to_vec(store).map_err(|error| format!("无法编码账号存储: {error}"))?;
-    let envelope = encrypt_store(path, plaintext)?;
+    let envelope = encrypt_store(key_path, plaintext)?;
     let mut bytes = serde_json::to_vec_pretty(&envelope)
         .map_err(|error| format!("无法编码加密账号存储: {error}"))?;
     bytes.push(b'\n');
     if bytes.len() as u64 > MAX_STORE_BYTES {
         return Err("账号存储内容过大，无法保存更多账号".to_string());
     }
-    atomic_write_secure(path, &bytes)
+    Ok(bytes)
+}
+
+fn restore_snapshot_path(store_path: &Path) -> PathBuf {
+    let mut backup_name = store_path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_else(|| "accounts.json".into());
+    backup_name.push(".pre-restore.bak");
+    store_path.with_file_name(backup_name)
+}
+
+fn write_restore_snapshot(path: &Path, store: &AccountStore) -> Result<(), String> {
+    let bytes = encode_store(path, store)?;
+    atomic_write_secure(&restore_snapshot_path(path), &bytes)
+}
+
+fn rollback_restore_snapshot(path: &Path) -> Result<(), String> {
+    let snapshot = restore_snapshot_path(path);
+    read_store_file(&snapshot, path).map_err(|error| format!("恢复回滚快照校验失败: {error}"))?;
+    let bytes = fs::read(&snapshot).map_err(|error| format!("无法读取恢复回滚快照: {error}"))?;
+    atomic_write_secure(path, &bytes).map_err(|error| format!("无法自动回滚替换恢复: {error}"))
 }
 
 fn encrypt_store(path: &Path, mut plaintext: Vec<u8>) -> Result<EncryptedStoreEnvelope, String> {
@@ -2966,7 +3560,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_import_updates_existing_record_without_overwriting_rename() {
+    fn duplicate_import_updates_credentials_without_overwriting_local_metadata() {
         let (_temp, pool) = pool();
         let secret = "sk-proj-duplicate-openai-key";
         let first = pool
@@ -3000,7 +3594,7 @@ mod tests {
         assert_eq!(second.updated, 1);
         assert_eq!(second.accounts[0].id, first.accounts[0].id);
         assert_eq!(second.accounts[0].name, "My account");
-        assert_eq!(second.accounts[0].priority, 3);
+        assert_eq!(second.accounts[0].priority, 20);
     }
 
     #[test]
@@ -3310,6 +3904,7 @@ mod tests {
                 source: AccountSource::Json,
                 created_at_ms: now_ms(),
                 updated_at_ms: now_ms(),
+                source_id: None,
                 credential: StoredCredential::ApiKey {
                     secret: "sk-proj-oversized-store".to_string(),
                 },
@@ -3514,5 +4109,141 @@ mod tests {
         assert!(expired_pool
             .has_enabled(ToolKind::Claude)
             .expect("has API key"));
+    }
+
+    #[test]
+    fn authenticated_v1_store_migrates_atomically_and_keeps_the_original_backup() {
+        let (_temp, pool) = pool();
+        let legacy = AccountStore {
+            version: LEGACY_STORE_VERSION,
+            accounts: vec![StoredAccount {
+                id: Uuid::new_v4().to_string(),
+                tool: ToolKind::Claude,
+                name: "Legacy".to_string(),
+                enabled: true,
+                priority: DEFAULT_ACCOUNT_PRIORITY,
+                source: AccountSource::Local,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+                source_id: None,
+                credential: StoredCredential::ApiKey {
+                    secret: "sk-ant-api03-legacy-store".to_string(),
+                },
+            }],
+        };
+        save_store(pool.path(), &legacy).expect("write v1 store");
+        let original = fs::read(pool.path()).expect("legacy envelope");
+
+        assert_eq!(pool.list().expect("migrated list").len(), 1);
+        let migration_backup = account_store_migration_backup_path(pool.path());
+        assert_eq!(
+            fs::read(&migration_backup).expect("migration backup"),
+            original
+        );
+        assert_eq!(
+            read_store_file(&migration_backup, pool.path())
+                .expect("authenticated v1 backup")
+                .version,
+            LEGACY_STORE_VERSION
+        );
+        assert_eq!(
+            read_store_file(pool.path(), pool.path())
+                .expect("migrated v2 store")
+                .version,
+            STORE_VERSION
+        );
+    }
+
+    #[test]
+    fn local_source_slot_matches_full_oauth_rotation_without_resetting_metadata() {
+        let (temp, pool) = pool();
+        let home = temp.path().join("home");
+        fs::create_dir_all(home.join(".codex")).expect("codex dir");
+        let auth_path = home.join(".codex/auth.json");
+        fs::write(
+            &auth_path,
+            json!({"tokens": {
+                "access_token": "codex-source-access-v1",
+                "refresh_token": "codex-source-refresh-v1"
+            }})
+            .to_string(),
+        )
+        .expect("initial auth");
+        let imported = pool.import_local_from(&home).expect("initial local import");
+        let id = imported.accounts[0].id.clone();
+        pool.update(
+            &id,
+            UpdateAccountInput {
+                name: Some("保留名称".to_string()),
+                enabled: Some(false),
+                priority: Some(9),
+            },
+        )
+        .expect("metadata");
+
+        fs::write(
+            &auth_path,
+            json!({"tokens": {
+                "access_token": "codex-source-access-v2",
+                "refresh_token": "codex-source-refresh-v2"
+            }})
+            .to_string(),
+        )
+        .expect("rotated auth");
+        let refreshed = pool
+            .refresh_known_local_with_keychain(&home, None)
+            .expect("source slot refresh");
+        assert_eq!(refreshed.updated, 1);
+        assert_eq!(refreshed.discovered, 0);
+        let account = &pool.list().unwrap()[0];
+        assert_eq!(account.id, id);
+        assert_eq!(account.name, "保留名称");
+        assert_eq!(account.priority, 9);
+        assert!(!account.enabled);
+        pool.update(
+            &id,
+            UpdateAccountInput {
+                enabled: Some(true),
+                ..UpdateAccountInput::default()
+            },
+        )
+        .expect("enable");
+        assert_eq!(
+            pool.candidates(ToolKind::Codex).unwrap()[0]
+                .credential
+                .secret(),
+            "codex-source-access-v2"
+        );
+    }
+
+    #[test]
+    fn interrupted_replace_can_restore_the_authenticated_local_snapshot() {
+        let (_temp, pool) = pool();
+        pool.import_content(
+            "sk-ant-api03-before-replace",
+            ImportOptions {
+                tool: Some(ToolKind::Claude),
+                name: Some("Before".to_string()),
+                ..ImportOptions::default()
+            },
+        )
+        .expect("seed");
+        let before = load_store(pool.path()).expect("before store");
+        write_restore_snapshot(pool.path(), &before).expect("snapshot");
+
+        pool.import_content(
+            "sk-proj-after-replace",
+            ImportOptions {
+                tool: Some(ToolKind::Codex),
+                ..ImportOptions::default()
+            },
+        )
+        .expect("mutate after snapshot");
+        assert_eq!(pool.list().unwrap().len(), 2);
+
+        rollback_restore_snapshot(pool.path()).expect("automatic rollback");
+        let restored = pool.list().expect("restored");
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].name, "Before");
     }
 }
