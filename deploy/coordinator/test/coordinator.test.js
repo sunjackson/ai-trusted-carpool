@@ -10,6 +10,9 @@ const {
   canonicalPoll,
   canonicalTurnCredentials,
   createCoordinator,
+  desktopDownloadUrls,
+  desktopReleaseVersion,
+  joinPage,
   peerIdFromPublicKey,
 } = require('../server');
 
@@ -87,9 +90,39 @@ test('registers and resolves an owner-signed public invite', async () => {
     assert.equal(join.status, 200);
     assert.match(join.headers['content-type'], /^text\/html/);
     assert.match(join.headers['content-security-policy'], /default-src 'none'/);
+    const nonce = join.text.match(/<script nonce="([^"]+)">/)?.[1];
+    assert.ok(nonce);
+    assert.ok(join.headers['content-security-policy'].includes(`script-src 'nonce-${nonce}'`));
+    assert.doesNotMatch(join.headers['content-security-policy'], /script-src 'unsafe-inline'/);
     assert.match(join.text, new RegExp(`trusted-carpool://join/${invite.code}`));
+    assert.doesNotMatch(join.text, /http-equiv="refresh"/);
+    assert.match(join.text, /navigator\.userAgentData/);
+    assert.match(join.text, /visibilitychange/);
+    assert.match(join.text, /Trusted-Carpool_0\.0\.7_x64-setup\.exe/);
+    assert.match(join.text, /Trusted-Carpool_0\.0\.7_universal\.dmg/);
+    assert.match(join.text, /Trusted-Carpool_0\.0\.7_amd64\.AppImage/);
+    assert.match(join.text, /Trusted-Carpool_0\.0\.7_amd64\.deb/);
+    assert.match(join.text, /SHA256SUMS\.txt/);
     assert.doesNotMatch(join.text, /owner_public_key|payload_base64|signature/);
   });
+});
+
+test('join download recommendations stay on the pinned project release', () => {
+  assert.equal(desktopReleaseVersion('1.2.3'), '1.2.3');
+  assert.equal(desktopReleaseVersion('../latest'), '0.0.7');
+  const downloads = desktopDownloadUrls('1.2.3');
+  assert.equal(
+    downloads.windows,
+    'https://github.com/sunjackson/ai-trusted-carpool/releases/download/v1.2.3/Trusted-Carpool_1.2.3_x64-setup.exe'
+  );
+  assert.match(downloads.macos, /Trusted-Carpool_1\.2\.3_universal\.dmg$/);
+  assert.match(downloads.appImage, /Trusted-Carpool_1\.2\.3_amd64\.AppImage$/);
+  assert.match(downloads.deb, /Trusted-Carpool_1\.2\.3_amd64\.deb$/);
+  assert.throws(() => joinPage('<script>alert(1)</script>'), /invalid join code/);
+  assert.throws(
+    () => joinPage('7G2K5LQ8M4TZ', { scriptNonce: 'too-short' }),
+    /invalid script nonce/
+  );
 });
 
 test('renewed short invite leases stay online and expire after the host stops renewing', async () => {

@@ -22,6 +22,8 @@ const DEFAULT_TURN_RATE_LIMIT = 30;
 const RATE_WINDOW_MS = 60_000;
 const DEFAULT_TURN_TTL_SECONDS = 3600;
 const MAX_TURN_TTL_SECONDS = 24 * 60 * 60;
+const DEFAULT_DESKTOP_RELEASE_VERSION = '0.0.7';
+const DESKTOP_RELEASE_REPOSITORY = 'sunjackson/ai-trusted-carpool';
 const ALLOWED_MESSAGE_KINDS = new Set([
   'carpool_claim',
   'carpool_access',
@@ -62,11 +64,19 @@ function error(res, status, message, headers = {}) {
   res.end(body);
 }
 
-function html(res, status, body) {
+function html(res, status, body, options = {}) {
+  const directives = [
+    "default-src 'none'",
+    "style-src 'unsafe-inline'",
+    "base-uri 'none'",
+    "form-action 'none'",
+    "frame-ancestors 'none'",
+  ];
+  if (options.scriptNonce) directives.push(`script-src 'nonce-${options.scriptNonce}'`);
   res.writeHead(status, {
     'content-type': 'text/html; charset=utf-8',
     'cache-control': 'no-store',
-    'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+    'content-security-policy': directives.join('; '),
     'referrer-policy': 'no-referrer',
     'x-content-type-options': 'nosniff',
     'x-frame-options': 'DENY',
@@ -74,25 +84,162 @@ function html(res, status, body) {
   res.end(body);
 }
 
-function joinPage(code) {
+function desktopReleaseVersion(value) {
+  const version = String(value || '').trim();
+  return /^\d+\.\d+\.\d+$/.test(version) ? version : DEFAULT_DESKTOP_RELEASE_VERSION;
+}
+
+function desktopDownloadUrls(version) {
+  const releaseVersion = desktopReleaseVersion(version);
+  const base = `https://github.com/${DESKTOP_RELEASE_REPOSITORY}/releases/download/v${releaseVersion}`;
+  return {
+    windows: `${base}/Trusted-Carpool_${releaseVersion}_x64-setup.exe`,
+    macos: `${base}/Trusted-Carpool_${releaseVersion}_universal.dmg`,
+    appImage: `${base}/Trusted-Carpool_${releaseVersion}_amd64.AppImage`,
+    deb: `${base}/Trusted-Carpool_${releaseVersion}_amd64.deb`,
+    checksums: `${base}/SHA256SUMS.txt`,
+    release: `https://github.com/${DESKTOP_RELEASE_REPOSITORY}/releases/tag/v${releaseVersion}`,
+  };
+}
+
+function joinPage(code, options = {}) {
+  if (!validCode(code)) throw new Error('invalid join code');
+  const scriptNonce = options.scriptNonce || crypto.randomBytes(18).toString('base64');
+  if (!/^[A-Za-z0-9+/=_-]{16,64}$/.test(scriptNonce)) throw new Error('invalid script nonce');
+  const releaseVersion = desktopReleaseVersion(options.releaseVersion);
+  const downloads = desktopDownloadUrls(releaseVersion);
   const deepLink = `trusted-carpool://join/${code}`;
   return `<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta http-equiv="refresh" content="0;url=${deepLink}">
   <title>正在上车 · 可信拼车</title>
   <style>
     :root{color-scheme:dark;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#111315;color:#f7f7f4}
-    *{box-sizing:border-box}body{min-height:100vh;margin:0;display:grid;place-items:center;padding:24px;background:radial-gradient(circle at 50% 12%,#2f291d 0,#171819 36%,#101112 72%)}
-    main{width:min(440px,100%);padding:40px 32px;border:1px solid #35383b;border-radius:24px;background:#1b1d1f;box-shadow:0 24px 80px #0008;text-align:center}
+    *{box-sizing:border-box}body{min-height:100vh;margin:0;display:flex;justify-content:center;padding:24px;background:radial-gradient(circle at 50% 12%,#2f291d 0,#171819 36%,#101112 72%)}
+    main{width:min(620px,100%);margin:auto 0;padding:40px 32px;border:1px solid #35383b;border-radius:24px;background:#1b1d1f;box-shadow:0 24px 80px #0008;text-align:center}
     .mark{width:62px;height:62px;margin:0 auto 20px;display:grid;place-items:center;border-radius:20px;background:#d8ad58;color:#15120d;font-size:30px;font-weight:800}
-    h1{margin:0 0 10px;font-size:27px}p{margin:0 0 22px;color:#aeb1b4;line-height:1.7}.code{display:block;margin:0 0 22px;color:#e7c67e;font:700 15px ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:2px}
-    a{display:block;padding:14px 18px;border-radius:12px;background:#d8ad58;color:#17130c;text-decoration:none;font-weight:800}small{display:block;margin-top:18px;color:#777d82;line-height:1.6}
+    h1{margin:0 0 10px;font-size:27px}h2{margin:28px 0 8px;font-size:20px}p{margin:0 0 22px;color:#aeb1b4;line-height:1.7}.code{display:block;margin:0 0 22px;color:#e7c67e;font:700 15px ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:2px}
+    .open-client{display:block;padding:14px 18px;border-radius:12px;background:#d8ad58;color:#17130c;text-decoration:none;font-weight:800}.status{min-height:24px;margin:14px 0 0;color:#8e9499;font-size:13px}
+    .downloads[hidden]{display:none}.download-copy{margin-bottom:16px}.download-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;text-align:left}
+    .download-card{position:relative;display:flex;min-height:72px;flex-direction:column;justify-content:center;padding:13px 14px;border:1px solid #34383c;border-radius:12px;background:#24272a;color:#f5f1e7;text-decoration:none}.download-card:hover{border-color:#8b7442;background:#2b2a25}.download-card.recommended{border-color:#d8ad58;box-shadow:0 0 0 1px #d8ad5833}.download-card strong{font-size:14px}.download-card span{margin-top:4px;color:#92989d;font-size:11px}.badge{display:none;position:absolute;right:10px;top:9px;color:#e7c67e;font-size:10px;font-weight:800}.recommended .badge{display:block}
+    .security-note{display:block;margin-top:16px;color:#777d82;font-size:11px;line-height:1.6}.security-note a{color:#bda66d}.manual-release{margin-top:8px!important;color:#6f757a!important;font-size:11px}noscript{display:block;margin-top:18px;color:#d8ad58}
+    @media(max-width:560px){main{padding:30px 20px}.download-list{grid-template-columns:1fr}}
   </style>
 </head>
-<body><main><div class="mark">车</div><h1>正在唤起可信拼车</h1><p>客户端会自动确认这辆车，无需再输入上车码。</p><span class="code">${code}</span><a href="${deepLink}">打开可信拼车并上车</a><small>如果没有自动打开，请点击上面的按钮。只加入你认识并信任的人发起的车队。</small></main></body>
+<body>
+  <main>
+    <div class="mark">车</div>
+    <h1>正在唤起可信拼车</h1>
+    <p>客户端会自动确认这辆车，无需再输入上车码。</p>
+    <span class="code">${code}</span>
+    <a id="open-client" class="open-client" href="${deepLink}">打开可信拼车并上车</a>
+    <p id="client-status" class="status" role="status" aria-live="polite">正在检测本机客户端并尝试打开…</p>
+    <section id="downloads" class="downloads" hidden>
+      <h2 id="download-title">没有看到客户端打开？</h2>
+      <p id="download-copy" class="download-copy">已按当前系统标出推荐安装包。安装后重新打开本页面即可继续上车。</p>
+      <div class="download-list">
+        <a class="download-card" data-platform="windows" href="${downloads.windows}" target="_blank" rel="noopener noreferrer"><span class="badge">推荐</span><strong>Windows x64</strong><span>NSIS 安装程序 · .exe</span></a>
+        <a class="download-card" data-platform="macos" href="${downloads.macos}" target="_blank" rel="noopener noreferrer"><span class="badge">推荐</span><strong>macOS 通用版</strong><span>Intel + Apple 芯片 · .dmg</span></a>
+        <a class="download-card" data-platform="linux" href="${downloads.appImage}" target="_blank" rel="noopener noreferrer"><span class="badge">推荐</span><strong>Linux x64 AppImage</strong><span>免安装便携版</span></a>
+        <a class="download-card" data-platform="linux" href="${downloads.deb}" target="_blank" rel="noopener noreferrer"><span class="badge">推荐</span><strong>Debian / Ubuntu x64</strong><span>DEB 软件包</span></a>
+      </div>
+      <small class="security-note">当前为未签名手动版 v${releaseVersion}。请只从本项目 GitHub 下载，并用 <a href="${downloads.checksums}" target="_blank" rel="noopener noreferrer">SHA256SUMS.txt</a> 核对文件；不要关闭系统安全防护。</small>
+      <p class="manual-release"><a href="${downloads.release}" target="_blank" rel="noopener noreferrer">查看全部平台与安装说明</a></p>
+    </section>
+    <noscript>浏览器未启用 JavaScript。请先点击“打开可信拼车”，未安装时前往 <a href="${downloads.release}">GitHub Release</a> 下载客户端。</noscript>
+    <small class="security-note">只加入你认识并信任的人发起的车队。</small>
+  </main>
+  <script nonce="${scriptNonce}">
+    (() => {
+      const deepLink = ${JSON.stringify(deepLink)};
+      const status = document.getElementById('client-status');
+      const downloads = document.getElementById('downloads');
+      const title = document.getElementById('download-title');
+      const copy = document.getElementById('download-copy');
+      const openClient = document.getElementById('open-client');
+      let fallbackTimer = null;
+
+      function detectPlatform() {
+        const userAgentDataPlatform = navigator.userAgentData && navigator.userAgentData.platform
+          ? navigator.userAgentData.platform
+          : '';
+        const platformHint = [userAgentDataPlatform, navigator.platform || '', navigator.userAgent || '']
+          .join(' ')
+          .toLowerCase();
+        if (
+          /android|iphone|ipad|ipod/.test(platformHint)
+          || ((navigator.maxTouchPoints || 0) > 1 && /macintosh|macintel/.test(platformHint))
+        ) return 'mobile';
+        if (/windows|win32|win64/.test(platformHint)) return 'windows';
+        if (/macintosh|macintel|mac os x|macos/.test(platformHint)) return 'macos';
+        if (/linux|x11/.test(platformHint)) {
+          return /aarch64|arm64|armv8/.test(platformHint) ? 'linux-arm' : 'linux';
+        }
+        return 'other';
+      }
+
+      const platform = detectPlatform();
+
+      function revealDownloads() {
+        if (document.hidden) return;
+        downloads.hidden = false;
+        document.querySelectorAll('[data-platform]').forEach(card => {
+          card.classList.toggle('recommended', card.dataset.platform === platform);
+        });
+        if (platform === 'windows') {
+          title.textContent = '未检测到客户端，下载 Windows 版';
+          copy.textContent = '推荐 Windows x64 安装程序。安装完成后重新打开上车链接。';
+        } else if (platform === 'macos') {
+          title.textContent = '未检测到客户端，下载 macOS 版';
+          copy.textContent = '通用 DMG 同时支持 Apple 芯片和 Intel Mac。';
+        } else if (platform === 'linux') {
+          title.textContent = '未检测到客户端，下载 Linux 版';
+          copy.textContent = '优先选择 AppImage；Debian 或 Ubuntu 也可使用 DEB。';
+        } else if (platform === 'linux-arm') {
+          title.textContent = '暂未提供 Linux ARM 安装包';
+          copy.textContent = '当前公开安装包仅支持 Linux x64；请勿下载架构不匹配的文件。';
+        } else if (platform === 'mobile') {
+          title.textContent = '请在电脑上打开上车链接';
+          copy.textContent = '可信拼车当前支持 Windows、macOS 和 Linux 桌面系统。';
+        } else {
+          title.textContent = '选择你的电脑系统';
+          copy.textContent = '未能识别当前系统，请手动选择对应安装包。';
+        }
+        status.textContent = platform === 'mobile'
+          ? '当前手机系统没有对应客户端。'
+          : '没有看到客户端打开时，请下载安装后重试。';
+      }
+
+      function scheduleFallback() {
+        if (fallbackTimer !== null) window.clearTimeout(fallbackTimer);
+        fallbackTimer = window.setTimeout(revealDownloads, 1800);
+      }
+
+      function markClientOpened() {
+        if (fallbackTimer !== null) window.clearTimeout(fallbackTimer);
+        downloads.hidden = true;
+        status.textContent = '已向本机客户端发送上车请求。';
+      }
+
+      document.addEventListener('visibilitychange', () => {
+        if (document.hidden) markClientOpened();
+      });
+      window.addEventListener('pagehide', markClientOpened);
+      openClient.addEventListener('click', scheduleFallback);
+
+      if (platform === 'mobile') {
+        revealDownloads();
+      } else {
+        window.setTimeout(() => {
+          scheduleFallback();
+          window.location.href = deepLink;
+        }, 120);
+      }
+    })();
+  </script>
+</body>
 </html>`;
 }
 
@@ -261,6 +408,9 @@ function createCoordinator(options = {}) {
   const pollPeerRateLimit = options.pollPeerRateLimit ?? DEFAULT_POLL_PEER_RATE_LIMIT;
   const turnRateLimit = options.turnRateLimit ?? DEFAULT_TURN_RATE_LIMIT;
   const maxInvitesPerOwner = options.maxInvitesPerOwner ?? MAX_INVITES_PER_OWNER;
+  const configuredDesktopReleaseVersion = desktopReleaseVersion(
+    options.desktopReleaseVersion ?? process.env.TRUSTED_CARPOOL_DESKTOP_RELEASE_VERSION
+  );
   const turnSecret = options.turnSecret ?? process.env.TRUSTED_CARPOOL_TURN_SECRET ?? '';
   const turnUrls = options.turnUrls ?? parseTurnUrls(process.env.TRUSTED_CARPOOL_TURN_URLS);
   const configuredTurnTtl = Number(
@@ -356,7 +506,16 @@ function createCoordinator(options = {}) {
         return error(res, 429, 'too many join link lookups', { 'retry-after': '60' });
       }
       if (!invites.has(joinMatch[1])) return error(res, 404, 'invite not found or expired');
-      return html(res, 200, joinPage(joinMatch[1]));
+      const scriptNonce = crypto.randomBytes(18).toString('base64');
+      return html(
+        res,
+        200,
+        joinPage(joinMatch[1], {
+          releaseVersion: configuredDesktopReleaseVersion,
+          scriptNonce,
+        }),
+        { scriptNonce }
+      );
     }
 
     if (req.method === 'POST' && url.pathname === '/api/v1/carpool/invites') {
@@ -472,6 +631,8 @@ module.exports = {
   canonicalPoll,
   canonicalTurnCredentials,
   createCoordinator,
+  desktopDownloadUrls,
+  desktopReleaseVersion,
   joinPage,
   peerIdFromPublicKey,
   turnRestCredentials,

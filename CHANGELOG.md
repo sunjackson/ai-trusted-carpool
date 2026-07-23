@@ -4,6 +4,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- 上车链接页面会先尝试唤起 `trusted-carpool://` 本机客户端；未观察到客户端打开时，自动识别 Windows、macOS、Linux 或移动端，并提供对应的固定官方 GitHub Release 安装包、SHA-256 清单及手动平台选择。
+- 下载推荐脚本使用每次请求生成的 CSP nonce，下载目标固定为本项目的校验版本；自建协调器可通过 `TRUSTED_CARPOOL_DESKTOP_RELEASE_VERSION` 选择已发布的 `X.Y.Z` 客户端版本。
+
 ## [0.0.7] - 2026-07-23
 
 ### Fixed
