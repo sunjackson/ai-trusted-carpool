@@ -29,7 +29,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
-x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
+x25519-dalek = { version = "3", default-features = false, features = ["static_secrets"] }
 flate2 = "1.1.9"
 tar = "0.4.46"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
