@@ -3,8 +3,11 @@ use crate::models::ToolKind;
 use base64::{engine::general_purpose, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::env;
+use std::net::SocketAddr;
 
 const DEFAULT_COORDINATOR_URL: &str = "https://p2p.cnaigc.ai";
+const OFFICIAL_COORDINATOR_HOST: &str = "p2p.cnaigc.ai";
+const OFFICIAL_COORDINATOR_IP: [u8; 4] = [192, 220, 24, 20];
 const MESSAGE_TTL_MS: i64 = 120_000;
 
 fn now_ms() -> i64 {
@@ -189,6 +192,7 @@ pub struct CoordinatorClient {
     base_url: String,
     trusted_host: String,
     client: reqwest::Client,
+    fallback_client: Option<reqwest::Client>,
 }
 
 impl CoordinatorClient {
@@ -210,14 +214,69 @@ impl CoordinatorClient {
             .ok()
             .and_then(|parsed| parsed.host_str().map(str::to_ascii_lowercase))
             .ok_or_else(|| "协调服务地址缺少有效域名".to_string())?;
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .map_err(|error| format!("无法创建协调服务客户端: {error}"))?;
+        let fallback_client = url::Url::parse(base_url)
+            .ok()
+            .filter(|parsed| {
+                parsed.scheme().eq_ignore_ascii_case("https")
+                    && parsed.host_str() == Some(OFFICIAL_COORDINATOR_HOST)
+                    && parsed.port_or_known_default() == Some(443)
+            })
+            .map(|_| {
+                reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(10))
+                    .resolve(
+                        OFFICIAL_COORDINATOR_HOST,
+                        SocketAddr::from((OFFICIAL_COORDINATOR_IP, 443)),
+                    )
+                    .build()
+            })
+            .transpose()
+            .map_err(|error| format!("无法创建协调服务备用客户端: {error}"))?;
         Ok(Self {
             base_url: base_url.to_string(),
             trusted_host,
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(10))
-                .build()
-                .map_err(|error| format!("无法创建协调服务客户端: {error}"))?,
+            client,
+            fallback_client,
         })
+    }
+
+    /// Sends a request through the normal system DNS/proxy path first. A
+    /// connection-level failure on the exact official HTTPS endpoint may be
+    /// retried against its pinned IP while retaining the hostname in the URL
+    /// so TLS SNI and certificate validation remain unchanged.
+    async fn send_request(
+        &self,
+        builder: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, reqwest::Error> {
+        let request = builder.build()?;
+        let fallback_request = request.try_clone();
+        match self.client.execute(request).await {
+            Ok(response) => Ok(response),
+            Err(error) if error.is_connect() => {
+                let Some(fallback_client) = self.fallback_client.as_ref() else {
+                    return Err(error);
+                };
+                let Some(fallback_request) = fallback_request else {
+                    return Err(error);
+                };
+                match fallback_client.execute(fallback_request).await {
+                    Ok(response) => {
+                        crate::diagnostics::record(
+                            "info",
+                            "coordinator",
+                            "official coordinator DNS fallback used",
+                        );
+                        Ok(response)
+                    }
+                    Err(fallback_error) => Err(fallback_error),
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
 
     async fn response_error(response: reqwest::Response) -> String {
@@ -229,6 +288,23 @@ impl CoordinatorClient {
             .and_then(|body| body.error)
             .unwrap_or_else(|| status.to_string());
         format!("协调服务请求失败 ({status}): {detail}")
+    }
+
+    fn request_error(action: &str, error: &reqwest::Error) -> String {
+        let reason = if error.is_connect() {
+            "连接建立失败"
+        } else if error.is_timeout() {
+            "请求超时"
+        } else if error.is_request() {
+            "请求无法发送"
+        } else if error.is_body() {
+            "请求正文传输失败"
+        } else if error.is_decode() {
+            "响应格式无效"
+        } else {
+            "网络请求失败"
+        };
+        format!("{action}: {reason}")
     }
 
     pub fn build_invite_with_lease(
@@ -271,12 +347,13 @@ impl CoordinatorClient {
 
     pub async fn register_invite(&self, invite: &InviteRegistration) -> Result<(), String> {
         let response = self
-            .client
-            .post(format!("{}/api/v1/carpool/invites", self.base_url))
-            .json(invite)
-            .send()
+            .send_request(
+                self.client
+                    .post(format!("{}/api/v1/carpool/invites", self.base_url))
+                    .json(invite),
+            )
             .await
-            .map_err(|error| format!("无法连接协调服务: {error}"))?;
+            .map_err(|error| Self::request_error("无法连接协调服务", &error))?;
         if response.status().is_success() {
             Ok(())
         } else {
@@ -289,11 +366,12 @@ impl CoordinatorClient {
         code: &str,
     ) -> Result<(PublicInvitePayload, PublicIdentity), String> {
         let response = self
-            .client
-            .get(format!("{}/api/v1/carpool/invites/{}", self.base_url, code))
-            .send()
+            .send_request(
+                self.client
+                    .get(format!("{}/api/v1/carpool/invites/{}", self.base_url, code)),
+            )
             .await
-            .map_err(|error| format!("无法连接协调服务: {error}"))?;
+            .map_err(|error| Self::request_error("无法连接协调服务", &error))?;
         if !response.status().is_success() {
             return Err(Self::response_error(response).await);
         }
@@ -379,12 +457,13 @@ impl CoordinatorClient {
             signature,
         };
         let response = self
-            .client
-            .post(format!("{}/api/v1/carpool/messages", self.base_url))
-            .json(&input)
-            .send()
+            .send_request(
+                self.client
+                    .post(format!("{}/api/v1/carpool/messages", self.base_url))
+                    .json(&input),
+            )
             .await
-            .map_err(|error| format!("无法发送协调消息: {error}"))?;
+            .map_err(|error| Self::request_error("无法发送协调消息", &error))?;
         if response.status().is_success() {
             Ok(())
         } else {
@@ -466,12 +545,13 @@ impl CoordinatorClient {
             signature,
         };
         let response = self
-            .client
-            .post(format!("{}/api/v1/carpool/messages/poll", self.base_url))
-            .json(&input)
-            .send()
+            .send_request(
+                self.client
+                    .post(format!("{}/api/v1/carpool/messages/poll", self.base_url))
+                    .json(&input),
+            )
             .await
-            .map_err(|error| format!("无法轮询协调消息: {error}"))?;
+            .map_err(|error| Self::request_error("无法轮询协调消息", &error))?;
         if !response.status().is_success() {
             return Err(Self::response_error(response).await);
         }
@@ -501,12 +581,13 @@ impl CoordinatorClient {
             signature,
         };
         let response = self
-            .client
-            .post(format!("{}/api/v1/turn-credentials", self.base_url))
-            .json(&input)
-            .send()
+            .send_request(
+                self.client
+                    .post(format!("{}/api/v1/turn-credentials", self.base_url))
+                    .json(&input),
+            )
             .await
-            .map_err(|error| format!("无法获取 TURN 中继凭据: {error}"))?;
+            .map_err(|error| Self::request_error("无法获取 TURN 中继凭据", &error))?;
         let credentials = if response.status().is_success() {
             response
                 .json::<TurnCredentialsResponse>()
@@ -519,12 +600,13 @@ impl CoordinatorClient {
             // Transition: older coordinators only accept unsigned GET.
             drop(response);
             let legacy = self
-                .client
-                .get(format!("{}/api/v1/turn-credentials", self.base_url))
-                .query(&[("peer_id", public.peer_id.as_str())])
-                .send()
+                .send_request(
+                    self.client
+                        .get(format!("{}/api/v1/turn-credentials", self.base_url))
+                        .query(&[("peer_id", public.peer_id.as_str())]),
+                )
                 .await
-                .map_err(|error| format!("无法获取 TURN 中继凭据: {error}"))?;
+                .map_err(|error| Self::request_error("无法获取 TURN 中继凭据", &error))?;
             if !legacy.status().is_success() {
                 return Err(Self::response_error(legacy).await);
             }
@@ -591,15 +673,163 @@ pub(crate) fn signed_test_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     fn now_ms() -> i64 {
         super::now_ms()
+    }
+
+    async fn serve_once(
+        status: u16,
+        body: &'static str,
+    ) -> (SocketAddr, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener");
+        let address = listener.local_addr().expect("test address");
+        let requests = Arc::new(AtomicUsize::new(0));
+        let request_count = Arc::clone(&requests);
+        let task = tokio::spawn(async move {
+            let accepted =
+                tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept()).await;
+            let Ok(Ok((mut stream, _))) = accepted else {
+                return;
+            };
+            request_count.fetch_add(1, Ordering::Relaxed);
+            let mut request_bytes = [0_u8; 4096];
+            let _ = stream.read(&mut request_bytes).await;
+            let response = format!(
+                "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+        (address, requests, task)
+    }
+
+    fn test_http_client(host: &str, address: SocketAddr) -> reqwest::Client {
+        reqwest::Client::builder()
+            .no_proxy()
+            .resolve(host, address)
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .expect("test client")
+    }
+
+    fn test_coordinator(
+        port: u16,
+        primary: reqwest::Client,
+        fallback: Option<reqwest::Client>,
+    ) -> CoordinatorClient {
+        CoordinatorClient {
+            base_url: format!("http://p2p.cnaigc.ai:{port}"),
+            trusted_host: OFFICIAL_COORDINATOR_HOST.to_string(),
+            client: primary,
+            fallback_client: fallback,
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_failure_uses_only_the_configured_fallback_client() {
+        let (address, requests, server) = serve_once(200, "ok").await;
+        let port = address.port();
+        let primary = test_http_client(
+            OFFICIAL_COORDINATOR_HOST,
+            SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], port)),
+        );
+        let fallback = test_http_client(OFFICIAL_COORDINATOR_HOST, address);
+        let client = test_coordinator(port, primary, Some(fallback));
+
+        let response = client
+            .send_request(client.client.get(format!("{}/health", client.base_url)))
+            .await
+            .expect("fallback response");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        server.await.expect("server task");
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn successful_primary_response_does_not_touch_fallback() {
+        let (primary_address, primary_requests, primary_server) = serve_once(200, "primary").await;
+        let (fallback_address, fallback_requests, fallback_server) =
+            serve_once(200, "fallback").await;
+        let port = primary_address.port();
+        let primary = test_http_client(OFFICIAL_COORDINATOR_HOST, primary_address);
+        let fallback = test_http_client(OFFICIAL_COORDINATOR_HOST, fallback_address);
+        let client = test_coordinator(port, primary, Some(fallback));
+
+        let response = client
+            .send_request(client.client.get(format!("{}/health", client.base_url)))
+            .await
+            .expect("primary response");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        primary_server.await.expect("primary task");
+        fallback_server.await.expect("fallback task");
+        assert_eq!(primary_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(fallback_requests.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn http_error_does_not_retry_a_non_idempotent_request() {
+        let (primary_address, primary_requests, primary_server) = serve_once(500, "error").await;
+        let (fallback_address, fallback_requests, fallback_server) =
+            serve_once(200, "fallback").await;
+        let port = primary_address.port();
+        let primary = test_http_client(OFFICIAL_COORDINATOR_HOST, primary_address);
+        let fallback = test_http_client(OFFICIAL_COORDINATOR_HOST, fallback_address);
+        let client = test_coordinator(port, primary, Some(fallback));
+
+        let response = client
+            .send_request(
+                client
+                    .client
+                    .post(format!("{}/api/v1/carpool/invites", client.base_url))
+                    .body("payload"),
+            )
+            .await
+            .expect("primary error response");
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        primary_server.await.expect("primary task");
+        fallback_server.await.expect("fallback task");
+        assert_eq!(primary_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(fallback_requests.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn request_errors_do_not_expose_urls_or_invite_codes() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve test port");
+        let port = listener.local_addr().expect("reserved address").port();
+        let client = test_http_client(
+            OFFICIAL_COORDINATOR_HOST,
+            SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], port)),
+        );
+        let error = client
+            .get(format!(
+                "http://{OFFICIAL_COORDINATOR_HOST}:{port}/api/v1/carpool/invites/7G2K5LQ8M4TZ"
+            ))
+            .send()
+            .await
+            .expect_err("connection must fail");
+        let message = CoordinatorClient::request_error("无法连接协调服务", &error);
+        assert!(!message.contains("http"));
+        assert!(!message.contains(OFFICIAL_COORDINATOR_HOST));
+        assert!(!message.contains("7G2K5LQ8M4TZ"));
     }
 
     #[test]
     fn trusted_turn_host_is_derived_from_the_configured_coordinator_url() {
         let official = CoordinatorClient::new("https://p2p.cnaigc.ai").expect("official client");
         assert_eq!(official.trusted_host, "p2p.cnaigc.ai");
+        assert!(official.fallback_client.is_some());
         assert!(turn_url_matches_host(
             "turn:p2p.cnaigc.ai:3478?transport=udp",
             &official.trusted_host
@@ -612,6 +842,7 @@ mod tests {
         let self_hosted =
             CoordinatorClient::new("https://carpool.example.org").expect("self-hosted client");
         assert_eq!(self_hosted.trusted_host, "carpool.example.org");
+        assert!(self_hosted.fallback_client.is_none());
         assert!(turn_url_matches_host(
             "turn:carpool.example.org:3478?transport=udp",
             &self_hosted.trusted_host
@@ -621,6 +852,14 @@ mod tests {
             &self_hosted.trusted_host
         ));
 
+        assert!(CoordinatorClient::new("https://p2p.cnaigc.ai:444")
+            .expect("custom port")
+            .fallback_client
+            .is_none());
+        assert!(CoordinatorClient::new("https://p2p.cnaigc.ai.evil.example")
+            .expect("similar host")
+            .fallback_client
+            .is_none());
         assert!(CoordinatorClient::new("https://").is_err());
     }
 

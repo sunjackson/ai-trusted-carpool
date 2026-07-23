@@ -310,11 +310,11 @@ mod startup_tests {
     use super::*;
 
     #[test]
-    fn main_window_waits_on_a_dark_boot_surface_instead_of_showing_blank() {
+    fn main_window_presents_a_dark_boot_surface_immediately() {
         let config: serde_json::Value =
             serde_json::from_str(include_str!("../tauri.conf.json")).expect("tauri config");
         let window = &config["app"]["windows"][0];
-        assert_eq!(window["visible"], false);
+        assert_eq!(window["visible"], true);
         assert_eq!(window["backgroundColor"], "#0f1115");
 
         let html = include_str!("../../index.html");
