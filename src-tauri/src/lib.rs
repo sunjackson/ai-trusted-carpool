@@ -48,12 +48,48 @@ use diagnostics::{
 };
 use relay::RelayBridge;
 use runtime::RuntimeState;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 use tauri::webview::PageLoadEvent;
-use tauri::Manager;
+use tauri::{AppHandle, Manager, State};
 use tauri_plugin_deep_link::DeepLinkExt;
 
 fn should_show_main_window(label: &str, event: PageLoadEvent) -> bool {
     label == "main" && event == PageLoadEvent::Finished
+}
+
+#[derive(Clone, Default)]
+struct StartupState {
+    frontend_ready: Arc<AtomicBool>,
+    presentation_allowed: Arc<AtomicBool>,
+}
+
+impl StartupState {
+    fn mark_frontend_ready(&self) -> bool {
+        !self.frontend_ready.swap(true, Ordering::AcqRel)
+    }
+
+    fn is_frontend_ready(&self) -> bool {
+        self.frontend_ready.load(Ordering::Acquire)
+    }
+
+    fn allow_window_presentation(&self) {
+        self.presentation_allowed.store(true, Ordering::Release);
+    }
+
+    fn is_window_presentation_allowed(&self) -> bool {
+        self.presentation_allowed.load(Ordering::Acquire)
+    }
+}
+
+#[tauri::command]
+fn mark_frontend_ready(app: AppHandle, startup: State<'_, StartupState>) {
+    if startup.mark_frontend_ready() {
+        diagnostics::record("info", "runtime", "frontend committed its first render");
+    }
+    startup.allow_window_presentation();
+    join_link::show_main_window(&app);
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -61,8 +97,10 @@ pub fn run() {
     diagnostics::record("info", "runtime", "application starting");
     let state = RuntimeState::default();
     let updater_state = AppUpdaterState::default();
+    let startup_state = StartupState::default();
     let setup_state = state.clone();
     let single_instance_state = state.clone();
+    let page_load_startup_state = startup_state.clone();
     let builder = tauri::Builder::default();
     #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
     let builder = builder
@@ -75,17 +113,31 @@ pub fn run() {
             },
         ));
     builder
-        .on_page_load(|webview, payload| {
+        .on_page_load(move |webview, payload| {
             if should_show_main_window(webview.label(), payload.event()) {
-                join_link::show_main_window(webview.app_handle());
                 diagnostics::record("info", "runtime", "main window finished loading");
+                let app = webview.app_handle().clone();
+                let startup = page_load_startup_state.clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(1_500)).await;
+                    if !startup.is_frontend_ready() {
+                        diagnostics::record(
+                            "warn",
+                            "runtime",
+                            "frontend ready signal timed out; showing packaged boot surface",
+                        );
+                        startup.allow_window_presentation();
+                        join_link::show_main_window(&app);
+                    }
+                });
             }
         })
         .plugin(tauri_plugin_deep_link::init())
         .manage(state)
         .manage(updater_state)
+        .manage(startup_state)
         .setup(move |app| {
-            client_launcher::recover_stale(app.handle()).map_err(std::io::Error::other)?;
+            diagnostics::record("info", "runtime", "backend setup started");
             let app_data_dir = app.path().app_data_dir().map_err(std::io::Error::other)?;
             diagnostics::configure(&app_data_dir).map_err(std::io::Error::other)?;
             let history_path = app_data_dir.join("usage-history.jsonl");
@@ -189,16 +241,20 @@ pub fn run() {
                 );
             }
 
-            if let Some(urls) = app
-                .deep_link()
-                .get_current()
-                .map_err(std::io::Error::other)?
-            {
-                join_link::accept_urls(
-                    app.handle(),
-                    &setup_state,
-                    urls.iter().map(ToString::to_string),
-                );
+            match app.deep_link().get_current() {
+                Ok(Some(urls)) => {
+                    join_link::accept_urls(
+                        app.handle(),
+                        &setup_state,
+                        urls.iter().map(ToString::to_string),
+                    );
+                }
+                Ok(None) => {}
+                Err(error) => diagnostics::record(
+                    "warn",
+                    "deep-link",
+                    format!("startup deep-link lookup is unavailable: {error}"),
+                ),
             }
             let open_state = setup_state.clone();
             let open_app = app.handle().clone();
@@ -209,6 +265,24 @@ pub fn run() {
                     event.urls().iter().map(ToString::to_string),
                 );
             });
+
+            let recovery_app = app.handle().clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                diagnostics::record("info", "client-launcher", "stale client recovery started");
+                match client_launcher::recover_stale(&recovery_app) {
+                    Ok(()) => diagnostics::record(
+                        "info",
+                        "client-launcher",
+                        "stale client recovery finished",
+                    ),
+                    Err(error) => diagnostics::record(
+                        "warn",
+                        "client-launcher",
+                        format!("stale client recovery deferred: {error}"),
+                    ),
+                }
+            });
+            diagnostics::record("info", "runtime", "backend setup finished");
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -264,6 +338,7 @@ pub fn run() {
             record_frontend_log,
             open_debug_log_directory,
             export_diagnostic_bundle,
+            mark_frontend_ready,
             join_link::take_pending_join_code
         ])
         .build(tauri::generate_context!())
@@ -310,12 +385,16 @@ mod startup_tests {
     use super::*;
 
     #[test]
-    fn main_window_presents_a_dark_boot_surface_immediately() {
+    fn main_window_waits_until_the_webview_is_ready_instead_of_showing_blank() {
         let config: serde_json::Value =
             serde_json::from_str(include_str!("../tauri.conf.json")).expect("tauri config");
         let window = &config["app"]["windows"][0];
-        assert_eq!(window["visible"], true);
+        assert_eq!(window["visible"], false);
         assert_eq!(window["backgroundColor"], "#0f1115");
+        assert_eq!(
+            config["bundle"]["windows"]["webviewInstallMode"]["type"],
+            "downloadBootstrapper"
+        );
 
         let html = include_str!("../../index.html");
         assert!(html.contains("id=\"boot-splash\""));
@@ -327,5 +406,14 @@ mod startup_tests {
             PageLoadEvent::Finished
         ));
         assert!(should_show_main_window("main", PageLoadEvent::Finished));
+
+        let startup = StartupState::default();
+        assert!(!startup.is_frontend_ready());
+        assert!(!startup.is_window_presentation_allowed());
+        assert!(startup.mark_frontend_ready());
+        startup.allow_window_presentation();
+        assert!(startup.is_frontend_ready());
+        assert!(startup.is_window_presentation_allowed());
+        assert!(!startup.mark_frontend_ready());
     }
 }

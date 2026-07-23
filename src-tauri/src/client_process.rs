@@ -1,12 +1,33 @@
 use crate::models::ToolKind;
 use std::fs;
+#[cfg(any(target_os = "windows", test))]
+use std::io::{Read, Result as IoResult};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-use std::{thread, time::Duration};
+#[cfg(any(target_os = "windows", test))]
+use std::process::{Child, Output, Stdio};
+#[cfg(any(target_os = "windows", test))]
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
+#[cfg(any(target_os = "windows", test))]
+use std::time::Instant;
 
 #[cfg(target_os = "windows")]
 use serde_json::Value;
+#[cfg(target_os = "windows")]
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+    SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+};
+
+#[cfg(target_os = "windows")]
+const WINDOWS_PROCESS_QUERY_TIMEOUT: Duration = Duration::from_secs(8);
+#[cfg(target_os = "windows")]
+const WINDOWS_PROCESS_ACTION_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProcessInfo {
@@ -63,31 +84,51 @@ pub(crate) fn canonical_path_key(path: &Path) -> String {
 fn hide_console_window(command: &mut Command) {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    command.creation_flags(CREATE_NO_WINDOW);
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    command.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
 }
 
 #[cfg(target_os = "windows")]
-pub(crate) fn terminate_process(pid: u32) {
+pub(crate) fn terminate_process(pid: u32) -> Result<(), String> {
     let mut command = Command::new("taskkill.exe");
     command.args(["/PID", &pid.to_string(), "/T", "/F"]);
     hide_console_window(&mut command);
-    let _ = command.status();
+    match command_output_with_timeout(&mut command, WINDOWS_PROCESS_ACTION_TIMEOUT)
+        .map_err(|error| format!("无法结束拼车客户端进程: {error}"))?
+    {
+        Some(output) if output.status.success() => Ok(()),
+        Some(_) => Err("系统拒绝结束拼车客户端进程".to_string()),
+        None => Err("结束拼车客户端进程超时".to_string()),
+    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-pub(crate) fn terminate_process(pid: u32) {
+pub(crate) fn terminate_process(pid: u32) -> Result<(), String> {
     let pid_text = pid.to_string();
-    let _ = Command::new("kill").args(["-TERM", &pid_text]).status();
+    let status = Command::new("kill")
+        .args(["-TERM", &pid_text])
+        .status()
+        .map_err(|error| format!("无法结束拼车客户端进程: {error}"))?;
+    if !status.success() {
+        return Err("系统拒绝结束拼车客户端进程".to_string());
+    }
     for _ in 0..5 {
         thread::sleep(Duration::from_millis(100));
         if list_processes()
             .map(|processes| processes.iter().all(|process| process.pid != pid))
             .unwrap_or(true)
         {
-            return;
+            return Ok(());
         }
     }
-    let _ = Command::new("kill").args(["-KILL", &pid_text]).status();
+    let status = Command::new("kill")
+        .args(["-KILL", &pid_text])
+        .status()
+        .map_err(|error| format!("无法强制结束拼车客户端进程: {error}"))?;
+    status
+        .success()
+        .then_some(())
+        .ok_or_else(|| "系统拒绝强制结束拼车客户端进程".to_string())
 }
 
 #[cfg(target_os = "macos")]
@@ -115,15 +156,14 @@ pub(crate) fn focus_process(pid: u32) -> Result<(), String> {
     let mut command = Command::new("powershell.exe");
     command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
     hide_console_window(&mut command);
-    command
-        .status()
-        .map_err(|error| format!("无法定位拼车客户端窗口: {error}"))
-        .and_then(|status| {
-            status
-                .success()
-                .then_some(())
-                .ok_or_else(|| "暂时无法定位拼车客户端窗口".to_string())
-        })
+    let output = command_output_with_timeout(&mut command, WINDOWS_PROCESS_ACTION_TIMEOUT)
+        .map_err(|error| format!("无法定位拼车客户端窗口: {error}"))?
+        .ok_or_else(|| "定位拼车客户端窗口超时".to_string())?;
+    output
+        .status
+        .success()
+        .then_some(())
+        .ok_or_else(|| "暂时无法定位拼车客户端窗口".to_string())
 }
 
 #[cfg(target_os = "linux")]
@@ -226,13 +266,191 @@ pub(crate) fn list_processes() -> Result<Vec<ProcessInfo>, String> {
     let mut command = Command::new("powershell.exe");
     command.args(["-NoProfile", "-NonInteractive", "-Command", script]);
     hide_console_window(&mut command);
-    let output = command
-        .output()
-        .map_err(|error| format!("无法读取进程列表: {error}"))?;
+    let output = command_output_with_timeout(&mut command, WINDOWS_PROCESS_QUERY_TIMEOUT)
+        .map_err(|error| format!("无法读取进程列表: {error}"))?
+        .ok_or_else(|| "读取进程列表超时".to_string())?;
     if !output.status.success() {
         return Err("无法读取进程列表".to_string());
     }
     parse_windows_processes(&output.stdout)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn read_pipe(mut pipe: impl Read) -> IoResult<Vec<u8>> {
+    let mut bytes = Vec::new();
+    pipe.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn remaining_timeout(started: Instant, timeout: Duration) -> Option<Duration> {
+    timeout.checked_sub(started.elapsed())
+}
+
+#[cfg(target_os = "windows")]
+struct WindowsProcessJob(OwnedHandle);
+
+#[cfg(target_os = "windows")]
+impl WindowsProcessJob {
+    fn assign(child: &Child) -> IoResult<Self> {
+        // SAFETY: null security/name pointers request a private job with default
+        // security. The returned owned handle is closed exactly once.
+        let raw = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if raw.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: CreateJobObjectW returned a new owned HANDLE.
+        let job = unsafe { OwnedHandle::from_raw_handle(raw) };
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // SAFETY: the information pointer and byte length describe `limits`,
+        // which remains alive for the duration of the call.
+        if unsafe {
+            SetInformationJobObject(
+                job.as_raw_handle(),
+                JobObjectExtendedLimitInformation,
+                std::ptr::from_ref(&limits).cast(),
+                std::mem::size_of_val(&limits) as u32,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: both handles are valid for the duration of the call.
+        if unsafe { AssignProcessToJobObject(job.as_raw_handle(), child.as_raw_handle()) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self(job))
+    }
+
+    fn terminate(&self) {
+        // SAFETY: the job handle is owned by `self` and stays valid here.
+        let _ = unsafe { TerminateJobObject(self.0.as_raw_handle(), 1) };
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn finish_child_in_background(mut child: Child) {
+    thread::spawn(move || {
+        #[cfg(target_os = "windows")]
+        {
+            let mut command = Command::new("taskkill.exe");
+            command.args(["/PID", &child.id().to_string(), "/T", "/F"]);
+            hide_console_window(&mut command);
+            let _ = command.status();
+        }
+        #[cfg(all(test, unix))]
+        {
+            let mut command = Command::new("kill");
+            command
+                .args(["-KILL", &format!("-{}", child.id())])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let _ = command.status();
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    });
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn command_output_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+) -> IoResult<Option<Output>> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(all(test, unix))]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command.spawn()?;
+    #[cfg(target_os = "windows")]
+    let process_job = match WindowsProcessJob::assign(&child) {
+        Ok(job) => job,
+        Err(error) => {
+            finish_child_in_background(child);
+            return Err(error);
+        }
+    };
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("child stdout is unavailable"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| std::io::Error::other("child stderr is unavailable"))?;
+    let (stdout_sender, stdout_receiver) = mpsc::sync_channel(1);
+    let (stderr_sender, stderr_receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let _ = stdout_sender.send(read_pipe(stdout));
+    });
+    thread::spawn(move || {
+        let _ = stderr_sender.send(read_pipe(stderr));
+    });
+    let started = Instant::now();
+
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(error) => {
+                finish_child_in_background(child);
+                return Err(error);
+            }
+        }
+        if started.elapsed() >= timeout {
+            #[cfg(target_os = "windows")]
+            process_job.terminate();
+            finish_child_in_background(child);
+            return Ok(None);
+        }
+        thread::sleep(Duration::from_millis(25));
+    };
+
+    let Some(remaining) = remaining_timeout(started, timeout) else {
+        #[cfg(target_os = "windows")]
+        process_job.terminate();
+        finish_child_in_background(child);
+        return Ok(None);
+    };
+    let stdout = match stdout_receiver.recv_timeout(remaining) {
+        Ok(result) => result?,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            #[cfg(target_os = "windows")]
+            process_job.terminate();
+            finish_child_in_background(child);
+            return Ok(None);
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            return Err(std::io::Error::other("child stdout reader disconnected"));
+        }
+    };
+    let Some(remaining) = remaining_timeout(started, timeout) else {
+        #[cfg(target_os = "windows")]
+        process_job.terminate();
+        finish_child_in_background(child);
+        return Ok(None);
+    };
+    let stderr = match stderr_receiver.recv_timeout(remaining) {
+        Ok(result) => result?,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            #[cfg(target_os = "windows")]
+            process_job.terminate();
+            finish_child_in_background(child);
+            return Ok(None);
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            return Err(std::io::Error::other("child stderr reader disconnected"));
+        }
+    };
+
+    Ok(Some(Output {
+        status,
+        stdout,
+        stderr,
+    }))
 }
 
 #[cfg(target_os = "windows")]
@@ -264,4 +482,108 @@ fn parse_windows_processes(bytes: &[u8]) -> Result<Vec<ProcessInfo>, String> {
             })
         })
         .collect())
+}
+
+#[cfg(all(test, unix))]
+mod command_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_command_output_stops_a_hung_child() {
+        let started = Instant::now();
+        let mut command = Command::new("sh");
+        command.args(["-c", "exec sleep 2"]);
+
+        let output = command_output_with_timeout(&mut command, Duration::from_millis(50))
+            .expect("run bounded command");
+
+        assert!(output.is_none());
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn bounded_command_output_kills_descendants_holding_inherited_pipes() {
+        let temp = tempfile::TempDir::new().expect("temporary process marker");
+        let pid_path = temp.path().join("descendant.pid");
+        let started = Instant::now();
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            &format!("sleep 30 & echo $! > '{}'; exit 0", pid_path.display()),
+        ]);
+
+        let output = command_output_with_timeout(&mut command, Duration::from_millis(100))
+            .expect("run bounded command");
+
+        assert!(output.is_none());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let pid = fs::read_to_string(&pid_path)
+            .expect("read descendant pid")
+            .trim()
+            .to_string();
+        for _ in 0..20 {
+            let mut probe = Command::new("kill");
+            probe
+                .args(["-0", &pid])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            if !probe.status().is_ok_and(|status| status.success()) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        panic!("descendant process {pid} survived the timeout");
+    }
+
+    #[test]
+    fn bounded_command_output_collects_completed_output() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf stdout; printf stderr >&2"]);
+
+        let output = command_output_with_timeout(&mut command, Duration::from_secs(1))
+            .expect("run bounded command")
+            .expect("command should complete");
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"stdout");
+        assert_eq!(output.stderr, b"stderr");
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod windows_command_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_command_job_terminates_spawned_descendants() {
+        let script = "$child=Start-Process powershell.exe -ArgumentList '-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 30' -WindowStyle Hidden -PassThru; Write-Output $child.Id";
+        let mut command = Command::new("powershell.exe");
+        command.args(["-NoProfile", "-NonInteractive", "-Command", script]);
+        hide_console_window(&mut command);
+
+        let output = command_output_with_timeout(&mut command, Duration::from_secs(5))
+            .expect("run bounded PowerShell")
+            .expect("parent PowerShell should finish");
+        let pid = String::from_utf8(output.stdout)
+            .expect("PowerShell pid output")
+            .trim()
+            .parse::<u32>()
+            .expect("numeric descendant pid");
+
+        for _ in 0..40 {
+            let mut query = Command::new("powershell.exe");
+            query.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!("if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 1 }}"),
+            ]);
+            hide_console_window(&mut query);
+            if query.status().is_ok_and(|status| status.success()) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        panic!("job-owned descendant process {pid} survived handle close");
+    }
 }

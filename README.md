@@ -50,7 +50,7 @@
 
 ## 安装
 
-从 [GitHub Releases](https://github.com/sunjackson/ai-trusted-carpool/releases) 下载对应平台安装包（macOS 通用 DMG、Windows x64 NSIS、Linux x64 DEB/AppImage），并按同一 Release 中的 `SHA256SUMS.txt` 核对文件 SHA-256 后安装。当前推荐 [v0.0.7 未签名正式版](https://github.com/sunjackson/ai-trusted-carpool/releases/tag/v0.0.7)，它修复 Windows 桌面图标启动后无窗口，以及部分 Windows 网络无法连接官方协调服务的问题，完整说明见 [Release Notes](docs/releases/v0.0.7.md)。
+从 [GitHub Releases](https://github.com/sunjackson/ai-trusted-carpool/releases) 下载对应平台安装包（macOS 通用 DMG、Windows x64 NSIS、Linux x64 DEB/AppImage），并按同一 Release 中的 `SHA256SUMS.txt` 核对文件 SHA-256 后安装。当前推荐 [v0.0.8 未签名正式版](https://github.com/sunjackson/ai-trusted-carpool/releases/tag/v0.0.8)，它修复 Windows 首次启动黑窗与无界面问题，并在上车链接未唤起客户端时提供对应系统的官方下载，完整说明见 [Release Notes](docs/releases/v0.0.8.md)。
 
 ## 当前未签名发布策略
 
@@ -81,7 +81,7 @@
 4. 如果 UAC 显示“未知发布者”，这是没有 Authenticode 证书的预期结果；校验 SHA-256 无误后可选择“是”继续。
 5. 公司或学校管理的设备可能通过策略隐藏“仍要运行”。这种情况不要关闭 Defender/SmartScreen，也不要修改组织策略；请联系管理员或按下方开发说明从源码自行构建。
 
-`v0.0.7` 起，双击桌面图标后会立即显示深色启动页，不再等 WebView2 页面加载完成才显示窗口。如果旧版本已经在后台运行，可点击 Windows 托盘中的“可信拼车”图标恢复主窗口，再安装最新版本。
+`v0.0.8` 起，主窗口不会提前显示尚未绘制的 WebView2 黑壳：React 完成首次渲染后窗口才出现；前端异常时则回退到内置静态启动页。残留拼车客户端的恢复在后台执行，Windows WMI、PowerShell 与 `taskkill` 均有超时限制，不会再无限阻塞首窗。安装器仍使用 Tauri 官方 WebView2 bootstrapper 检查。旧版本若已在后台运行，可先从 Windows 托盘退出，再安装最新版本。
 
 Microsoft 对 SmartScreen 的说明见 [Microsoft Learn](https://learn.microsoft.com/windows/security/operating-system-security/virus-and-threat-protection/microsoft-defender-smartscreen/)。
 

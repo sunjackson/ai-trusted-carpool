@@ -67,6 +67,10 @@ export function serverJoinUrl(code: string): string {
   return `${coordinatorBaseUrl()}/api/v1/carpool/join/${normalized}`;
 }
 
+export async function markFrontendReady(): Promise<void> {
+  if (inTauri()) await invoke('mark_frontend_ready');
+}
+
 export async function takePendingJoinCode(): Promise<string | null> {
   return inTauri() ? invoke<string | null>('take_pending_join_code') : null;
 }

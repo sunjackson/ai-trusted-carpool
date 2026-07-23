@@ -50,7 +50,7 @@ A desktop app for sharing a locally signed-in Claude Code / Codex account among 
 
 ## Install
 
-Download the installer for your platform from [GitHub Releases](https://github.com/sunjackson/ai-trusted-carpool/releases) (macOS universal DMG, Windows x64 NSIS, Linux x64 DEB/AppImage), then compare its SHA-256 digest with `SHA256SUMS.txt` from the same release. The currently recommended download is the unsigned stable [v0.0.7 release](https://github.com/sunjackson/ai-trusted-carpool/releases/tag/v0.0.7), which fixes a Windows launch with no visible window and official coordinator connection failures on some Windows networks. See the complete [release notes](docs/releases/v0.0.7.md).
+Download the installer for your platform from [GitHub Releases](https://github.com/sunjackson/ai-trusted-carpool/releases) (macOS universal DMG, Windows x64 NSIS, Linux x64 DEB/AppImage), then compare its SHA-256 digest with `SHA256SUMS.txt` from the same release. The currently recommended download is the unsigned stable [v0.0.8 release](https://github.com/sunjackson/ai-trusted-carpool/releases/tag/v0.0.8), which fixes the Windows first-launch black/empty window and offers the matching official download when a join link cannot open the local client. See the complete [release notes](docs/releases/v0.0.8.md).
 
 ## Current unsigned release policy
 
@@ -81,7 +81,7 @@ Download the installer for your platform from [GitHub Releases](https://github.c
 4. UAC may display “Unknown publisher.” This is expected without an Authenticode certificate; after checking the SHA-256 digest, select **Yes** to continue.
 5. Organization-managed devices may hide **Run anyway** through policy. Do not disable Defender/SmartScreen or bypass organization policy; contact the administrator or build from source using the development instructions below.
 
-Starting with `v0.0.7`, double-clicking the desktop shortcut immediately presents the dark boot surface instead of waiting for WebView2 to finish loading before a window appears. If an older build is already running in the background, use the Trusted Carpool Windows tray icon to restore its window before installing the current release.
+Starting with `v0.0.8`, the main window no longer exposes an unpainted WebView2 shell. It is presented only after React commits its first render, with the packaged static boot surface as a fallback when frontend readiness is not received. Stale managed-client recovery runs off the UI thread, and Windows WMI, PowerShell, and `taskkill` calls are time-bounded so they cannot block the first window forever. The installer continues to use Tauri's official WebView2 bootstrapper check. If an older build is still running in the background, exit it from the Windows tray before installing the current release.
 
 See [Microsoft Learn](https://learn.microsoft.com/windows/security/operating-system-security/virus-and-threat-protection/microsoft-defender-smartscreen/) for Microsoft's SmartScreen documentation.
 

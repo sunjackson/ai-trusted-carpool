@@ -22,6 +22,7 @@ import {
   listRideHistory,
   listAccounts,
   listClientInstances,
+  markFrontendReady,
   previewAccountImport,
   previewAccountRestore,
   retryAccountRoute,
@@ -59,6 +60,19 @@ const account = {
 afterEach(() => {
   invokeMock.mockReset();
   Reflect.deleteProperty(window, '__TAURI_INTERNALS__');
+});
+
+describe('desktop startup readiness', () => {
+  it('signals readiness only inside the Tauri desktop runtime', async () => {
+    await expect(markFrontendReady()).resolves.toBeUndefined();
+    expect(invokeMock).not.toHaveBeenCalled();
+
+    Object.defineProperty(window, '__TAURI_INTERNALS__', { configurable: true, value: {} });
+    invokeMock.mockResolvedValueOnce(undefined);
+
+    await expect(markFrontendReady()).resolves.toBeUndefined();
+    expect(invokeMock).toHaveBeenCalledWith('mark_frontend_ready');
+  });
 });
 
 describe('managed desktop client commands', () => {

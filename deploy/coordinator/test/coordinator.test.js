@@ -98,10 +98,10 @@ test('registers and resolves an owner-signed public invite', async () => {
     assert.doesNotMatch(join.text, /http-equiv="refresh"/);
     assert.match(join.text, /navigator\.userAgentData/);
     assert.match(join.text, /visibilitychange/);
-    assert.match(join.text, /Trusted-Carpool_0\.0\.7_x64-setup\.exe/);
-    assert.match(join.text, /Trusted-Carpool_0\.0\.7_universal\.dmg/);
-    assert.match(join.text, /Trusted-Carpool_0\.0\.7_amd64\.AppImage/);
-    assert.match(join.text, /Trusted-Carpool_0\.0\.7_amd64\.deb/);
+    assert.match(join.text, /Trusted-Carpool_0\.0\.8_x64-setup\.exe/);
+    assert.match(join.text, /Trusted-Carpool_0\.0\.8_universal\.dmg/);
+    assert.match(join.text, /Trusted-Carpool_0\.0\.8_amd64\.AppImage/);
+    assert.match(join.text, /Trusted-Carpool_0\.0\.8_amd64\.deb/);
     assert.match(join.text, /SHA256SUMS\.txt/);
     assert.doesNotMatch(join.text, /owner_public_key|payload_base64|signature/);
   });
@@ -109,7 +109,7 @@ test('registers and resolves an owner-signed public invite', async () => {
 
 test('join download recommendations stay on the pinned project release', () => {
   assert.equal(desktopReleaseVersion('1.2.3'), '1.2.3');
-  assert.equal(desktopReleaseVersion('../latest'), '0.0.7');
+  assert.equal(desktopReleaseVersion('../latest'), '0.0.8');
   const downloads = desktopDownloadUrls('1.2.3');
   assert.equal(
     downloads.windows,

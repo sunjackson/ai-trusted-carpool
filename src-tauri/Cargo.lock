@@ -4486,7 +4486,7 @@ dependencies = [
 
 [[package]]
 name = "trusted-carpool-desktop"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -4511,6 +4511,7 @@ dependencies = [
  "tokio",
  "url",
  "uuid",
+ "windows-sys 0.61.2",
  "x25519-dalek",
  "zip 8.6.0",
 ]

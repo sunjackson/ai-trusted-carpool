@@ -30,7 +30,7 @@ services:
       TRUSTED_CARPOOL_TURN_URLS: "turn:carpool.example.org:3478?transport=udp,turn:carpool.example.org:3478?transport=tcp,turns:carpool.example.org:5349"
       TRUSTED_CARPOOL_TURN_TTL_SECONDS: "3600"
       # 上车页在未唤起本机客户端时提供的桌面安装包版本
-      TRUSTED_CARPOOL_DESKTOP_RELEASE_VERSION: "0.0.7"
+      TRUSTED_CARPOOL_DESKTOP_RELEASE_VERSION: "0.0.8"
     ports:
       - "127.0.0.1:18081:18081"      # 只暴露给本机反向代理
 
@@ -83,7 +83,7 @@ carpool.example.org {
 | `TRUSTED_CARPOOL_TURN_SECRET` | coturn `static-auth-secret` 共享密钥；不设置则 `/api/v1/turn-credentials` 返回 404 | 空 |
 | `TRUSTED_CARPOOL_TURN_URLS` | 逗号分隔的 `turn:`/`turns:` 地址列表，**域名必须与协调服务域名一致**（客户端会校验） | 空 |
 | `TRUSTED_CARPOOL_TURN_TTL_SECONDS` | 时效凭据有效期（上限 86400） | `3600` |
-| `TRUSTED_CARPOOL_DESKTOP_RELEASE_VERSION` | 上车页检测不到已安装客户端时，提供的本项目 GitHub Release 版本；只接受 `X.Y.Z` | `0.0.7` |
+| `TRUSTED_CARPOOL_DESKTOP_RELEASE_VERSION` | 上车页检测不到已安装客户端时，提供的本项目 GitHub Release 版本；只接受 `X.Y.Z` | `0.0.8` |
 
 公开协调器默认免登录，靠签名与配额控滥用：
 

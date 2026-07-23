@@ -220,7 +220,11 @@ try {
     const value = evaluation.result?.value;
     if (!value || value.status === 'running') throw new Error('WebRTC 测试仍在运行');
     return value;
-  }, 240_000, '浏览器 WebRTC E2E');
+  // Each of the three cases owns bounded ICE and data-channel waits. When an
+  // external TURN service is degraded, their combined failure budget can
+  // legitimately exceed four minutes; leave enough time to return the actual
+  // per-case diagnostics instead of masking them as a generic runner timeout.
+  }, 300_000, '浏览器 WebRTC E2E');
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
   if (result.status !== 'passed') process.exitCode = 1;
 } finally {

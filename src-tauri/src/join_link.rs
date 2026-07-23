@@ -1,4 +1,5 @@
 use crate::runtime::RuntimeState;
+use crate::StartupState;
 use tauri::{AppHandle, Emitter, Manager, State};
 use url::Url;
 
@@ -68,6 +69,12 @@ fn parse_join_code_for_host(raw: &str, official_host: &str) -> Option<String> {
 }
 
 pub fn show_main_window(app: &AppHandle) {
+    if app
+        .try_state::<StartupState>()
+        .is_some_and(|startup| !startup.is_window_presentation_allowed())
+    {
+        return;
+    }
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.unminimize();
         let _ = window.show();

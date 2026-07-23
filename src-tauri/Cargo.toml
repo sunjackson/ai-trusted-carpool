@@ -1,6 +1,6 @@
 [package]
 name = "trusted-carpool-desktop"
-version = "0.0.7"
+version = "0.0.8"
 description = "One-click trusted carpool for Claude Code and Codex"
 authors = ["CNAIGC"]
 edition = "2021"
@@ -38,6 +38,14 @@ zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 tauri-plugin-process = "2.3.1"
 tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 tauri-plugin-updater = "2.10.1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 tauri = { version = "2", features = ["test"] }

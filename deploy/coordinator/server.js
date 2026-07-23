@@ -22,7 +22,7 @@ const DEFAULT_TURN_RATE_LIMIT = 30;
 const RATE_WINDOW_MS = 60_000;
 const DEFAULT_TURN_TTL_SECONDS = 3600;
 const MAX_TURN_TTL_SECONDS = 24 * 60 * 60;
-const DEFAULT_DESKTOP_RELEASE_VERSION = '0.0.7';
+const DEFAULT_DESKTOP_RELEASE_VERSION = '0.0.8';
 const DESKTOP_RELEASE_REPOSITORY = 'sunjackson/ai-trusted-carpool';
 const ALLOWED_MESSAGE_KINDS = new Set([
   'carpool_claim',

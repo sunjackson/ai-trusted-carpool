@@ -2,6 +2,7 @@ use crate::client_process::{
     canonical_path_key, focus_process, list_processes, process_belongs_to_tool, profile_matches,
     terminate_process, ProcessInfo,
 };
+use crate::diagnostics;
 use crate::models::{RideAccess, ToolKind};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -18,7 +19,6 @@ use uuid::Uuid;
 const CLAUDE_PROFILE_ID: &str = "00000000-0000-4000-8000-000000157211";
 const CLAUDE_PROFILE_NAME: &str = "可信拼车";
 const ROUTE_STATE_DIR: &str = "client-routes";
-const CLIENT_PROFILE_DIR: &str = "client-profiles";
 const CLAUDE_PROFILE_DIR: &str = "client-profiles/claude";
 const CODEX_PROFILE_DIR: &str = "client-profiles/codex";
 const INSTANCE_REGISTRY_FILE: &str = "client-instances.json";
@@ -351,10 +351,18 @@ pub fn launch(
     let process = match ready {
         Ok(process) => process,
         Err(error) => {
-            if receipt.tracks_application_process && !preexisting.contains(&direct_pid) {
-                terminate_process(direct_pid);
+            let rollback_is_safe = receipt.tracks_application_process
+                && !preexisting.contains(&direct_pid)
+                && terminate_process(direct_pid).is_ok();
+            if rollback_is_safe {
+                let _ = remove_instance_record(&app_data, &instance_id, false);
+            } else {
+                diagnostics::record(
+                    "warn",
+                    "client-launcher",
+                    "kept conservative client launch guard after readiness failure because the launched process could not be safely terminated",
+                );
             }
-            let _ = remove_instance_record(&app_data, &instance_id, false);
             return Err(error);
         }
     };
@@ -371,8 +379,18 @@ pub fn launch(
         *slot = record.clone();
     }
     if let Err(error) = save_registry(&app_data, &registry) {
-        terminate_record_process(&record);
-        let _ = remove_instance_record(&app_data, &instance_id, false);
+        match terminate_record_process(&record) {
+            Ok(()) => {
+                let _ = remove_instance_record(&app_data, &instance_id, false);
+            }
+            Err(terminate_error) => diagnostics::record(
+                "warn",
+                "client-launcher",
+                format!(
+                    "kept conservative client launch guard because exact process state could not be saved and rollback failed: {terminate_error}"
+                ),
+            ),
+        }
         return Err(error);
     }
     Ok(launch_result(&record, false))
@@ -403,18 +421,57 @@ pub fn recover_stale(app: &AppHandle) -> Result<(), String> {
         .path()
         .app_data_dir()
         .map_err(|error| format!("无法定位客户端临时配置目录: {error}"))?;
-    let registry = load_registry(&app_data).unwrap_or_default();
-    for record in registry.instances {
-        terminate_record_process(&record);
-        cleanup_record_files(&app_data, &record)?;
+    let Some(mut registry) = load_registry_for_recovery(&app_data)? else {
+        // A corrupt or newer registry cannot be trusted for process ownership.
+        // Its records are quarantined for inspection, while legacy backups are
+        // still safe to restore because that path never terminates processes.
+        migrate_legacy_routes(&app_data)?;
+        return Ok(());
+    };
+    if !registry.instances.is_empty() {
+        // Windows process discovery may cold-start WMI. Query once for the
+        // entire registry, and leave every unverified record untouched when
+        // discovery fails instead of guessing which ordinary client to close.
+        let processes = list_processes()?;
+        let mut retained = Vec::new();
+        let mut recovery_errors = Vec::new();
+        for record in registry.instances.drain(..) {
+            if let Some(process) = matching_record_process(&record, &processes) {
+                if let Err(error) = terminate_process(process.pid) {
+                    recovery_errors.push(error);
+                    retained.push(record);
+                    continue;
+                }
+            } else if possible_record_process(&record, &processes).is_some() {
+                // The on-disk starting record may be the conservative guard
+                // left when the final exact registry save failed. Never remove
+                // a profile/config that a matching live process may still use.
+                retained.push(record);
+                continue;
+            }
+            if let Err(error) = cleanup_record_files(&app_data, &record) {
+                recovery_errors.push(error);
+                retained.push(record);
+            }
+        }
+        registry.instances = retained;
+        save_registry(&app_data, &registry)?;
+        if !recovery_errors.is_empty() {
+            return Err(format!(
+                "{} 个客户端实例将在下次启动时继续安全恢复: {}",
+                recovery_errors.len(),
+                recovery_errors.join("；")
+            ));
+        }
+        if !registry.instances.is_empty() {
+            return Err(format!(
+                "{} 个客户端实例仍可能使用拼车配置，已保留恢复状态并延后旧路由迁移",
+                registry.instances.len()
+            ));
+        }
     }
-    save_registry(&app_data, &ClientInstanceRegistry::default())?;
+    save_registry(&app_data, &registry)?;
     migrate_legacy_routes(&app_data)?;
-    let profiles = app_data.join(CLIENT_PROFILE_DIR);
-    if profiles.exists() {
-        fs::remove_dir_all(&profiles)
-            .map_err(|error| format!("无法清理客户端临时配置 {}: {error}", profiles.display()))?;
-    }
     Ok(())
 }
 
@@ -776,6 +833,51 @@ fn load_registry(app_data: &Path) -> Result<ClientInstanceRegistry, String> {
     Ok(registry)
 }
 
+fn load_registry_for_recovery(app_data: &Path) -> Result<Option<ClientInstanceRegistry>, String> {
+    let path = registry_path(app_data);
+    if !path.exists() {
+        return Ok(Some(ClientInstanceRegistry::default()));
+    }
+    let bytes = fs::read(&path)
+        .map_err(|error| format!("无法读取客户端配置状态 {}: {error}", path.display()))?;
+    let quarantine_invalid = |load_error: String| {
+        let quarantine = path.with_file_name(format!(
+            "{INSTANCE_REGISTRY_FILE}.invalid-{}-{}.json",
+            now_ms(),
+            Uuid::new_v4()
+        ));
+        fs::rename(&path, &quarantine).map_err(|error| {
+            format!(
+                "客户端配置状态已损坏 {}: {load_error}；且无法隔离该状态: {error}",
+                path.display()
+            )
+        })?;
+        diagnostics::record(
+            "warn",
+            "client-launcher",
+            format!(
+                "quarantined unreadable client registry at {}; legacy routes will be restored without terminating processes",
+                quarantine.display()
+            ),
+        );
+        Ok(None)
+    };
+    let value = match serde_json::from_slice::<Value>(&bytes) {
+        Ok(value) => value,
+        Err(error) => return quarantine_invalid(error.to_string()),
+    };
+    let Some(version) = value.get("version").and_then(Value::as_u64) else {
+        return quarantine_invalid("缺少有效版本号".to_string());
+    };
+    if version != u64::from(INSTANCE_REGISTRY_VERSION) {
+        return Err("客户端实例状态版本不受支持，未改动任何普通客户端".to_string());
+    }
+    match serde_json::from_value::<ClientInstanceRegistry>(value) {
+        Ok(registry) => Ok(Some(registry)),
+        Err(error) => quarantine_invalid(error.to_string()),
+    }
+}
+
 fn save_registry(app_data: &Path, registry: &ClientInstanceRegistry) -> Result<(), String> {
     write_json_secure(&registry_path(app_data), registry)
 }
@@ -810,7 +912,7 @@ fn prune_stale_records(
     registry.instances.retain(|record| {
         let keep = (record.status == ClientInstanceStatus::Starting
             && now_ms().saturating_sub(record.launched_at_ms) <= 10_000)
-            || matching_record_process(record, processes).is_some();
+            || possible_record_process(record, processes).is_some();
         if !keep {
             stale.push(record.clone());
         }
@@ -837,7 +939,7 @@ fn remove_instance_record(
     };
     let record = registry.instances.remove(index);
     if terminate {
-        terminate_record_process(&record);
+        terminate_record_process(&record)?;
     }
     cleanup_record_files(app_data, &record)?;
     save_registry(app_data, &registry)?;
@@ -972,13 +1074,10 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     fs::write(&temp, bytes)
         .map_err(|error| format!("无法写入客户端临时配置 {}: {error}", temp.display()))?;
     secure_file(&temp)?;
-    #[cfg(target_os = "windows")]
-    if path.exists() {
-        fs::remove_file(path)
-            .map_err(|error| format!("无法替换客户端配置 {}: {error}", path.display()))?;
+    if let Err(error) = fs::rename(&temp, path) {
+        let _ = fs::remove_file(&temp);
+        return Err(format!("无法提交客户端配置 {}: {error}", path.display()));
     }
-    fs::rename(&temp, path)
-        .map_err(|error| format!("无法提交客户端配置 {}: {error}", path.display()))?;
     secure_file(path)
 }
 
@@ -1414,6 +1513,18 @@ fn matching_record_process<'a>(
     })
 }
 
+fn possible_record_process<'a>(
+    record: &ClientInstanceRecord,
+    processes: &'a [ProcessInfo],
+) -> Option<&'a ProcessInfo> {
+    matching_record_process(record, processes).or_else(|| {
+        processes.iter().find(|process| {
+            process_matches_fingerprint(process, record.tool, &record.launcher_fingerprint)
+                && profile_matches(process, record.profile_path.as_deref())
+        })
+    })
+}
+
 fn process_matches_launch(
     process: &ProcessInfo,
     launcher: &DesktopLauncher,
@@ -1465,13 +1576,17 @@ fn launcher_fingerprint(launcher: &DesktopLauncher, _kind: ToolKind) -> String {
     canonical_path_key(path)
 }
 
-fn terminate_record_process(record: &ClientInstanceRecord) {
-    let Ok(processes) = list_processes() else {
-        return;
-    };
+fn terminate_record_process(record: &ClientInstanceRecord) -> Result<(), String> {
+    let processes = list_processes()?;
     if let Some(process) = matching_record_process(record, &processes) {
-        terminate_process(process.pid);
+        terminate_process(process.pid)?;
+    } else if possible_record_process(record, &processes).is_some() {
+        return Err(
+            "检测到可能仍在使用拼车配置的客户端，但无法验证其精确进程身份；已保留配置以避免影响普通客户端"
+                .to_string(),
+        );
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1681,6 +1796,105 @@ mod tests {
         let stored = fs::read_to_string(registry_path(temp.path())).expect("read registry");
         assert!(!stored.contains("session-secret"));
         assert!(!stored.contains("apiKey"));
+    }
+
+    #[test]
+    fn incomplete_launch_guard_keeps_profile_while_matching_process_may_use_it() {
+        let temp = TempDir::new().expect("temp dir");
+        let profile = temp.path().join("client-profiles/codex/access-a");
+        fs::create_dir_all(&profile).expect("create guarded profile");
+        let executable = PathBuf::from("/Applications/ChatGPT.app/Contents/MacOS/ChatGPT");
+        let record = ClientInstanceRecord {
+            instance_id: "guarded-instance".to_string(),
+            access_id: "access-a".to_string(),
+            tool: ToolKind::Codex,
+            status: ClientInstanceStatus::Starting,
+            strategy: RouteStrategy::CodexIsolatedHome,
+            profile_path: Some(profile.clone()),
+            launcher_fingerprint: canonical_path_key(&executable),
+            process_id: None,
+            process_started_at: None,
+            launched_at_ms: 0,
+            ready_at_ms: None,
+        };
+        let mut registry = ClientInstanceRegistry {
+            version: INSTANCE_REGISTRY_VERSION,
+            instances: vec![record],
+        };
+        let processes = vec![ProcessInfo {
+            pid: 4242,
+            executable,
+            command_line: format!(
+                "ChatGPT --user-data-dir={}",
+                profile.join("app-data").display()
+            ),
+            started_at: "start-a".to_string(),
+        }];
+
+        prune_stale_records(temp.path(), &mut registry, &processes).expect("prune registry");
+
+        assert_eq!(registry.instances.len(), 1);
+        assert!(profile.exists());
+    }
+
+    #[test]
+    fn corrupt_registry_is_quarantined_before_legacy_backup_recovery() {
+        let temp = TempDir::new().expect("temp dir");
+        let config = temp.path().join("user/config.toml");
+        atomic_write(&config, b"personal=true\n").expect("write personal config");
+        snapshot_files(
+            &backup_dir(temp.path(), ToolKind::Codex),
+            "old-access",
+            std::slice::from_ref(&config),
+        )
+        .expect("snapshot");
+        atomic_write(&config, b"carpool=true\n").expect("write managed config");
+        atomic_write(&registry_path(temp.path()), b"{not-json").expect("write corrupt registry");
+
+        assert!(load_registry_for_recovery(temp.path())
+            .expect("quarantine corrupt registry")
+            .is_none());
+        migrate_legacy_routes(temp.path()).expect("restore legacy route");
+
+        assert_eq!(fs::read(&config).unwrap(), b"personal=true\n");
+        assert!(!registry_path(temp.path()).exists());
+        let route_dir = temp.path().join(ROUTE_STATE_DIR);
+        assert!(fs::read_dir(route_dir)
+            .expect("read route state")
+            .filter_map(Result::ok)
+            .any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(&format!("{INSTANCE_REGISTRY_FILE}.invalid-"))));
+    }
+
+    #[test]
+    fn unknown_registry_version_is_preserved_and_blocks_unsafe_recovery() {
+        let temp = TempDir::new().expect("temp dir");
+        atomic_write(
+            &registry_path(temp.path()),
+            br#"{"version":255,"instances":[{"status":"suspended","futureField":true}]}"#,
+        )
+        .expect("write future registry");
+
+        let error = load_registry_for_recovery(temp.path()).expect_err("reject future registry");
+        assert!(error.contains("版本不受支持"));
+        assert!(registry_path(temp.path()).exists());
+    }
+
+    #[test]
+    fn malformed_current_registry_is_quarantined_for_safe_legacy_recovery() {
+        let temp = TempDir::new().expect("temp dir");
+        atomic_write(
+            &registry_path(temp.path()),
+            br#"{"version":1,"instances":[{"status":"suspended"}]}"#,
+        )
+        .expect("write malformed current registry");
+
+        assert!(load_registry_for_recovery(temp.path())
+            .expect("quarantine malformed current registry")
+            .is_none());
+        assert!(!registry_path(temp.path()).exists());
     }
 
     #[test]

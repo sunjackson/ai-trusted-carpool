@@ -172,6 +172,16 @@ jobs:
             xdg-utils
       - name: Install frontend dependencies
         run: npm ci
+      - name: Verify Windows-specific Rust paths
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          rustup component add clippy
+          if ($LASTEXITCODE -ne 0) { throw "failed to install the Windows clippy component" }
+          cargo test --manifest-path src-tauri/Cargo.toml client_process::windows_command_tests --all-features
+          if ($LASTEXITCODE -ne 0) { throw "Windows-specific Rust tests failed" }
+          cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
+          if ($LASTEXITCODE -ne 0) { throw "Windows-specific Rust clippy failed" }
       - name: Import and pin Windows code-signing certificate
         if: runner.os == 'Windows' && needs.verify.outputs.release_mode == 'signed'
         shell: pwsh
@@ -250,6 +260,10 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: npm run tauri build -- ${{ matrix.build_args }} --config src-tauri/tauri.distribution.conf.json --config src-tauri/tauri.release.conf.json ${{ matrix.signing_config }}
+      - name: Smoke-test Windows startup and rapid single-instance handoff
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/test-windows-startup.ps1
       - name: Verify updater signatures against embedded public key
         if: needs.verify.outputs.release_mode == 'signed'
         run: node scripts/verify-updater-artifacts.mjs --assets-dir "${{ matrix.bundle_dir }}"
